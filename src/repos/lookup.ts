@@ -1,6 +1,7 @@
 /**
- * dsh-repo `dshRepos` 服务的查找。观象经它维护应用仓库的本地镜像和只读快照、
- * 在主机或令牌变更后重新拉取，并把 SKILL 改进与接入初稿提交为合并请求（GitLab MR 或 GitHub PR）。
+ * `dshRepos` 服务的查找。观象经它维护应用仓库的本地镜像和只读快照、在主机或
+ * 令牌变更后重新拉取，并在可写工作区中起草 SKILL 改进与接入初稿、推送到新分支、
+ * 创建合并请求（GitLab MR 或 GitHub PR）。
  *
  * 观象需要的方法见 `./contract.ts`；服务在运行时经 `ctx.get('dshRepos')`
  * 取得，服务版本不符时不调用。
@@ -14,7 +15,7 @@ import type { DshRepos, DshReposVersion } from './contract.ts'
 export const DSH_REPOS_SERVICE = 'dshRepos'
 
 /** The `dshRepos` contract version this plugin speaks. */
-export const DSH_REPOS_VERSION: DshReposVersion = 1
+export const DSH_REPOS_VERSION: DshReposVersion = 2
 
 /** Result of looking the service up. */
 export type ReposLookup =

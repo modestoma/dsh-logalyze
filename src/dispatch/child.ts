@@ -17,7 +17,7 @@ export interface ChildRun {
   readonly parent: Agent
   /** Child label shown in the UI. */
   readonly label: string
-  /** Read-only snapshot the child works in. */
+  /** Workspace the child works in. */
   readonly cwd: string
   /** First message. */
   readonly prompt: string
@@ -36,7 +36,7 @@ export interface ChildOutcome {
 
 /**
  * Run one child to its end.
- * @param run - service, parent, snapshot, prompt, and limits.
+ * @param run - service, parent, working directory, prompt, and limits.
  * @returns the outcome; a child that fails to start or errors is reported, not thrown.
  * @throws the cancellation reason when `signal` is aborted.
  */

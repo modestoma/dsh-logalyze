@@ -10,6 +10,8 @@
  * - 开启 SKILL 改进时，子 Agent 在 SKILL 不足时于运行目录写 `skill-gap.md`；派发
  *   结束后检查已完成任务的记录，并在结果中标出 SKILL 不足，供父 Agent 询问用户
  *   是否改进。
+ * - 每个任务的结果带上应用仓库地址和分析的提交，后续修复代码可以从同一仓库和
+ *   提交开始。
  * - 子会话（委派深度大于 0）中不提供本工具。
  *
  * @module dsh-logalyze/dispatch/tool
@@ -17,7 +19,7 @@
 
 import { randomBytes } from 'node:crypto'
 import { mkdir, stat } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { z } from 'zod'
 import { describeIssue } from '../config.ts'
 import type { Agent, ContentBlock, SubagentActivation, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
@@ -57,6 +59,10 @@ export type TaskStatus = 'completed' | 'aborted' | 'error' | 'max-tokens' | 'ref
 export interface TaskResult {
   app: string
   name: string
+  /** Repository address of the application. */
+  url: string
+  /** Commit the child analyzed. */
+  commit: string
   status: TaskStatus
   childId?: string
   /** The child's final answer text (possibly partial when not completed). */
@@ -90,10 +96,12 @@ const OUTPUT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['app', 'name', 'status', 'output', 'workDir', 'logs'],
+        required: ['app', 'name', 'url', 'commit', 'status', 'output', 'workDir', 'logs'],
         properties: {
           app: { type: 'string' },
           name: { type: 'string' },
+          url: { type: 'string' },
+          commit: { type: 'string' },
           status: { type: 'string' },
           childId: { type: 'string' },
           output: { type: 'string' },
@@ -144,7 +152,7 @@ export function renderDispatchValue(value: DispatchValue): ContentBlock[] {
     const label = STATUS_LABELS[result.status] ?? result.status
     const body = result.output.trim() === '' ? '（子 Agent 没有给出结论）' : result.output.trim()
     const diagnostic = result.diagnostic === undefined ? '' : `\n\n诊断：${result.diagnostic}`
-    return `### ${result.name}（${result.app}）— ${label}\n\n${body}${diagnostic}${renderGap(result)}`
+    return `### ${result.name}（${result.app}）— ${label}\n\n仓库 ${result.url}，提交 ${result.commit.slice(0, 12)}\n\n${body}${diagnostic}${renderGap(result)}`
   })
   return [{ type: 'text', text: `观象派发 ${value.runId} 结束，运行目录 ${value.runDir}。\n\n${sections.join('\n\n')}` }]
 }
@@ -246,6 +254,20 @@ export function newRunId(now: Date): string {
 export function isInside(child: string, parent: string): boolean {
   const path = relative(parent, child)
   return path === '' || (!path.startsWith('..') && !isAbsolute(path))
+}
+
+/** Path segments of the run directories below a base directory. */
+export const RUNS_SEGMENTS = ['.logalyze', 'runs'] as const
+
+/**
+ * Whether a path lies in a run directory, where improvement and drafting
+ * children work in their workspaces.
+ * @param path - absolute path.
+ * @returns whether the path has a `.logalyze/runs/` segment pair.
+ */
+export function inRunDirectory(path: string): boolean {
+  const segments = path.split(sep)
+  return segments.some((segment, index) => segment === RUNS_SEGMENTS[0] && segments[index + 1] === RUNS_SEGMENTS[1])
 }
 
 /** Where a top-level agent's run directories live. */
@@ -380,7 +402,7 @@ export class Dispatcher {
     try {
       exec.signal.throwIfAborted()
       const runId = newRunId(this.deps.now?.() ?? new Date())
-      const runDir = join(baseDir, '.logalyze', 'runs', runId)
+      const runDir = join(baseDir, ...RUNS_SEGMENTS, runId)
       const prepared = await Promise.all(tasks.map(async (task, index) => {
         const ready = lease.apps.get(task.app)
         if (ready === undefined) throw new Error(`应用「${task.app}」不可用`)
@@ -416,7 +438,7 @@ export class Dispatcher {
 
   private async runChildren(
     parent: Agent,
-    prepared: readonly { task: DispatchArgs['tasks'][number]; ready: { app: AppManifest; dir: string; commit: string }; workDir: string; logs: ChildLog[] }[],
+    prepared: readonly { task: DispatchArgs['tasks'][number]; ready: { app: AppManifest; url: string; dir: string; commit: string }; workDir: string; logs: ChildLog[] }[],
     settings: EditableSettings,
     signal: AbortSignal,
     gaps: boolean,
@@ -426,7 +448,7 @@ export class Dispatcher {
     const maxDepth = this.deps.subagents.resolveMaxDepth()
     const activations: (SubagentActivation | undefined)[] = []
     const results = await Promise.all(prepared.map(async ({ task, ready, workDir, logs }, index): Promise<TaskResult> => {
-      const base = { app: ready.app.id, name: ready.app.name, workDir, logs: logs.map(log => log.path) }
+      const base = { app: ready.app.id, name: ready.app.name, url: ready.url, commit: ready.commit, workDir, logs: logs.map(log => log.path) }
       let activation: SubagentActivation
       try {
         activation = await this.deps.subagents.startActivation({

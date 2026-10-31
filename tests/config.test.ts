@@ -4,16 +4,25 @@ import { diffOverlay } from '../src/settings/overlay.ts'
 
 describe('git address policy', () => {
   it.each([
-    'git@github.com:example/order-service.git',
     'https://github.com/example/pay-service.git',
-    'ssh://git@git.example.com:2222/team/app.git',
+    'https://gitlab.example.com:8443/team/app.git',
     'file:///srv/git/app.git',
     '/srv/git/app',
   ])('accepts %s', (url) => {
     expect(isAcceptedGitUrl(url)).toBe(true)
   })
 
-  it.each(['ext::sh -c id', '--upload-pack=touch /tmp/x', 'relative/path', 'ftp://example.com/a.git', ''])('refuses %s', (url) => {
+  it.each([
+    'git@github.com:example/order-service.git',
+    'ssh://git@git.example.com:2222/team/app.git',
+    'git://example.com/a.git',
+    'http://example.com/a.git',
+    'ext::sh -c id',
+    '--upload-pack=touch /tmp/x',
+    'relative/path',
+    'ftp://example.com/a.git',
+    '',
+  ])('refuses %s', (url) => {
     expect(isAcceptedGitUrl(url)).toBe(false)
   })
 

@@ -10,7 +10,7 @@
  */
 
 import { join } from 'node:path'
-import { kindOf, ProposalError, readText } from './proposal.ts'
+import { kindOf, ProposalError, readText } from './files.ts'
 
 /** Gap record inside a task's run directory. */
 export const GAP_FILE = 'skill-gap.md'

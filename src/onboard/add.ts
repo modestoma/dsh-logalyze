@@ -47,7 +47,7 @@ const PARAMETERS: Record<string, unknown> = {
   additionalProperties: false,
   required: ['url'],
   properties: {
-    url: { type: 'string', description: '应用代码仓库的 git 地址：https/ssh/git/file URL、user@host:path 或本机绝对路径。' },
+    url: { type: 'string', description: '应用代码仓库的 https 地址（例如 https://github.com/example/order-service.git）；也接受 file URL 或本机绝对路径，不接受 ssh 地址。' },
     branch: { type: 'string', description: '要跟踪的远端分支；省略时跟随远端默认分支。' },
   },
 }
@@ -83,7 +83,7 @@ export function renderAddRepoValue(value: AddRepoValue): ContentBlock[] {
     ? `应用「${repo.app.name}」（id: ${repo.app.id}）可用${commit}，可以用 /logalyze 分析它的日志。`
     : value.setup === 'needs-setup'
       ? `仓库已拉取${commit}，但还不能用：${repo?.error ?? '缺少应用描述'}。调用 ${INIT_REPO_TOOL_NAME} 起草应用描述和日志分析 SKILL；用户提供了样例日志时一并传入。`
-      : `仓库还不能用：${repo?.error ?? '拉取没有完成'}。https 私有仓库需要在 dsh-repo 插件页为该主机配置令牌，配置后观象自动重新拉取；ssh 地址使用本机 SSH key。`
+      : `仓库还不能用：${repo?.error ?? '拉取没有完成'}。https 私有仓库需要在 dsh-repo 插件页为该主机配置令牌，配置后观象自动重新拉取。`
   return [{ type: 'text', text: `${head}${next}` }]
 }
 
