@@ -186,10 +186,11 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     return { service, started }
   }
 
-  async function setup(work: (workDir: string) => Promise<void>, outcome?: Partial<SubagentResult>) {
+  async function setup(work: (workDir: string) => Promise<void>, outcome?: Partial<SubagentResult>, copies = 1) {
     const root = await dir()
     const origin = await bareRepo(join(root, 'order'))
     const other = await createAppRepo(join(root, 'other'))
+    const duplicates = await Promise.all(Array.from({ length: copies - 1 }, async (_, index) => ({ url: await createAppRepo(join(root, `copy-${index}`)) })))
     const project = join(root, 'project')
     await mkdir(project, { recursive: true })
     const state = { branches: new Set<string>() }
@@ -198,7 +199,7 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
       commitFiles: vi.fn(async (_repo: string, request: Record<string, unknown> & { branch: string }) => { state.branches.add(request.branch); return {} }),
       createChange: vi.fn(async () => ({ webUrl: MR_URL })),
     })
-    const settings: EditableSettings = { ...defaultsOf(resolveConfig({})), repos: [{ url: origin }, { url: other }], skillUpdates: { enabled: false, maxFiles: 8, maxFileBytes: 65536 } }
+    const settings: EditableSettings = { ...defaultsOf(resolveConfig({})), repos: [{ url: origin }, { url: other }, ...duplicates], skillUpdates: { enabled: false, maxFiles: 8, maxFileBytes: 65536 } }
     const registry = new RepoRegistry({ repos: () => repos, onChange: () => {} })
     registry.configure(settings.repos)
     await registry.syncAll()
@@ -302,6 +303,16 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     }))
     const value = await initializer.draft({ url: origin }, { signal: new AbortController().signal, agent })
     // The example repository already registers `order-service`.
+    expect(value.draft).toMatchObject({ ok: false, error: expect.stringContaining('已被') })
+  })
+
+  it('refuses an id that two other repositories already claim, though neither is usable', async () => {
+    const { origin, registry, initializer, agent } = await setup(async workDir => await writeDraft(workDir, {
+      'logalyze.yaml': MANIFEST.replace('id: billing-service', 'id: order-service'),
+      'skills/order-logs/SKILL.md': SKILL,
+    }), undefined, 2)
+    expect(registry.readyApps()).toEqual([])
+    const value = await initializer.draft({ url: origin }, { signal: new AbortController().signal, agent })
     expect(value.draft).toMatchObject({ ok: false, error: expect.stringContaining('已被') })
   })
 

@@ -57,6 +57,7 @@ export class LogalyzeService {
   private readonly refreshWaitMs: number
   private readonly analyzeTokenRef: string
   private readonly booted = Promise.withResolvers<void>()
+  private additions: Promise<void> = Promise.resolve()
 
   /**
    * @param ctx - plugin context.
@@ -363,15 +364,20 @@ export class LogalyzeService {
 
   /**
    * Append one repository to the panel settings, as a panel save would, and
-   * start syncing it.
+   * start syncing it. Concurrent additions are applied in call order.
    * @param spec - validated repository.
    * @returns `exists` without writing when the address is already configured.
    * @throws SettingsError when the resulting settings are invalid.
    */
   async addRepo(spec: RepoSpec): Promise<'added' | 'exists'> {
-    if (this.registry.has(spec.url)) return 'exists'
-    await this.save({ ...this.current, repos: [...this.current.repos, spec] })
-    return 'added'
+    // Additions run one at a time so each one reads the settings the previous one saved.
+    const added = this.additions.then(async () => {
+      if (this.registry.has(spec.url)) return 'exists' as const
+      await this.save({ ...this.current, repos: [...this.current.repos, spec] })
+      return 'added' as const
+    })
+    this.additions = added.then(() => undefined, () => undefined)
+    return await added
   }
 
   /**

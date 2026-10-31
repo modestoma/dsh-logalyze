@@ -152,6 +152,11 @@ describe('plugin', () => {
     const state = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
     expect(state.repos).toMatchObject([{ url: origin, available: false }])
     expect(await init!.when?.(step)).toBe(true)
+
+    // Additions from two conversations at once both persist.
+    const [first, second] = await Promise.all([join(dir, 'a'), join(dir, 'b')].map(path => createAppRepo(path)))
+    await Promise.all([first, second].map(url => add!.definition.execute({ url }, step)))
+    expect(JSON.parse(await readFile(overlayPath, 'utf8'))).toEqual({ repos: [{ url: origin }, { url: first }, { url: second }] })
   })
 
   it('refreshes repositories before rendering /logalyze, waiting at most refreshWaitMs', async () => {

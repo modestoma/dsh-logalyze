@@ -414,7 +414,8 @@ export class RepoInitializer {
     const options = signal === undefined ? {} : { signal }
     const draft = await readInitDraft(task.workDir, this.deps.settings().skillUpdates)
     await checkInitDraft(draft, path => repos.readMirrorFile(task.url, task.commit, path, options))
-    const conflict = this.deps.registry.readyApps().find(ready => ready.app.id === draft.app.id && ready.url !== task.url)
+    // Conflicted applications are not ready but still claim their id.
+    const conflict = this.deps.registry.status().find(repo => repo.app?.id === draft.app.id && repo.url !== task.url)
     if (conflict !== undefined) throw new Error(`应用 id「${draft.app.id}」已被 ${conflict.url} 使用，请换一个 id`)
     const change = await prepareChange(repos, { url: task.url, base: task.commit, dir: AGENTS_DIR }, draft.files, signal)
     if (change.files.length === 0) throw new Error(`初稿与提交 ${task.commit.slice(0, 12)} 中的文件相同，没有改动`)
