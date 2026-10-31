@@ -182,8 +182,10 @@ skill: log-analysis             # 对应 .agents/skills/log-analysis/SKILL.md
 | 工具 | 何时提供 | 做什么 |
 |---|---|---|
 | `logalyze_add_repo` | 总是 | 参数为 git 地址和可选分支。经用户一次性授权后写入与面板相同的 `settings.json`，等待第一次拉取结束，返回应用可用、需要起草或拉取失败的原因。地址已在列表中时不请求授权，只重新拉取 |
-| `logalyze_init_repo` | 有仓库已拉取但缺少应用描述或 SKILL 时 | 参数为 git 地址、可选的用户说明和样例日志（`path` 或白名单内的 `url`）。在最新提交的只读快照里启动一个起草子 Agent，把 `logalyze.yaml` 和一个日志分析 SKILL（大型仓库按领域拆到 `references/`）写到运行目录 `.logalyze/runs/<runId>/init/repo-init/`，结束后检查初稿并写出 `repo-init.diff`，不提交 |
+| `logalyze_init_repo` | 有仓库已拉取但缺少应用描述或 SKILL 时 | 参数为 git 地址、可选的用户说明和样例日志（`path` 或白名单内的 `url`）。在最新提交的只读快照里启动一个起草子 Agent，首行用 `/logalyze-kit` 加载接入套件，把 `logalyze.yaml` 和一个日志分析 SKILL（大型仓库按领域拆到 `references/`）写到运行目录 `.logalyze/runs/<runId>/init/repo-init/`，结束后检查初稿并写出 `repo-init.diff`，不提交 |
 | `logalyze_submit_init` | 本会话有起草结果时 | 参数为起草的运行目录。重新检查初稿，经用户一次性授权后以起草时的提交为起点建新分支 `logalyze/init-<应用 id>-<改动摘要前缀>`，提交 `.agents/` 下有改动的文件，并创建合入跟踪分支的合并请求 |
+
+**接入套件 `/logalyze-kit`。** 观象自带一个 SKILL，写明怎样为应用仓库编写应用描述和日志分析 SKILL：从代码和日志配置里找什么、`logalyze.yaml` 字段、SKILL.md 与 `references/` 的结构模板、约束和自检清单。正文在包内的 [skills/logalyze-kit/SKILL.md](skills/logalyze-kit/SKILL.md)，插件加载时读取，缺失或不合法时加载失败。它在任何目录都列出（包括子 Agent 所在的仓库快照），只能由用户输入或首行手势加载，模型不会自行选用。开发者也可以在自己的仓库里运行 dsh，输入 `/logalyze-kit` 直接编写或改进 SKILL。
 
 初稿的检查规则与拉取时相同：`logalyze.yaml` 合法，SKILL 存在、frontmatter 的 `name` 等于 `skill` 字段、不设置 `user-invocable: false`，应用 id 不与其他仓库重复；初稿只能包含 `logalyze.yaml` 和它指定的 `skills/<skill>/` 下的文件，文件数和大小上限沿用 `skillUpdates.maxFiles` 与 `maxFileBytes`（不需要开启 SKILL 改进）。起草子 Agent 的等待上限是 `dispatchTimeoutMs`。授权、令牌权限、提交作者（`skillUpdateAuthor`）和合并请求的规则与 [SKILL 改进](#skill-改进) 相同；合并后下一次 `/logalyze` 拉取即启用该应用。用户拒绝提交时，初稿文件仍在运行目录中，可以手动提交。
 
@@ -269,7 +271,8 @@ pnpm check        # 类型检查（Host 与 Client）+ 单元测试 + 构建 + �
 | `src/index.ts` | Cordis 插件入口 |
 | `src/service.ts` | 生效设置、注册表、入口 SKILL 与各工具的注册 |
 | `src/repos/` | `dshRepos` 服务需求与查找、应用描述校验、应用注册表 |
-| `src/skill/entry.ts` | `/logalyze` 入口 SKILL |
+| `src/skill/` | `/logalyze` 入口 SKILL 与 `/logalyze-kit` 接入套件的 provider |
+| `skills/logalyze-kit/` | 接入套件 SKILL 正文 |
 | `src/dispatch/` | 派发工具、日志下载、子 Agent 首条消息 |
 | `src/skill-update/` | SKILL 修改提议的校验、diff、授权与提交 |
 | `src/onboard/` | 在对话中添加仓库、起草应用描述与 SKILL、提交接入合并请求 |

@@ -21,6 +21,7 @@ import type { AnalyzeWire, EditableSettings, RepoSpec, ReposWire, StateWire, Tok
 import { diffOverlay, overriddenKeys } from './settings/overlay.ts'
 import type { OverlayStore } from './settings/overlay.ts'
 import { createEntrySkillProvider } from './skill/entry.ts'
+import type { KitSkill } from './skill/kit.ts'
 import { SkillUpdater } from './skill-update/tool.ts'
 import { RepoAdder } from './onboard/add.ts'
 import { RepoInitializer } from './onboard/init.ts'
@@ -39,6 +40,12 @@ const tokenSetSchema = tokenClearSchema.extend({ value: tokenValue }).strict()
 /** Optional seams for tests. */
 export interface ServiceOptions {
   readonly fetch?: typeof fetch
+}
+
+/** Package files the service serves. */
+export interface ServiceAssets {
+  /** The `/logalyze-kit` skill. */
+  readonly kit: KitSkill
 }
 
 /** The plugin's long-lived state. */
@@ -63,12 +70,14 @@ export class LogalyzeService {
    * @param ctx - plugin context.
    * @param config - validated plugin configuration.
    * @param store - panel overlay file.
+   * @param assets - package files the service serves.
    * @param options - test seams.
    */
   constructor(
     private readonly ctx: HostContext,
     config: LogalyzeConfig,
     private readonly store: OverlayStore,
+    assets: ServiceAssets,
     options: ServiceOptions = {},
   ) {
     this.defaults = defaultsOf(config)
@@ -117,6 +126,7 @@ export class LogalyzeService {
       maxAppsPerRequest: () => this.current.maxAppsPerRequest,
       skillUpdates: () => this.current.skillUpdates.enabled,
       autoInvoke: config.autoInvoke,
+      kit: assets.kit,
       inRepositories: (cwd) => {
         const lookup = lookupRepos(ctx.get?.(DSH_REPOS_SERVICE))
         return lookup.availability === 'ready' && isInside(cwd, lookup.service.mirrorSettings().dir)

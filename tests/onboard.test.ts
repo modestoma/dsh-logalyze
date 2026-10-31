@@ -350,9 +350,9 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
 describe('renderInitPrompt', () => {
   it('names the draft paths, the user guidance, and the sample logs', () => {
     const text = renderInitPrompt({ url: 'git@host:shop/order.git', commit: 'a'.repeat(40), problem: '仓库缺少应用描述', logs: [{ path: '/tmp/app.log', url: 'https://oss/app.log' }], workDir: '/run/init', maxFiles: 16 })
+    expect(text.startsWith('/logalyze-kit\n')).toBe(true)
     expect(text).toContain('仓库还不能用：仓库缺少应用描述')
     expect(text).toContain('`/run/init/repo-init/files/logalyze.yaml`')
-    expect(text).toContain('references/<领域>.md')
     expect(text).toContain('- `/tmp/app.log`（下载自 https://oss/app.log）')
     expect(text).toContain('全部文件不超过 16 个')
     expect(text).toContain('## 用户说明\n\n（无）')

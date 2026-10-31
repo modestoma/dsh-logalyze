@@ -24,6 +24,7 @@ import { LogalyzeService } from './service.ts'
 import type { ServiceOptions } from './service.ts'
 import { defaultOverlayPath, OverlayStore } from './settings/overlay.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
+import { loadKitSkill } from './skill/kit.ts'
 
 export type * from './settings/contract.ts'
 export type { LogalyzeConfig, SettingsOverlay } from './config.ts'
@@ -39,6 +40,7 @@ export type { AddRepoStatus, AddRepoValue, RepoSetup } from './onboard/add.ts'
 export { RepoInitializer } from './onboard/init.ts'
 export type { DraftCheck, InitRepoValue, SubmitInitValue } from './onboard/init.ts'
 export { ENTRY_SKILL_NAME, renderEntrySkill } from './skill/entry.ts'
+export { KIT_SKILL_NAME } from './skill/kit.ts'
 export { RepoRegistry } from './repos/registry.ts'
 export { readAppManifest, MANIFEST_PATH } from './repos/manifest.ts'
 export { LogalyzeService } from './service.ts'
@@ -71,7 +73,8 @@ export interface LogalyzePluginOptions extends ServiceOptions {
  * @param options - test seams.
  */
 export function apply(ctx: HostContext, config?: unknown, options: LogalyzePluginOptions = {}): void {
-  const service = new LogalyzeService(ctx, resolveConfig(config), new OverlayStore(options.overlayPath ?? defaultOverlayPath()), options)
+  const kit = loadKitSkill(new URL('../skills/logalyze-kit/SKILL.md', import.meta.url))
+  const service = new LogalyzeService(ctx, resolveConfig(config), new OverlayStore(options.overlayPath ?? defaultOverlayPath()), { kit }, options)
   service.registerSkill()
   service.registerTool()
   mountSettingsRoutes(ctx, service)

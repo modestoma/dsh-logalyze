@@ -201,7 +201,8 @@ describe('plugin', () => {
       const [listed] = await provider.list({ cwd: dir })
       expect(listed?.invocation.modelInvocable).toBe(autoInvoke)
       if (autoInvoke) expect(listed?.description).toContain('订单服务（order-service')
-      expect(await provider.list({ cwd: join(h.repos.mirrorSettings().dir, '.snapshots', 'local', 'x') })).toEqual([])
+      // Inside the repositories only the kit is listed.
+      expect((await provider.list({ cwd: join(h.repos.mirrorSettings().dir, '.snapshots', 'local', 'x') })).map(skill => skill.name)).toEqual(['logalyze-kit'])
     }
   })
 

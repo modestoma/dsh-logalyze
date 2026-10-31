@@ -8,6 +8,8 @@
 
 import type { SkillDefinition, SkillProvider, SkillProviderControl } from '../host.ts'
 import type { AppManifest } from '../settings/contract.ts'
+import { KIT_SKILL_NAME } from './kit.ts'
+import type { KitSkill } from './kit.ts'
 import { DISPATCH_TOOL_NAME } from '../dispatch/tool.ts'
 import { ADD_REPO_TOOL_NAME } from '../onboard/names.ts'
 import { PROPOSE_TOOL_NAME } from '../skill-update/tool.ts'
@@ -146,11 +148,15 @@ export interface EntrySkillSource {
    * @returns whether the directory belongs to the repositories.
    */
   inRepositories(cwd: string): boolean
+  /** The `/logalyze-kit` skill, served from the same provider. */
+  readonly kit: KitSkill
 }
 
 /**
- * Build the entry skill provider.
- * @param source - live registry view.
+ * Build the skill provider serving `/logalyze` and `/logalyze-kit`. The kit
+ * is listed in every directory, including the repository snapshots children
+ * work in, where `/logalyze` is not listed.
+ * @param source - live registry view and the kit skill.
  * @returns a provider factory for `ctx.skills.registerProvider`, plus the
  *   hook to call after the usable applications may have changed; it
  *   invalidates the DSH catalog only when the listed entry changes.
@@ -161,6 +167,15 @@ export function createEntrySkillProvider(source: EntrySkillSource): {
 } {
   let control: SkillProviderControl | undefined
   let listed: string | undefined
+  // The kit is user-invoked (or loaded by the drafting child's first line), never chosen by the model.
+  const kitSummary = {
+    name: KIT_SKILL_NAME,
+    description: source.kit.description,
+    whenToUse: '仅在用户输入 /logalyze-kit 时使用。',
+    invocation: { modelInvocable: false, userInvocable: true },
+    source: 'bundled',
+    provider: SKILL_PROVIDER_NAME,
+  } as const
   const summary = () => {
     const apps = source.apps()
     const automatic = source.autoInvoke && apps.length > 0
@@ -179,12 +194,14 @@ export function createEntrySkillProvider(source: EntrySkillSource): {
       return {
         name: SKILL_PROVIDER_NAME,
         list: (options) => {
-          if (options.cwd !== undefined && source.inRepositories(options.cwd)) return Promise.resolve([])
+          const kit = { ...kitSummary, rank: BUNDLED_SKILL_RANK, locator: KIT_SKILL_NAME }
+          if (options.cwd !== undefined && source.inRepositories(options.cwd)) return Promise.resolve([kit])
           const current = summary()
           listed = JSON.stringify(current)
-          return Promise.resolve([{ ...current, rank: BUNDLED_SKILL_RANK, locator: ENTRY_SKILL_NAME }])
+          return Promise.resolve([{ ...current, rank: BUNDLED_SKILL_RANK, locator: ENTRY_SKILL_NAME }, kit])
         },
         get: async (requested, options): Promise<SkillDefinition | undefined> => {
+          if (requested.name === KIT_SKILL_NAME) return { ...kitSummary, content: source.kit.content }
           if (requested.name !== ENTRY_SKILL_NAME) return undefined
           await source.prepare(options.signal)
           return { ...summary(), content: renderEntrySkill(source.apps(), source.maxAppsPerRequest(), source.skillUpdates()) }
