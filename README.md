@@ -109,7 +109,7 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
       enabled: true                    # 默认开启；false = 子 Agent 不记录 SKILL 不足，也不询问
       maxFiles: 16                     # 一次改进最多新增或修改的文件数
       maxFileBytes: 262144             # 改进中单个文件和 SKILL 不足记录的大小上限
-    skillUpdateAuthor:                 # 可选：SKILL 改进与接入初稿提交的作者；省略时由 dshRepos 服务决定
+    skillUpdateAuthor:                 # 可选：SKILL 改进与接入初稿提交的作者；省略时是该主机令牌所属的账号
       name: 观象
       email: logalyze@example.com
     analyze:                           # 日志平台分析接口，见下文
@@ -176,7 +176,7 @@ skill: log-analysis             # 对应 .agents/skills/log-analysis/SKILL.md
 
 - 支持 GitLab（包括自建实例）和 GitHub。应用仓库的 https 地址要能被 `dshRepos` 识别为已配置主机上的仓库；该主机的令牌要能推送分支和创建合并请求（GitLab 上需要 `api` 权限，GitHub 上需要 Contents 和 Pull requests 的读写权限）。
 - 有写权限的令牌可以改动它能访问的所有项目。建议用只覆盖应用仓库的项目或组访问令牌，设置过期时间，并保护应用仓库的默认分支。
-- 合并请求以该主机令牌主人的身份创建，提交作者是 `skillUpdateAuthor`，省略时由 `dshRepos` 服务决定。飞书群里点「允许」的人可能不是令牌主人；合并请求描述写明了来源会话与分析提交。
+- 合并请求以该主机令牌所属账号的身份创建；提交作者和提交者默认也是这个账号，配置 `skillUpdateAuthor` 时用它。飞书群里点「允许」的人可能不是令牌账号；提交说明末尾有 `DSH-Session: <会话 id>`，合并请求描述也写明了来源会话与分析提交。
 - 日志内容不可信，可能诱导模型写出不当的 SKILL 或在案例里留下未脱敏的数据。观象只限制改动范围，内容需要合并请求的评审者把关。
 
 ## 在对话中接入仓库

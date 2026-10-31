@@ -116,8 +116,10 @@ export interface WorkspacePushOptions extends CallOptions {
   readonly branch: string
   /** Message of the commit recording the uncommitted changes. */
   readonly message: string
-  /** Author and committer of that commit; default: chosen by the provider. */
+  /** Author and committer of that commit; default: the account that owns the host token. */
   readonly author?: CommitAuthor
+  /** Session added to that commit's message as a `DSH-Session:` trailer. */
+  readonly session?: string
 }
 
 /** Outcome of {@link DshRepos.pushWorkspace}. */

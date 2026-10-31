@@ -272,7 +272,7 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     answer.value = 'allowed-once'
     const opened = await initializer.submit({ workDir }, exec)
     expect(opened).toMatchObject({ status: 'opened', mergeRequestUrl: MR_URL, branch: rejected.branch })
-    expect(pushWorkspace).toHaveBeenCalledWith(join(workDir, 'repo'), expect.objectContaining({ branch: opened.branch, author: { name: '观象', email: 'logalyze@example.com' } }))
+    expect(pushWorkspace).toHaveBeenCalledWith(join(workDir, 'repo'), expect.objectContaining({ branch: opened.branch, author: { name: '观象', email: 'logalyze@example.com' }, session: 'parent' }))
     const [push] = repos.pushes
     expect(push?.files).toEqual({
       '.agents/logalyze.yaml': MANIFEST,

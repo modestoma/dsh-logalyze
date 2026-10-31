@@ -48,6 +48,7 @@ export interface RecordedPush {
   readonly branch: string
   readonly message: string
   readonly author?: CommitAuthor
+  readonly session?: string
   readonly commit: string
   /** Files of the pushed commit, by path. */
   readonly files: Record<string, string>
@@ -235,7 +236,7 @@ export class FakeRepos implements DshRepos {
 
   async pushWorkspace(dir: string, options: WorkspacePushOptions): Promise<WorkspacePushResult> {
     const workspace = this.workspace(dir)
-    const { branch, message, author } = options
+    const { branch, message, author, session } = options
     if (workspace.branch !== undefined && workspace.branch !== branch) throw repoError('invalid', `工作区已推送到 ${workspace.branch}`)
     if (branch === workspace.baseBranch) throw repoError('invalid', `不能推送到基准分支 ${branch}`)
     const env = { GIT_INDEX_FILE: workspace.index }
@@ -260,7 +261,7 @@ export class FakeRepos implements DshRepos {
     for (const path of (await git(workspace.mirror, 'diff', '--name-only', '--diff-filter=AM', workspace.baseCommit, commit)).split('\n').filter(Boolean)) {
       files[path] = await git(workspace.mirror, 'cat-file', 'blob', `${commit}:${path}`)
     }
-    this.pushes.push({ dir, branch, message, ...author === undefined ? {} : { author }, commit, files })
+    this.pushes.push({ dir, branch, message, ...author === undefined ? {} : { author }, ...session === undefined ? {} : { session }, commit, files })
     return { branch, commit }
   }
 

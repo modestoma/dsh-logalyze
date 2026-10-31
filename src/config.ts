@@ -115,7 +115,7 @@ const configSchema = z.object({
   analyzeTokenRef: z.string().trim().regex(TOKEN_ENV_PATTERN, '令牌名称只能包含字母、数字和下划线，且不能以数字开头').default('LOGALYZE_ANALYZE_TOKEN'),
   /**
    * Author and committer of SKILL improvement and onboarding commits;
-   * omitted leaves the choice to the `dshRepos` service.
+   * default: the account that owns the host token.
    */
   skillUpdateAuthor: authorSchema.optional(),
   /** Registered `ctx.subagents` provider the children start on. */

@@ -289,13 +289,14 @@ describe('logalyze_improve_skill', () => {
       branch: value.branch,
       message: expect.any(String),
       author: { name: '观象', email: 'logalyze@example.com' },
+      session: 'parent',
       signal: exec.signal,
     })
     const [push] = repos.service.pushes
     expect(Object.keys(push!.files)).toEqual([SKILL, IN_SKILL(CASE)])
     expect(push?.author).toEqual({ name: '观象', email: 'logalyze@example.com' })
     expect(git(origin, 'rev-parse', `${value.branch}^`).trim()).toBe(status.commit)
-    expect(push?.message).toMatch(new RegExp(`^补充 traceId 字段说明与案例\\n\\n# 补充 traceId[\\s\\S]*\\n\\nProposed-by: 观象 Logalyze\\nAnalyzed-commit: ${task.commit}\\nSession: parent\\n$`))
+    expect(push?.message).toMatch(new RegExp(`^补充 traceId 字段说明与案例\\n\\n# 补充 traceId[\\s\\S]*\\n\\nProposed-by: 观象 Logalyze\\nAnalyzed-commit: ${task.commit}\\n$`))
     expect(repos.createChange).toHaveBeenCalledWith(origin, {
       title: '补充 traceId 字段说明与案例',
       body: expect.stringMatching(/^由观象在日志分析后经用户同意提出（应用 order-service，分析提交 [0-9a-f]{12}，会话 parent）。请评审案例和 SKILL 修改。\n\n# 补充 traceId/),
@@ -473,7 +474,8 @@ describe('logalyze_improve_skill', () => {
     expect(value).toMatchObject({ status: 'opened', files: [{ path: SKILL, added: 2, removed: 0 }] })
     expect(value.workDir).toBeUndefined()
     const [push] = repos.service.pushes
-    expect(push?.message).toBe('修正日志时区说明\n\n修正日志时区说明\n\n- SKILL.md：时间是 UTC\n\nProposed-by: 观象 Logalyze\nSession: parent\n')
+    expect(push?.message).toBe('修正日志时区说明\n\n修正日志时区说明\n\n- SKILL.md：时间是 UTC\n\nProposed-by: 观象 Logalyze\n')
+    expect(push?.session).toBe('parent')
     expect(repos.createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ body: expect.stringMatching(/^由观象按用户反馈提出（应用 order-service，会话 parent）。请评审 SKILL 修改。/) }))
     expect(task.workDir).not.toBe(improveDir)
   })

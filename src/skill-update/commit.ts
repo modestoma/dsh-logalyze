@@ -46,6 +46,8 @@ export interface PushRequest {
   readonly title: string
   readonly body: string
   readonly author?: CommitAuthor
+  /** Session recorded in the commit message by `dshRepos`. */
+  readonly session: string
 }
 
 /** One submission that asks before pushing. */
@@ -105,6 +107,7 @@ export async function pushChange(request: PushRequest): Promise<SubmitOutcome> {
       branch,
       message: request.message,
       ...request.author === undefined ? {} : { author: request.author },
+      session: request.session,
       signal: exec.signal,
     })
   } catch (error) {
