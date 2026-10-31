@@ -193,6 +193,18 @@ export class RepoRegistry {
   }
 
   /**
+   * Find one usable application.
+   * @param id - application id.
+   * @returns the application with its repository and latest synced commit.
+   * @throws when the id does not name a usable application; the message says why and lists the usable ids.
+   */
+  readyApp(id: string): ReadyApp {
+    const found = this.readyApps().find(ready => ready.app.id === id)
+    if (found === undefined) throw new Error(this.unknownMessage([id]))
+    return found
+  }
+
+  /**
    * Hold a snapshot of each requested application's latest synced commit for
    * one dispatch. Every id must resolve to a usable application, or nothing is
    * held.
@@ -230,6 +242,60 @@ export class RepoRegistry {
     return {
       apps: new Map(held.map(({ id, app }, index) => [id, { ...app, dir: (leases[index] as SnapshotLease).dir }])),
       release,
+    }
+  }
+
+  /**
+   * The panel view of one configured repository.
+   * @param url - git address.
+   * @returns its status, or undefined when it is not configured.
+   */
+  statusOf(url: string): RepoStatusWire | undefined {
+    return this.status().find(repo => repo.url === url)
+  }
+
+  /**
+   * Addresses that synced but have no application: the description or its
+   * SKILL is missing or invalid at the latest synced commit.
+   * @returns those addresses, ordered as configured.
+   */
+  setupPending(): string[] {
+    return this.entries.filter(entry => entry.commit !== undefined && entry.app === undefined && entry.syncing === undefined).map(entry => entry.spec.url)
+  }
+
+  /**
+   * Hold a snapshot of a configured repository's latest synced commit.
+   * @param url - configured repository address.
+   * @returns the commit, its read-only checkout, and the release; release exactly once.
+   * @throws when the address is not configured or never synced, dsh-repo is unavailable, or the snapshot cannot be created.
+   */
+  async acquireRepo(url: string): Promise<{ readonly commit: string; readonly dir: string; release(): void }> {
+    const entry = this.entries.find(item => item.spec.url === url)
+    if (entry === undefined) throw new Error(`仓库 ${url} 不在应用仓库列表中`)
+    const commit = entry.commit
+    if (commit === undefined) throw new Error(`仓库 ${url} 还没有同步成功${entry.error === undefined ? '' : `：${entry.error}`}`)
+    const service = requireRepos(this.deps.repos())
+    entry.activeRuns += 1
+    this.deps.onChange()
+    let lease: SnapshotLease
+    try {
+      lease = await service.acquireSnapshot(url, commit)
+    } catch (error) {
+      entry.activeRuns -= 1
+      this.deps.onChange()
+      throw new Error(`仓库 ${url} 的代码快照创建失败：${messageOf(error)}`)
+    }
+    let released = false
+    return {
+      commit,
+      dir: lease.dir,
+      release: () => {
+        if (released) return
+        released = true
+        lease.release()
+        entry.activeRuns -= 1
+        this.deps.onChange()
+      },
     }
   }
 

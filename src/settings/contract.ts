@@ -41,13 +41,13 @@ export interface DownloadSettings {
   timeoutMs: number
 }
 
-/** Application SKILL improvement proposals that children may write and the top-level agent may submit as merge requests. */
+/** Application SKILL improvement: children record SKILL gaps, and after the user agrees an improvement child drafts a case and SKILL changes that are submitted as a merge request. */
 export interface SkillUpdateSettings {
-  /** Whether children are told how to propose SKILL changes and top-level agents are offered `logalyze_propose_skill`. */
+  /** Whether children are told to record SKILL gaps and top-level agents are offered `logalyze_improve_skill`. */
   enabled: boolean
-  /** Most files one proposal may add or change. */
+  /** Most files one improvement may add or change. */
   maxFiles: number
-  /** Largest proposed file, in bytes. */
+  /** Largest file of an improvement or gap record, in bytes. */
   maxFileBytes: number
 }
 
@@ -69,7 +69,7 @@ export interface EditableSettings {
   dispatchTimeoutMs: number
   /** URL download policy. */
   download: DownloadSettings
-  /** SKILL improvement proposals. */
+  /** SKILL improvement. */
   skillUpdates: SkillUpdateSettings
   /** Log-platform analyze API. */
   analyze: AnalyzeSettings
@@ -138,7 +138,7 @@ export interface TokenStatusWire {
 
 /**
  * Whether dsh-repo provides the `dshRepos` service this plugin mirrors
- * repositories and submits proposals through: `missing` while it is not
+ * repositories and submits SKILL improvements and setup drafts through: `missing` while it is not
  * loaded, `incompatible` when its contract version is not the one this
  * plugin speaks.
  */

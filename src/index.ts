@@ -4,11 +4,15 @@
  * 提供入口 SKILL `/logalyze`（识别日志属于哪个应用；用户显式调用，或在
  * 任务匹配已注册应用时由顶层 Agent 自行加载）和
  * `logalyze_dispatch` 工具（按应用派发子 Agent，工作目录为该应用的代码
- * 仓库，首条消息用 `/<skill>` 加载仓库里的日志分析 SKILL），以及开启 SKILL
- * 改进时的 `logalyze_propose_skill` 工具（经用户授权后经 dsh-repo 把子 Agent
- * 的 SKILL 修改提议提交到新分支并创建合并请求）。应用仓库在设置
+ * 仓库，首条消息用 `/<skill>` 加载仓库里的日志分析 SKILL），以及 SKILL 改进
+ * 工具：`logalyze_show_skill` 只读查看应用 SKILL；`logalyze_improve_skill` 在
+ * 子 Agent 记录了 SKILL 不足或用户要求纠正时询问用户是否改进，同意后由改进子
+ * Agent 按 `/logalyze-improve` 修改 SKILL 并沉淀案例，经 dsh-repo 提交到新分支
+ * 并创建合并请求。应用仓库在设置
  * 面板中只填 git 地址，由插件拉取；应用描述来自各仓库的
- * `.agents/logalyze.yaml`。另提供日志平台分析接口 `POST /open-api/logalyze`，
+ * `.agents/logalyze.yaml`。顶层 Agent 还可以用 `logalyze_add_repo` 在对话中
+ * 添加仓库，并用 `logalyze_init_repo` / `logalyze_submit_init` 为缺少应用描述
+ * 的仓库起草并提交接入合并请求。另提供日志平台分析接口 `POST /open-api/logalyze`，
  * 经 dsh-channels 的 `feishuTopics` 服务在飞书群话题中开始分析。
  *
  * @module dsh-logalyze
@@ -22,6 +26,7 @@ import { LogalyzeService } from './service.ts'
 import type { ServiceOptions } from './service.ts'
 import { defaultOverlayPath, OverlayStore } from './settings/overlay.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
+import { loadBundledSkills } from './skill/bundled.ts'
 
 export type * from './settings/contract.ts'
 export type { LogalyzeConfig, SettingsOverlay } from './config.ts'
@@ -29,9 +34,19 @@ export { pluginConfigSchema, resolveConfig } from './config.ts'
 export { DISPATCH_TOOL_NAME, Dispatcher } from './dispatch/tool.ts'
 export type { DispatchValue, TaskResult } from './dispatch/tool.ts'
 export { renderChildPrompt } from './dispatch/prompt.ts'
-export { PROPOSE_TOOL_NAME, SkillUpdater } from './skill-update/tool.ts'
-export type { DispatchedTask, ProposalCheck, ProposeStatus, ProposeValue } from './skill-update/tool.ts'
+export { IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from './skill-update/names.ts'
+export { SkillViewer } from './skill-update/show.ts'
+export type { ShowSkillValue } from './skill-update/show.ts'
+export { SkillImprover } from './skill-update/tool.ts'
+export type { AnalyzedTask, ImproveStatus, ImproveValue } from './skill-update/tool.ts'
+export type { GapCheck } from './skill-update/gap.ts'
+export { ADD_REPO_TOOL_NAME, INIT_REPO_TOOL_NAME, SUBMIT_INIT_TOOL_NAME } from './onboard/names.ts'
+export { RepoAdder } from './onboard/add.ts'
+export type { AddRepoStatus, AddRepoValue, RepoSetup } from './onboard/add.ts'
+export { RepoInitializer } from './onboard/init.ts'
+export type { DraftCheck, InitRepoValue, SubmitInitValue } from './onboard/init.ts'
 export { ENTRY_SKILL_NAME, renderEntrySkill } from './skill/entry.ts'
+export { IMPROVE_SKILL_NAME, KIT_SKILL_NAME } from './skill/bundled.ts'
 export { RepoRegistry } from './repos/registry.ts'
 export { readAppManifest, MANIFEST_PATH } from './repos/manifest.ts'
 export { LogalyzeService } from './service.ts'
@@ -55,15 +70,18 @@ export interface LogalyzePluginOptions extends ServiceOptions {
 }
 
 /**
- * Install the entry skill, the dispatch and SKILL proposal tools, the settings
- * routes, and the analyze route, then mirror or update the configured
- * repositories in the background and again after each dsh-repo host change.
+ * Install the entry skill, the bundled guide skills, the dispatch, SKILL
+ * view and improvement, and repository
+ * onboarding tools, the settings routes, and the analyze route, then mirror
+ * or update the configured repositories in the background and again after
+ * each dsh-repo host change.
  * @param ctx - plugin context.
  * @param config - loader-validated configuration.
  * @param options - test seams.
  */
 export function apply(ctx: HostContext, config?: unknown, options: LogalyzePluginOptions = {}): void {
-  const service = new LogalyzeService(ctx, resolveConfig(config), new OverlayStore(options.overlayPath ?? defaultOverlayPath()), options)
+  const bundled = loadBundledSkills(new URL('../skills/', import.meta.url))
+  const service = new LogalyzeService(ctx, resolveConfig(config), new OverlayStore(options.overlayPath ?? defaultOverlayPath()), { bundled }, options)
   service.registerSkill()
   service.registerTool()
   mountSettingsRoutes(ctx, service)

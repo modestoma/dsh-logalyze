@@ -51,7 +51,8 @@ export function isAcceptedBranch(value: string): boolean {
     && !value.endsWith('.lock')
 }
 
-const repoSchema = z.object({
+/** One application repository: git address and optional branch. */
+export const repoSchema = z.object({
   url: z.string().trim().min(1, 'git 地址不能为空').refine(isAcceptedGitUrl, '不支持的 git 地址（支持 https/ssh/git/file URL、user@host:path 或绝对路径）'),
   branch: z.string().trim().optional().transform(value => value === '' ? undefined : value)
     .refine(value => value === undefined || isAcceptedBranch(value), '分支名不合法'),
@@ -70,7 +71,7 @@ const downloadSchema = z.object({
 }).strict()
 
 const skillUpdatesSchema = z.object({
-  enabled: z.boolean().default(false),
+  enabled: z.boolean().default(true),
   maxFiles: z.number().int().min(1).max(256).default(16),
   maxFileBytes: z.number().int().min(1).max(16 * 1024 * 1024).default(256 * 1024),
 }).strict()

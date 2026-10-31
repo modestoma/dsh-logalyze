@@ -70,6 +70,18 @@ export function parseManifest(text: string): ManifestRead {
   return { ok: true, app: parsed.data }
 }
 
+function frontmatterOf(text: string): Record<string, unknown> | undefined {
+  const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u.exec(text)?.[1]
+  if (frontmatter === undefined) return undefined
+  try {
+    const metadata: unknown = parseYaml(frontmatter)
+    return typeof metadata === 'object' && metadata !== null ? metadata as Record<string, unknown> : undefined
+  } catch {
+    // Malformed frontmatter is reported by DSH's own skill loader, not here.
+    return undefined
+  }
+}
+
 /**
  * Whether a SKILL.md opts out of user invocation, which would turn the
  * dispatch prompt's `/<skill>` gesture into plain text.
@@ -77,16 +89,17 @@ export function parseManifest(text: string): ManifestRead {
  * @returns whether frontmatter sets `user-invocable: false`.
  */
 export function disablesUserInvocation(text: string): boolean {
-  const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u.exec(text)?.[1]
-  if (frontmatter === undefined) return false
-  try {
-    const metadata: unknown = parseYaml(frontmatter)
-    return typeof metadata === 'object' && metadata !== null
-      && (metadata as Record<string, unknown>)['user-invocable'] === false
-  } catch {
-    // Malformed frontmatter is reported by DSH's own skill loader, not here.
-    return false
-  }
+  return frontmatterOf(text)?.['user-invocable'] === false
+}
+
+/**
+ * The name a SKILL.md registers under, which `/<skill>` addresses.
+ * @param text - SKILL.md content.
+ * @returns the frontmatter `name`, or undefined when absent or not a string.
+ */
+export function skillNameOf(text: string): string | undefined {
+  const name = frontmatterOf(text)?.name
+  return typeof name === 'string' ? name : undefined
 }
 
 /**

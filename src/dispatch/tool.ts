@@ -7,8 +7,9 @@
  *   `<父会话目录>/.logalyze/runs/<runId>/<序号>-<应用 id>/`，该目录也是子 Agent
  *   解压日志的可写目录。
  * - 超时（`dispatchTimeoutMs`）或调用被取消时停止全部仍在运行的子 Agent。
- * - 开启 SKILL 改进时，子 Agent 可以在运行目录写 SKILL 修改提议；派发结束后
- *   检查已完成任务的提议，并在结果中给出改动统计或提议不可用的原因。
+ * - 开启 SKILL 改进时，子 Agent 在 SKILL 不足时于运行目录写 `skill-gap.md`；派发
+ *   结束后检查已完成任务的记录，并在结果中标出 SKILL 不足，供父 Agent 询问用户
+ *   是否改进。
  * - 子会话（委派深度大于 0）中不提供本工具。
  *
  * @module dsh-logalyze/dispatch/tool
@@ -22,8 +23,9 @@ import { describeIssue } from '../config.ts'
 import type { Agent, ContentBlock, SubagentActivation, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
 import type { RepoRegistry } from '../repos/registry.ts'
 import type { AppManifest, EditableSettings } from '../settings/contract.ts'
-import { describeFiles, PROPOSE_TOOL_NAME } from '../skill-update/tool.ts'
-import type { DispatchedTask, ProposalCheck } from '../skill-update/tool.ts'
+import type { GapCheck } from '../skill-update/gap.ts'
+import { IMPROVE_TOOL_NAME } from '../skill-update/names.ts'
+import type { AnalyzedTask } from '../skill-update/tool.ts'
 import { admitUrl, downloadLog, fileNameFor } from './download.ts'
 import { renderChildPrompt } from './prompt.ts'
 import type { ChildLog } from './prompt.ts'
@@ -31,7 +33,8 @@ import type { ChildLog } from './prompt.ts'
 /** Model-facing tool name. */
 export const DISPATCH_TOOL_NAME = 'logalyze_dispatch'
 
-const logSchema = z.union([
+/** One log item of a model request: a local path or a download URL, with an optional filter. */
+export const logSchema = z.union([
   z.object({ path: z.string().trim().min(1), filter: z.string().trim().min(1).optional() }).strict(),
   z.object({ url: z.string().trim().min(1), filter: z.string().trim().min(1).optional() }).strict(),
 ], { error: '每个日志项必须是 { path } 或 { url } 之一（可带 filter）' })
@@ -64,8 +67,8 @@ export interface TaskResult {
   workDir: string
   /** Absolute log paths handed to the child. */
   logs: string[]
-  /** The SKILL improvement proposal the child wrote, when proposals are enabled and it wrote one. */
-  skillProposal?: ProposalCheck
+  /** The SKILL gap record the child wrote, when SKILL improvement is enabled and it wrote one. */
+  skillGap?: GapCheck
 }
 
 /** Canonical tool value. */
@@ -97,22 +100,14 @@ const OUTPUT_SCHEMA = {
           diagnostic: { type: 'string' },
           workDir: { type: 'string' },
           logs: { type: 'array', items: { type: 'string' } },
-          skillProposal: {
+          skillGap: {
             type: 'object',
             additionalProperties: false,
             required: ['ok'],
             properties: {
               ok: { type: 'boolean' },
-              files: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  additionalProperties: false,
-                  required: ['path'],
-                  properties: { path: { type: 'string' }, added: { type: 'number' }, removed: { type: 'number' } },
-                },
-              },
-              diffPath: { type: 'string' },
+              path: { type: 'string' },
+              preview: { type: 'string' },
               error: { type: 'string' },
             },
           },
@@ -132,11 +127,11 @@ const STATUS_LABELS: Record<string, string> = {
   failed: '未能启动',
 }
 
-function renderProposal(result: TaskResult): string {
-  const proposal = result.skillProposal
-  if (proposal === undefined) return ''
-  if (!proposal.ok) return `\n\nSKILL 修改提议不可提交：${proposal.error}`
-  return `\n\nSKILL 修改提议：${describeFiles(proposal.files)}。diff 文件：${proposal.diffPath}。提交时调用 ${PROPOSE_TOOL_NAME}，workDir 为 ${result.workDir}。`
+function renderGap(result: TaskResult): string {
+  const gap = result.skillGap
+  if (gap === undefined) return ''
+  if (!gap.ok) return `\n\nSKILL 不足记录不可用：${gap.error}`
+  return `\n\nSKILL 不足（记录在 ${gap.path}）：${gap.preview}\n汇总回复写完后调用 ${IMPROVE_TOOL_NAME}（workDir 为 ${result.workDir}），工具会询问用户是否改进。`
 }
 
 /**
@@ -149,7 +144,7 @@ export function renderDispatchValue(value: DispatchValue): ContentBlock[] {
     const label = STATUS_LABELS[result.status] ?? result.status
     const body = result.output.trim() === '' ? '（子 Agent 没有给出结论）' : result.output.trim()
     const diagnostic = result.diagnostic === undefined ? '' : `\n\n诊断：${result.diagnostic}`
-    return `### ${result.name}（${result.app}）— ${label}\n\n${body}${diagnostic}${renderProposal(result)}`
+    return `### ${result.name}（${result.app}）— ${label}\n\n${body}${diagnostic}${renderGap(result)}`
   })
   return [{ type: 'text', text: `观象派发 ${value.runId} 结束，运行目录 ${value.runDir}。\n\n${sections.join('\n\n')}` }]
 }
@@ -204,22 +199,22 @@ export interface DispatchDeps {
   readonly provider: string
   /** The working-directory service, when the composition has one. */
   workingDirectory(): WorkingDirectoryService | undefined
-  /** SKILL improvement proposals; omitted never mentions them to children. */
-  readonly proposals?: ProposalInbox
+  /** SKILL gap records; omitted never mentions them to children. */
+  readonly gaps?: GapInbox
   readonly fetch?: typeof fetch
   readonly now?: () => Date
 }
 
-/** Where finished tasks go to have their SKILL proposals checked. */
-export interface ProposalInbox {
-  /** Whether children are told how to propose SKILL changes. */
+/** Where finished tasks go to have their SKILL gap records checked. */
+export interface GapInbox {
+  /** Whether children are told to record SKILL gaps. */
   enabled(): boolean
   /**
-   * Remember a finished task and check its proposal.
-   * @param task - the dispatched task.
-   * @returns the check, or undefined when the task wrote no proposal.
+   * Check a finished task's gap record and remember the task when it has one.
+   * @param task - the finished analysis.
+   * @returns the check, or undefined when the task wrote no record.
    */
-  inspect(task: DispatchedTask): Promise<ProposalCheck | undefined>
+  inspect(task: AnalyzedTask): Promise<GapCheck | undefined>
 }
 
 /**
@@ -231,7 +226,12 @@ export function isDelegatedAgent(agent: Agent): boolean {
   return (agent.session.header.delegationDepth ?? 0) > 0
 }
 
-function newRunId(now: Date): string {
+/**
+ * A new run id: local timestamp plus a random suffix.
+ * @param now - current time.
+ * @returns `YYYYMMDD-HHMMSS-xxxxxx`.
+ */
+export function newRunId(now: Date): string {
   const pad = (value: number): string => String(value).padStart(2, '0')
   const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
   return `${stamp}-${randomBytes(3).toString('hex')}`
@@ -246,6 +246,81 @@ function newRunId(now: Date): string {
 export function isInside(child: string, parent: string): boolean {
   const path = relative(parent, child)
   return path === '' || (!path.startsWith('..') && !isAbsolute(path))
+}
+
+/** Where a top-level agent's run directories live. */
+export interface RunBase {
+  /** The agent's effective working directory; relative log paths resolve against it. */
+  readonly effectiveDir: string
+  /** Directory holding `.logalyze/runs/`: the effective directory when it lies in the project directory, else the project directory. */
+  readonly baseDir: string
+}
+
+/**
+ * Resolve where an agent's run directories go.
+ * @param parent - calling top-level agent.
+ * @param workingDirectory - the working-directory service, when the composition has one.
+ * @param signal - cancellation.
+ * @returns the effective and base directories.
+ * @throws when the session has no project directory.
+ */
+export async function resolveRunBase(parent: Agent, workingDirectory: WorkingDirectoryService | undefined, signal: AbortSignal): Promise<RunBase> {
+  const projectDir = parent.session.header.cwd
+  if (projectDir === undefined) throw new Error('当前会话没有项目目录，无法创建运行目录')
+  const effectiveDir = await workingDirectory?.ensure(parent, signal) ?? projectDir
+  return { effectiveDir, baseDir: isInside(effectiveDir, projectDir) ? effectiveDir : projectDir }
+}
+
+/** A checked log source: an existing local path or an admitted download URL. */
+export type LogSource =
+  | { readonly path: string; readonly url?: undefined; readonly filter?: string | undefined }
+  | { readonly url: string; readonly path?: undefined; readonly filter?: string | undefined }
+
+/**
+ * Check log items before anything starts: local paths must exist, URLs must
+ * pass the download policy.
+ * @param logs - validated log items.
+ * @param effectiveDir - directory relative paths resolve against.
+ * @param download - download policy.
+ * @returns the sources in order.
+ * @throws when a path is unreadable or a URL is not admitted.
+ */
+export async function admitLogs(logs: readonly z.output<typeof logSchema>[], effectiveDir: string, download: EditableSettings['download']): Promise<LogSource[]> {
+  return await Promise.all(logs.map(async (log): Promise<LogSource> => {
+    if ('url' in log) return { url: admitUrl(log.url, download).href, filter: log.filter }
+    const path = resolve(effectiveDir, log.path)
+    try {
+      await stat(path)
+    } catch (error) {
+      throw new Error(`日志路径不可读：${path}（${(error as NodeJS.ErrnoException).code ?? messageOf(error)}）`)
+    }
+    return { path, filter: log.filter }
+  }))
+}
+
+/**
+ * Turn admitted sources into local paths, downloading URLs into a run directory.
+ * @param sources - admitted sources.
+ * @param workDir - run directory receiving downloads.
+ * @param download - download policy.
+ * @param signal - cancellation.
+ * @param fetchImpl - fetch implementation.
+ * @returns the logs as handed to a child.
+ * @throws when a download fails.
+ */
+export async function materializeLogs(sources: readonly LogSource[], workDir: string, download: EditableSettings['download'], signal: AbortSignal, fetchImpl?: typeof fetch): Promise<ChildLog[]> {
+  const logs: ChildLog[] = []
+  for (const [position, source] of sources.entries()) {
+    const filter = source.filter === undefined ? {} : { filter: source.filter }
+    if (source.path !== undefined) {
+      logs.push({ path: source.path, ...filter })
+      continue
+    }
+    const name = `${position + 1}-${fileNameFor(new URL(source.url), 'log')}`
+    const file = await downloadLog(source.url, workDir, name, download, signal, fetchImpl)
+    logs.push({ path: file.path, url: source.url, ...filter })
+  }
+  return logs
 }
 
 function textOf(blocks: readonly ContentBlock[]): string {
@@ -298,21 +373,8 @@ export class Dispatcher {
     if (tasks.length > settings.maxAppsPerRequest) {
       throw new Error(`一次最多派发 ${settings.maxAppsPerRequest} 个任务，本次有 ${tasks.length} 个；请合并或分批`)
     }
-    const projectDir = parent.session.header.cwd
-    if (projectDir === undefined) throw new Error('当前会话没有项目目录，无法创建运行目录')
-    const effectiveDir = await this.deps.workingDirectory()?.ensure(parent, exec.signal) ?? projectDir
-    const baseDir = isInside(effectiveDir, projectDir) ? effectiveDir : projectDir
-
-    const sources = await Promise.all(tasks.map(task => Promise.all(task.logs.map(async (log) => {
-      if ('url' in log) return { url: admitUrl(log.url, settings.download).href, filter: log.filter }
-      const path = resolve(effectiveDir, log.path)
-      try {
-        await stat(path)
-      } catch (error) {
-        throw new Error(`日志路径不可读：${path}（${(error as NodeJS.ErrnoException).code ?? messageOf(error)}）`)
-      }
-      return { path, filter: log.filter }
-    }))))
+    const { effectiveDir, baseDir } = await resolveRunBase(parent, this.deps.workingDirectory(), exec.signal)
+    const sources = await Promise.all(tasks.map(task => admitLogs(task.logs, effectiveDir, settings.download)))
 
     const lease = await this.deps.registry.acquire(tasks.map(task => task.app))
     try {
@@ -324,28 +386,26 @@ export class Dispatcher {
         if (ready === undefined) throw new Error(`应用「${task.app}」不可用`)
         const workDir = join(runDir, `${index + 1}-${task.app}`)
         await mkdir(workDir, { recursive: true })
-        const logs: ChildLog[] = []
-        for (const [position, source] of (sources[index] ?? []).entries()) {
-          const filter = source.filter === undefined ? {} : { filter: source.filter }
-          if (source.path !== undefined) {
-            logs.push({ path: source.path, ...filter })
-            continue
-          }
-          const url = new URL(source.url)
-          const name = `${position + 1}-${fileNameFor(url, 'log')}`
-          const file = await downloadLog(source.url, workDir, name, settings.download, exec.signal, this.deps.fetch)
-          logs.push({ path: file.path, url: source.url, ...filter })
-        }
+        const logs = await materializeLogs(sources[index] ?? [], workDir, settings.download, exec.signal, this.deps.fetch)
         return { task, ready, workDir, logs }
       }))
-      const proposals = this.deps.proposals?.enabled() === true ? this.deps.proposals : undefined
-      const results = await this.runChildren(parent, prepared, settings, exec.signal, proposals !== undefined)
-      if (proposals !== undefined) {
+      const gaps = this.deps.gaps?.enabled() === true ? this.deps.gaps : undefined
+      const results = await this.runChildren(parent, prepared, settings, exec.signal, gaps !== undefined)
+      if (gaps !== undefined) {
         await Promise.all(results.map(async (result, index) => {
           const item = prepared[index]
           if (result.status !== 'completed' || item === undefined) return
-          const check = await proposals.inspect({ workDir: result.workDir, sessionId: parent.session.header.id, app: item.ready.app, url: item.ready.url, commit: item.ready.commit })
-          if (check !== undefined) result.skillProposal = check
+          const check = await gaps.inspect({
+            workDir: result.workDir,
+            sessionId: parent.session.header.id,
+            app: item.ready.app,
+            url: item.ready.url,
+            commit: item.ready.commit,
+            question: item.task.question,
+            output: result.output,
+            logs: result.logs,
+          })
+          if (check !== undefined) result.skillGap = check
         }))
       }
       return { runId, runDir, results }
@@ -359,7 +419,7 @@ export class Dispatcher {
     prepared: readonly { task: DispatchArgs['tasks'][number]; ready: { app: AppManifest; dir: string; commit: string }; workDir: string; logs: ChildLog[] }[],
     settings: EditableSettings,
     signal: AbortSignal,
-    proposals: boolean,
+    gaps: boolean,
   ): Promise<TaskResult[]> {
     const deadline = AbortSignal.timeout(settings.dispatchTimeoutMs)
     const stop = AbortSignal.any([signal, deadline])
@@ -374,7 +434,7 @@ export class Dispatcher {
           label: `${ready.app.name}分析`,
           request: {
             cwd: ready.dir,
-            prompt: [{ type: 'text', text: renderChildPrompt({ app: ready.app, commit: ready.commit, question: task.question, logs, workDir, proposals }) }],
+            prompt: [{ type: 'text', text: renderChildPrompt({ app: ready.app, commit: ready.commit, question: task.question, logs, workDir, gaps }) }],
             parent,
             ...maxDepth === undefined ? {} : { maxDepth },
           },
