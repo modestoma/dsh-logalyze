@@ -3,7 +3,8 @@
  * （{@link submitChange}）；SKILL 改进在起草前就已经征得用户同意，起草后直接
  * 推送（{@link pushChange}）：
  *
- * - 授权经 DSH 审批服务一次性请求，只有 `allowed-once` 才继续。
+ * - 授权经 DSH 审批服务一次性请求，只有 `allowed-once` 才继续；授权后重新检查
+ *   工作区，改动与提问时不同则不推送。
  * - 推送经 `dshRepos` 的 `pushWorkspace` 完成，提交工作区里未提交的改动，从不
  *   强推；远端已有同名分支时报告 `exists`。
  * - 分支推送后合并请求失败时报告 `pushed`，由用户手动创建。
@@ -14,6 +15,7 @@
 import type { Agent, ApprovalOutcome, HostApproval, ToolRunContext } from '../host.ts'
 import type { CommitAuthor, DshRepos } from '../repos/contract.ts'
 import { messageOf, repoErrorCode } from '../repos/lookup.ts'
+import { ProposalError } from './files.ts'
 
 /** How one submission ended. */
 export type SubmitStatus = 'opened' | 'pushed' | 'exists' | 'rejected' | 'cancelled' | 'unavailable'
@@ -51,7 +53,12 @@ export interface PushRequest {
 }
 
 /** One submission that asks before pushing. */
-export interface SubmitRequest extends PushRequest, ApprovalAsk {}
+export interface SubmitRequest extends PushRequest, ApprovalAsk {
+  /** Digest of the checked changes the prompt describes. */
+  readonly digest: string
+  /** Checks the workspace again and returns its current digest. */
+  readonly recheck: () => Promise<string>
+}
 
 /** Outcome of one submission. */
 export interface SubmitOutcome {
@@ -85,11 +92,13 @@ export async function askApproval(ask: ApprovalAsk): Promise<ApprovalOutcome> {
  * Ask once, then push and open the merge request.
  * @param request - workspace, change, and approval context.
  * @returns how the submission ended.
- * @throws the cancellation reason when the turn is cancelled, or the push failure; the branch is not created then.
+ * @throws the cancellation reason when the turn is cancelled, ProposalError when the changes differ from the approved ones or no longer pass the checks, or the push failure; the branch is not created then.
  */
 export async function submitChange(request: SubmitRequest): Promise<SubmitOutcome> {
   const outcome = await askApproval(request)
   if (outcome !== 'allowed-once') return { status: outcome }
+  // The workspace stays writable while the user decides.
+  if (await request.recheck() !== request.digest) throw new ProposalError('等待授权期间工作区的改动变了，没有推送；请重新提交，按新的改动重新请求授权')
   return await pushChange(request)
 }
 

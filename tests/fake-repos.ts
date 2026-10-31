@@ -201,7 +201,7 @@ export class FakeRepos implements DshRepos {
     await gitEnv({ GIT_INDEX_FILE: index }, mirror, 'read-tree', commit)
     await gitEnv({ GIT_INDEX_FILE: index }, mirror, `--work-tree=${dir}`, 'checkout-index', '-a')
     this.workspaces.set(dir, { url, mirror, index, baseBranch, baseCommit: commit, head: commit })
-    return { dir, baseCommit: commit }
+    return { url, dir, baseCommit: commit }
   }
 
   async workspaceChanges(dir: string): Promise<WorkspaceChanges> {
@@ -228,7 +228,7 @@ export class FakeRepos implements DshRepos {
       files.push({ path, status, ...previousPath === undefined ? {} : { previousPath }, binary: count.additions === undefined, ...count })
     }
     return {
-      workspace: { dir, baseCommit: workspace.baseCommit, ...workspace.branch === undefined ? {} : { branch: workspace.branch } },
+      workspace: { url: workspace.url, dir, baseCommit: workspace.baseCommit, ...workspace.branch === undefined ? {} : { branch: workspace.branch } },
       files,
       diff: await run('diff', '--cached', '-M', workspace.baseCommit),
     }

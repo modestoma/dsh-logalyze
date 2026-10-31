@@ -80,6 +80,8 @@ export interface WorkspaceOpenOptions extends CallOptions {
 
 /** A writable checkout opened by {@link DshRepos.openWorkspace}. */
 export interface WorkspaceInfo {
+  /** Repository address the workspace pushes to. */
+  readonly url: string
   /** Absolute directory of the checkout. */
   readonly dir: string
   /** Commit the work started from. */

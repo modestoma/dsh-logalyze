@@ -402,6 +402,8 @@ export class RepoInitializer {
     const title = `接入观象日志分析：${app.name}（${app.id}）`
     const preview = reason.replace(/\s+/g, ' ').slice(0, REASON_PREVIEW_CHARS)
     const outcome = await submitChange({
+      digest: changes.digest,
+      recheck: async () => (await checkInitDraft(requireRepos(this.deps.repos()), task.workDir, this.deps.settings().skillUpdates, exec.signal)).changes.digest,
       repos,
       approval,
       agent,

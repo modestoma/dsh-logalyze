@@ -12,8 +12,9 @@
  */
 
 import { join } from 'node:path'
-import type { DshRepos } from '../repos/contract.ts'
+import type { DshRepos, WorkspaceChanges } from '../repos/contract.ts'
 import { checkAppManifest, skillNameOf, skillPath } from '../repos/manifest.ts'
+import type { RepoFileReader } from '../repos/manifest.ts'
 import type { AppManifest, SkillUpdateSettings } from '../settings/contract.ts'
 import { ProposalError } from '../skill-update/files.ts'
 import { checkChanges, readReason, workspaceReader, WORKSPACE_DIR } from '../skill-update/workspace.ts'
@@ -33,6 +34,35 @@ export interface InitDraft {
 }
 
 /**
+ * A reader of the tree a push of the workspace publishes: changed files from
+ * the workspace, every other file from the base commit. A file that exists in
+ * the workspace but in neither is excluded by the repository's ignore rules.
+ * @param repos - the `dshRepos` service holding the workspace.
+ * @param changes - the workspace's changes.
+ * @param maxBytes - size ceiling.
+ * @param signal - cancellation.
+ * @returns the reader; it yields undefined for a path the push does not publish.
+ */
+function publishedReader(repos: DshRepos, changes: WorkspaceChanges, maxBytes: number, signal?: AbortSignal): RepoFileReader {
+  const { workspace } = changes
+  const disk = workspaceReader(workspace.dir, maxBytes)
+  const changed = new Map<string, string>()
+  for (const file of changes.files) {
+    if (file.previousPath !== undefined) changed.set(file.previousPath, 'deleted')
+    changed.set(file.path, file.status)
+  }
+  return async (path) => {
+    const status = changed.get(path)
+    if (status === 'deleted') return undefined
+    if (status !== undefined) return await disk(path)
+    const published = await repos.readMirrorFile(workspace.url, workspace.baseCommit, path, signal === undefined ? {} : { signal })
+    if (published === undefined && await disk(path) !== undefined) throw new ProposalError(`${path} 被仓库的忽略规则（.gitignore 等）排除，推送时不会包含它；请改用不被忽略的文件名`)
+    if (published !== undefined && Buffer.byteLength(published, 'utf8') > maxBytes) throw new ProposalError(`${path} 超过大小上限 ${maxBytes} 字节`)
+    return published
+  }
+}
+
+/**
  * Check one drafting run's workspace: the application it describes, then the
  * changes against the paths that application allows.
  * @param repos - the `dshRepos` service holding the workspace.
@@ -45,7 +75,7 @@ export interface InitDraft {
 export async function checkInitDraft(repos: DshRepos, workDir: string, limits: Pick<SkillUpdateSettings, 'maxFiles' | 'maxFileBytes'>, signal?: AbortSignal): Promise<InitDraft> {
   const dir = join(workDir, WORKSPACE_DIR)
   const changes = await repos.workspaceChanges(dir, signal === undefined ? {} : { signal })
-  const read = workspaceReader(dir, limits.maxFileBytes)
+  const read = publishedReader(repos, changes, limits.maxFileBytes, signal)
   const checked = await checkAppManifest(read)
   if (!checked.ok) throw new ProposalError(checked.error)
   const { app } = checked

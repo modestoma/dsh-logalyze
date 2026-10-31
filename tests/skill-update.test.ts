@@ -38,7 +38,7 @@ async function workspace(files: Record<string, string>, changes: Partial<Workspa
   return {
     root,
     changes: {
-      workspace: { dir: root, baseCommit: 'b'.repeat(40), ...branch === undefined ? {} : { branch } },
+      workspace: { url: 'https://code.example.com/team/app.git', dir: root, baseCommit: 'b'.repeat(40), ...branch === undefined ? {} : { branch } },
       files: changes.map(change => ({ path: '', status: 'added', binary: false, additions: 1, deletions: 0, ...change })),
       diff: 'diff --git a/x b/x\n',
     },

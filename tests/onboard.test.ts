@@ -130,9 +130,14 @@ describe('logalyze_add_repo', () => {
 
 describe('init drafts', () => {
   /** A workspace of a repository without `.agents/`, opened in a run directory. */
-  async function opened(): Promise<{ repos: FakeRepos; workDir: string }> {
+  async function opened(ignore?: string): Promise<{ repos: FakeRepos; workDir: string }> {
     const root = await dir()
     const origin = await bareRepo(join(root, 'order'))
+    if (ignore !== undefined) {
+      await writeFile(join(origin, '.gitignore'), ignore)
+      git(origin, 'add', '.gitignore')
+      git(origin, 'commit', '-qm', 'ignore')
+    }
     const repos = new FakeRepos(join(root, 'mirrors'))
     const head = await repos.syncMirror(origin)
     const workDir = join(root, 'project', '.logalyze', 'runs', 'r1', 'init')
@@ -173,6 +178,10 @@ describe('init drafts', () => {
     await writeDraft(deleted.workDir, { '.agents/logalyze.yaml': MANIFEST, '.agents/skills/order-logs/SKILL.md': SKILL })
     await rm(join(deleted.workDir, 'repo', 'README.md'))
     await expect(checkInitDraft(deleted.repos, deleted.workDir, LIMITS)).rejects.toThrow('工作区改动了 README.md')
+    // The repository ignores the SKILL, so a push would carry only the manifest.
+    const ignored = await opened('SKILL.md\n')
+    await writeDraft(ignored.workDir, { '.agents/logalyze.yaml': MANIFEST, '.agents/skills/order-logs/SKILL.md': SKILL })
+    await expect(checkInitDraft(ignored.repos, ignored.workDir, LIMITS)).rejects.toThrow('.agents/skills/order-logs/SKILL.md 被仓库的忽略规则')
   })
 })
 
@@ -291,6 +300,24 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     expect(pushWorkspace).toHaveBeenCalledTimes(1)
     await expect(initializer.submit({ workDir }, { ...exec, agent: { id: 'x', session: { header: { id: 'other' } } } })).rejects.toThrow('不是当前会话起草的任务')
     await expect(initializer.submit({ workDir: join(project, 'nope') }, exec)).rejects.toThrow('不是本次 DSH 运行中观象起草任务的运行目录')
+  })
+
+  it('does not push when the workspace changed while the user was deciding', async () => {
+    const { origin, pushWorkspace, approval, initializer, agent } = await setup(goodDraft)
+    const exec = { signal: new AbortController().signal, agent, callId: 'call-3' }
+    const { workDir } = await initializer.draft({ url: origin }, exec)
+    approval.request.mockImplementationOnce(async () => {
+      await writeFile(join(workDir, 'repo', 'pom.xml'), '<project/>')
+      return 'allowed-once'
+    })
+    await expect(initializer.submit({ workDir }, exec)).rejects.toThrow('工作区改动了 pom.xml')
+    await rm(join(workDir, 'repo', 'pom.xml'))
+    approval.request.mockImplementationOnce(async () => {
+      await writeFile(join(workDir, 'repo', '.agents', 'skills', 'order-logs', 'references', 'payment.md'), '# 支付回调（改）\n')
+      return 'allowed-once'
+    })
+    await expect(initializer.submit({ workDir }, exec)).rejects.toThrow('等待授权期间工作区的改动变了')
+    expect(pushWorkspace).not.toHaveBeenCalled()
   })
 
   it('reports a draft that cannot be submitted', async () => {
