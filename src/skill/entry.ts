@@ -11,7 +11,7 @@ import type { AppManifest } from '../settings/contract.ts'
 import type { BundledSkill } from './bundled.ts'
 import { DISPATCH_TOOL_NAME } from '../dispatch/tool.ts'
 import { ADD_REPO_TOOL_NAME } from '../onboard/names.ts'
-import { IMPROVE_TOOL_NAME } from '../skill-update/names.ts'
+import { IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from '../skill-update/names.ts'
 
 /** Entry skill name, addressed as `/logalyze`. */
 export const ENTRY_SKILL_NAME = 'logalyze'
@@ -66,8 +66,9 @@ export function renderCatalog(apps: readonly AppManifest[]): string {
 
 function improveStep(): string {
   return `
-5. **SKILL 改进。** 派发结果中某个应用标出「SKILL 不足」时，先照常写完汇总回复，在末尾另起一节「SKILL 改进」，用一两句话说明子 Agent 认为 SKILL 哪里不足。然后对每个这样的应用调用一次 \`${IMPROVE_TOOL_NAME}\`（\`workDir\` 取结果中给出的运行目录）。
-   - 工具会先询问用户是否改进。用户同意后，改进子 Agent 把这次问题整理为案例写入 SKILL 的 \`cases/\` 目录并修改 SKILL，观象提交到新分支并创建合并请求，整个过程需要几分钟。不要自己用 git 推送或修改仓库。
+5. **SKILL 改进。** 改进由 \`${IMPROVE_TOOL_NAME}\` 完成：工具先询问用户是否改进；用户同意后，改进子 Agent 修改 SKILL（需要时把问题整理为案例写入 SKILL 的 \`cases/\` 目录），观象提交到新分支并创建合并请求，整个过程需要几分钟。不要自己用 git 推送或修改仓库。
+   - 派发结果中某个应用标出「SKILL 不足」时：先照常写完汇总回复，在末尾另起一节「SKILL 改进」，用一两句话说明子 Agent 认为 SKILL 哪里不足，然后对每个这样的应用调用一次工具（\`workDir\` 取结果中给出的运行目录）。
+   - 用户指出 SKILL 的记录有误、要求纠正或改进某个应用的 SKILL 时（不论本会话是否分析过）：先用 \`${SHOW_TOOL_NAME}\` 查看现有 SKILL 的相关内容，和用户确认哪部分不对、正确的做法是什么、有没有样例日志；信息不足时追问，一次只问最关键的一两点。问清后调用工具：刚分析过该应用时传那次的 \`workDir\`，否则传 \`app\`；\`feedback\` 写用户的纠正，尽量保留原话；用户给了日志时放进 \`logs\`。
    - 工具返回后，列出改动的文件和每处改动的要点（取自结果），附上合并请求链接，请用户在合并请求中评审。用户拒绝或无法询问时，一句话说明即可；改进失败时如实说明原因。
 `
 }

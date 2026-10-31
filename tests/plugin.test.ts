@@ -99,15 +99,18 @@ describe('plugin', () => {
     cleanups.push(h.dispose)
     apply(h.ctx, { repos: [{ url: origin }] }, { overlayPath: join(dir, 'settings.json') })
     expect(h.skills.map(skill => skill.name)).toEqual(['dsh-logalyze'])
-    expect(h.tools.map(tool => tool.definition.name)).toEqual(['logalyze_dispatch', 'logalyze_improve_skill', 'logalyze_add_repo', 'logalyze_init_repo', 'logalyze_submit_init'])
-    const [tool, improve, add, init, submit] = h.tools
+    expect(h.tools.map(tool => tool.definition.name)).toEqual(['logalyze_dispatch', 'logalyze_improve_skill', 'logalyze_show_skill', 'logalyze_add_repo', 'logalyze_init_repo', 'logalyze_submit_init'])
+    const [tool, improve, show, add, init, submit] = h.tools
     const signal = new AbortController().signal
     const step = (depth?: number) => ({ agent: { id: 'a', session: { header: { id: 'a', ...depth === undefined ? {} : { delegationDepth: depth } } } }, signal })
     // The condition waits for the first sync, so a step prepared during startup still sees the cloned application.
     expect(await tool!.when?.(step())).toBe(true)
     expect(await tool!.when?.(step(1))).toBe(false)
-    // SKILL improvement is offered only after a dispatch in the session recorded a SKILL gap.
-    expect(await improve!.when?.(step())).toBe(false)
+    // The SKILL tools are offered to top-level agents while an application is usable.
+    expect(await improve!.when?.(step())).toBe(true)
+    expect(await improve!.when?.(step(1))).toBe(false)
+    expect(await show!.when?.(step())).toBe(true)
+    expect(await show!.when?.(step(1))).toBe(false)
     // Adding is always offered at the top level; drafting needs a repository without an application, submitting a draft.
     expect(await add!.when?.(step())).toBe(true)
     expect(await add!.when?.(step(1))).toBe(false)
@@ -127,7 +130,7 @@ describe('plugin', () => {
       apply(h.ctx, { repos: [{ url: origin }], skillUpdates: { enabled } }, { overlayPath: join(dir, `settings-${enabled}.json`) })
       const [candidate] = await h.skills[0]!.list({})
       const content = (await h.skills[0]!.get(candidate!, {}))?.content
-      if (enabled) expect(content).toContain('调用一次 `logalyze_improve_skill`')
+      if (enabled) expect(content).toContain('先用 `logalyze_show_skill` 查看现有 SKILL 的相关内容')
       else expect(content).not.toContain('logalyze_improve_skill')
     }
   })
@@ -142,7 +145,7 @@ describe('plugin', () => {
     cleanups.push(h.dispose)
     const overlayPath = join(dir, 'settings.json')
     apply(h.ctx, {}, { overlayPath })
-    const [, , add, init] = h.tools
+    const [, , , add, init] = h.tools
     const step = { agent: { id: 'a', session: { header: { id: 'a' } } }, signal: new AbortController().signal }
     expect(await init!.when?.(step)).toBe(false)
     const value = await add!.definition.execute({ url: origin }, step)

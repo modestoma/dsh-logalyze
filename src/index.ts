@@ -4,10 +4,11 @@
  * 提供入口 SKILL `/logalyze`（识别日志属于哪个应用；用户显式调用，或在
  * 任务匹配已注册应用时由顶层 Agent 自行加载）和
  * `logalyze_dispatch` 工具（按应用派发子 Agent，工作目录为该应用的代码
- * 仓库，首条消息用 `/<skill>` 加载仓库里的日志分析 SKILL），以及子 Agent
- * 记录了 SKILL 不足时的 `logalyze_improve_skill` 工具（询问用户是否改进，同意后
- * 由改进子 Agent 按 `/logalyze-improve` 写案例并修改 SKILL，经 dsh-repo 提交到
- * 新分支并创建合并请求）。应用仓库在设置
+ * 仓库，首条消息用 `/<skill>` 加载仓库里的日志分析 SKILL），以及 SKILL 改进
+ * 工具：`logalyze_show_skill` 只读查看应用 SKILL；`logalyze_improve_skill` 在
+ * 子 Agent 记录了 SKILL 不足或用户要求纠正时询问用户是否改进，同意后由改进子
+ * Agent 按 `/logalyze-improve` 修改 SKILL 并沉淀案例，经 dsh-repo 提交到新分支
+ * 并创建合并请求。应用仓库在设置
  * 面板中只填 git 地址，由插件拉取；应用描述来自各仓库的
  * `.agents/logalyze.yaml`。顶层 Agent 还可以用 `logalyze_add_repo` 在对话中
  * 添加仓库，并用 `logalyze_init_repo` / `logalyze_submit_init` 为缺少应用描述
@@ -33,7 +34,9 @@ export { pluginConfigSchema, resolveConfig } from './config.ts'
 export { DISPATCH_TOOL_NAME, Dispatcher } from './dispatch/tool.ts'
 export type { DispatchValue, TaskResult } from './dispatch/tool.ts'
 export { renderChildPrompt } from './dispatch/prompt.ts'
-export { IMPROVE_TOOL_NAME } from './skill-update/names.ts'
+export { IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from './skill-update/names.ts'
+export { SkillViewer } from './skill-update/show.ts'
+export type { ShowSkillValue } from './skill-update/show.ts'
 export { SkillImprover } from './skill-update/tool.ts'
 export type { AnalyzedTask, ImproveStatus, ImproveValue } from './skill-update/tool.ts'
 export type { GapCheck } from './skill-update/gap.ts'
@@ -68,7 +71,7 @@ export interface LogalyzePluginOptions extends ServiceOptions {
 
 /**
  * Install the entry skill, the bundled guide skills, the dispatch, SKILL
- * improvement, and repository
+ * view and improvement, and repository
  * onboarding tools, the settings routes, and the analyze route, then mirror
  * or update the configured repositories in the background and again after
  * each dsh-repo host change.

@@ -19,8 +19,8 @@ describe('entry skill', () => {
     expect(body).toContain('最多 3 个')
     expect(body).not.toContain('logalyze_improve_skill')
     const improving = renderEntrySkill([order], 3, true)
-    expect(improving).toContain('5. **SKILL 改进。** 派发结果中某个应用标出「SKILL 不足」时，先照常写完汇总回复')
-    expect(improving).toContain('调用一次 `logalyze_improve_skill`')
+    expect(improving).toContain('派发结果中某个应用标出「SKILL 不足」时：先照常写完汇总回复')
+    expect(improving).toContain('先用 `logalyze_show_skill` 查看现有 SKILL 的相关内容')
   })
 
   it('is user-invocable only and renders the live catalog on each load', async () => {

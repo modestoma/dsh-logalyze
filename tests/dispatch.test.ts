@@ -67,7 +67,7 @@ async function setup(overrides: Partial<EditableSettings> = {}, gaps = false) {
   registry.configure(settings.repos)
   await registry.syncAll()
   const { service, started } = fakeSubagents()
-  const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', settings: () => settings, approval: () => undefined, repos: () => repos })
+  const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, approval: () => undefined, repos: () => repos })
   const dispatcher = new Dispatcher({
     registry,
     ...gaps ? { gaps: improver } : {},
@@ -78,7 +78,7 @@ async function setup(overrides: Partial<EditableSettings> = {}, gaps = false) {
     now: () => new Date(2026, 9, 25, 9, 30, 0),
   })
   const parent: Agent = { id: 'parent', session: { header: { id: 'parent', cwd: project } } }
-  return { dir, project, registry, dispatcher, started, parent, settings, repos, improver }
+  return { dir, project, registry, dispatcher, started, parent, settings, repos }
 }
 
 async function waitForStarts(started: Started[], count: number): Promise<void> {
@@ -129,7 +129,7 @@ describe('logalyze_dispatch', () => {
   })
 
   it('tells children to record SKILL gaps and marks the completed tasks that recorded one', async () => {
-    const { project, dispatcher, started, parent, improver } = await setup({ skillUpdates: { enabled: true, maxFiles: 4, maxFileBytes: 65536 } }, true)
+    const { project, dispatcher, started, parent } = await setup({ skillUpdates: { enabled: true, maxFiles: 4, maxFileBytes: 65536 } }, true)
     const path = join(project, 'sample-logs', 'order-service.log')
     const running = dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ path }] }, { app: 'order-service', question: 'q2', logs: [{ path }] }] }, { signal: new AbortController().signal, agent: parent })
     await waitForStarts(started, 2)
@@ -141,21 +141,18 @@ describe('logalyze_dispatch', () => {
     const second = /`([^`]+)\/skill-gap\.md`/.exec(started[1]?.spec.request.prompt[0]?.text as string)?.[1] as string
     await writeFile(join(workDir, 'skill-gap.md'), '  SKILL 没写   traceId 字段\n\n靠 grep 找到的\n')
     await writeFile(join(second, 'skill-gap.md'), '失败的任务不检查')
-    expect(improver.hasGap('parent')).toBe(false)
     started[0]?.settle({ stopReason: 'completed', output: [{ type: 'text', text: '结论' }] })
     started[1]?.settle({ stopReason: 'error', output: [] })
     const value = await running
     expect(value.results[0]?.skillGap).toEqual({ ok: true, path: join(workDir, 'skill-gap.md'), preview: 'SKILL 没写 traceId 字段 靠 grep 找到的' })
     expect(value.results[1]?.skillGap).toBeUndefined()
-    expect(improver.hasGap('parent')).toBe(true)
-    expect(improver.hasGap('other')).toBe(false)
     const text = renderDispatchValue(value)[0]?.text
     expect(text).toContain(`SKILL 不足（记录在 ${join(workDir, 'skill-gap.md')}）：SKILL 没写 traceId 字段 靠 grep 找到的`)
     expect(text).toContain(`汇总回复写完后调用 logalyze_improve_skill（workDir 为 ${workDir}），工具会询问用户是否改进。`)
   })
 
   it('reports a gap record that cannot be read instead of offering it', async () => {
-    const { project, dispatcher, started, parent, improver } = await setup({ skillUpdates: { enabled: true, maxFiles: 4, maxFileBytes: 8 } }, true)
+    const { project, dispatcher, started, parent } = await setup({ skillUpdates: { enabled: true, maxFiles: 4, maxFileBytes: 8 } }, true)
     const running = dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ path: join(project, 'sample-logs', 'order-service.log') }] }] }, { signal: new AbortController().signal, agent: parent })
     await waitForStarts(started, 1)
     const workDir = /`([^`]+)\/skill-gap\.md`/.exec(started[0]?.spec.request.prompt[0]?.text as string)?.[1] as string
@@ -163,7 +160,6 @@ describe('logalyze_dispatch', () => {
     started[0]?.settle({ stopReason: 'completed', output: [] })
     const value = await running
     expect(value.results[0]?.skillGap).toEqual({ ok: false, error: 'skill-gap.md 有 20 字节，超过上限 8' })
-    expect(improver.hasGap('parent')).toBe(false)
     expect(renderDispatchValue(value)[0]?.text).toContain('SKILL 不足记录不可用：skill-gap.md 有 20 字节，超过上限 8')
   })
 

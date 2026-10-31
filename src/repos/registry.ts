@@ -193,6 +193,18 @@ export class RepoRegistry {
   }
 
   /**
+   * Find one usable application.
+   * @param id - application id.
+   * @returns the application with its repository and latest synced commit.
+   * @throws when the id does not name a usable application; the message says why and lists the usable ids.
+   */
+  readyApp(id: string): ReadyApp {
+    const found = this.readyApps().find(ready => ready.app.id === id)
+    if (found === undefined) throw new Error(this.unknownMessage([id]))
+    return found
+  }
+
+  /**
    * Hold a snapshot of each requested application's latest synced commit for
    * one dispatch. Every id must resolve to a usable application, or nothing is
    * held.

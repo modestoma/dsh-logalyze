@@ -1,6 +1,6 @@
 /**
  * 观象运行时：持有生效设置（cordis.yml + 面板覆盖）、应用注册表、入口
- * SKILL、派发工具、SKILL 改进工具与仓库接入工具的注册，并为设置面板提供状态与写入口。
+ * SKILL、派发工具、SKILL 查看与改进工具、仓库接入工具的注册，并为设置面板提供状态与写入口。
  *
  * @module dsh-logalyze/service
  */
@@ -22,6 +22,7 @@ import { diffOverlay, overriddenKeys } from './settings/overlay.ts'
 import type { OverlayStore } from './settings/overlay.ts'
 import { createEntrySkillProvider } from './skill/entry.ts'
 import type { BundledSkill } from './skill/bundled.ts'
+import { SkillViewer } from './skill-update/show.ts'
 import { SkillImprover } from './skill-update/tool.ts'
 import { RepoAdder } from './onboard/add.ts'
 import { RepoInitializer } from './onboard/init.ts'
@@ -57,6 +58,7 @@ export class LogalyzeService {
   private current: EditableSettings
   private readonly dispatcher: Dispatcher
   private readonly improver: SkillImprover
+  private readonly viewer: SkillViewer
   private readonly adder: RepoAdder
   private readonly initializer: RepoInitializer
   private readonly skill: ReturnType<typeof createEntrySkillProvider>
@@ -93,10 +95,13 @@ export class LogalyzeService {
       subagents: ctx.subagents,
       provider: config.subagentProvider,
       settings: () => this.current,
+      workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
       ...config.skillUpdateAuthor === undefined ? {} : { author: config.skillUpdateAuthor },
       approval: () => ctx.get?.('approval') as HostApproval | undefined,
       repos: () => ctx.get?.(DSH_REPOS_SERVICE),
+      ...options.fetch === undefined ? {} : { fetch: options.fetch },
     })
+    this.viewer = new SkillViewer({ registry: this.registry, repos: () => ctx.get?.(DSH_REPOS_SERVICE) })
     this.dispatcher = new Dispatcher({
       registry: this.registry,
       gaps: this.improver,
@@ -142,7 +147,7 @@ export class LogalyzeService {
   }
 
   /**
-   * Register the dispatch, SKILL improvement, and repository onboarding tools;
+   * Register the dispatch, SKILL improvement and view, and repository onboarding tools;
    * called once from `apply()`. The definitions stay fixed because a step
    * drops a tool whose registration changed after the step resolved its tools.
    */
@@ -152,8 +157,12 @@ export class LogalyzeService {
       'logalyze: dispatch tool',
     )
     this.ctx.effect(
-      () => this.ctx.tools.register(this.improver.definition(), { when: context => this.offersTopLevel(context, () => this.current.skillUpdates.enabled && this.improver.hasGap(context.agent.session.header.id)) }),
+      () => this.ctx.tools.register(this.improver.definition(), { when: async context => this.current.skillUpdates.enabled && await this.offersTool(context) }),
       'logalyze: skill improvement tool',
+    )
+    this.ctx.effect(
+      () => this.ctx.tools.register(this.viewer.definition(), { when: context => this.offersTool(context) }),
+      'logalyze: skill view tool',
     )
     this.ctx.effect(
       () => this.ctx.tools.register(this.adder.definition(), { when: context => this.offersTopLevel(context, () => true) }),
@@ -183,7 +192,7 @@ export class LogalyzeService {
   }
 
   /**
-   * Offer the dispatch tool to top-level agents once the first
+   * Offer the dispatch and SKILL tools to top-level agents once the first
    * sync settled and at least one application is usable.
    * @param context - the preparing step.
    * @returns whether the step may call the tool.

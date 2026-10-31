@@ -7,6 +7,7 @@ import type { Agent, ApprovalOutcome, ApprovalRequest, HostApproval, SubagentAct
 import { RepoRegistry } from '../src/repos/registry.ts'
 import type { EditableSettings } from '../src/settings/contract.ts'
 import { DIFF_FILE, readProposal, replaceFile } from '../src/skill-update/proposal.ts'
+import { renderShowSkillValue, SkillViewer } from '../src/skill-update/show.ts'
 import { renderImproveValue, SkillImprover } from '../src/skill-update/tool.ts'
 import type { AnalyzedTask } from '../src/skill-update/tool.ts'
 import { FakeRepos } from './fake-repos.ts'
@@ -177,6 +178,7 @@ async function setup(): Promise<Setup> {
     subagents: service,
     provider: 'spawn',
     settings: () => settings,
+    workingDirectory: () => undefined,
     author: { name: '观象', email: 'logalyze@example.com' },
     approval: () => approval,
     repos: () => repos.service,
@@ -227,11 +229,11 @@ describe('logalyze_improve_skill', () => {
     expect(prompt.split('\n')[0]).toBe('/logalyze-improve')
     expect(prompt).toContain('## 分析时的问题\n\n21 点下单报 500')
     expect(prompt).toContain('## 分析结论\n\n根因：促销商品没有 SKU')
-    expect(prompt).toContain(`分析子 Agent 写在 \`${join(task.workDir, 'skill-gap.md')}\``)
+    expect(prompt).toContain(`记录写在 \`${join(task.workDir, 'skill-gap.md')}\`，先读它。`)
     expect(prompt).toContain('- `/logs/order.log`')
     const improveDir = improveDirOf(child!)
     expect(improveDir).toMatch(new RegExp(`^${task.workDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/improve-[0-9a-f]{6}$`))
-    expect(prompt).toContain(`案例写到 \`${improveDir}/skill-proposal/files/cases/2026-10-31-<slug>.md\``)
+    expect(prompt).toContain(`否则新建 \`${improveDir}/skill-proposal/files/cases/2026-10-31-<slug>.md\``)
     expect(prompt).not.toContain('分析时的提交是')
 
     await finishChild(started, 0, { 'SKILL.md': `${skill}\n## 案例索引\n\n| ${CASE} | traceId | 下单 |\n`, [CASE]: '# traceId 串联\n' })
@@ -274,27 +276,22 @@ describe('logalyze_improve_skill', () => {
     const text = renderImproveValue(value)[0]?.text
     expect(text).toContain(`SKILL 已改进，提交到 ${origin} 的分支 ${value.branch}（目标 main）并创建合并请求：${MR_URL}`)
     expect(text).toContain('改进子 Agent 的说明：\n- SKILL.md：补充 traceId')
-    // The gap is consumed once the improvement is submitted.
-    expect(improver.hasGap('parent')).toBe(false)
-    await expect(improver.execute({ workDir: task.workDir }, exec)).rejects.toThrow('不是本次 DSH 运行中记录了 SKILL 不足的观象派发任务')
   })
 
-  it('starts nothing unless the user agrees, and forgets the gap once the user declines', async () => {
+  it('starts nothing unless the user agrees', async () => {
     const { task, improver, agent, answer, repos, started } = await setup()
     const exec = { signal: new AbortController().signal, agent }
     answer.value = 'unavailable'
     expect(await improver.execute({ workDir: task.workDir }, exec)).toEqual({ status: 'unavailable', app: 'order-service', repo: task.url, workDir: task.workDir })
-    expect(improver.hasGap('parent')).toBe(true)
     answer.value = 'rejected'
     const rejected = await improver.execute({ workDir: task.workDir }, exec)
     expect(rejected.status).toBe('rejected')
     expect(renderImproveValue(rejected)[0]?.text).toContain('用户不改进这次的 SKILL，没有起草也没有提交')
-    expect(improver.hasGap('parent')).toBe(false)
     expect(started).toHaveLength(0)
     expect(repos.service.commitFiles).not.toHaveBeenCalled()
   })
 
-  it('reports an improvement that produced nothing submittable and keeps the gap for another try', async () => {
+  it('reports an improvement that produced nothing submittable', async () => {
     const { task, improver, agent, approval, repos, started, skill } = await setup()
     const exec = { signal: new AbortController().signal, agent }
     const attempt = async (index: number, arrange: () => Promise<unknown>) => {
@@ -302,7 +299,6 @@ describe('logalyze_improve_skill', () => {
       await arrange()
       const value = await running
       expect(value.status).toBe('failed')
-      expect(improver.hasGap('parent')).toBe(true)
       expect(started[index]?.dispose).toHaveBeenCalledTimes(1)
       return value
     }
@@ -342,7 +338,12 @@ describe('logalyze_improve_skill', () => {
     const { registry, task, improver, agent, settings, repos, started } = await setup()
     const exec = { signal: new AbortController().signal, agent }
     const args = { workDir: task.workDir }
-    await expect(improver.execute({ workDir: '/elsewhere' }, exec)).rejects.toThrow('不是本次 DSH 运行中记录了 SKILL 不足的观象派发任务')
+    await expect(improver.execute({ workDir: '/elsewhere' }, exec)).rejects.toThrow('不是本次 DSH 运行中已完成的观象派发任务')
+    await expect(improver.execute({ workDir: task.workDir, app: 'order-service' }, exec)).rejects.toThrow('workDir 和 app 必须给出且只能给出一个')
+    await expect(improver.execute({}, exec)).rejects.toThrow('workDir 和 app 必须给出且只能给出一个')
+    await expect(improver.execute({ app: 'order-service' }, exec)).rejects.toThrow('按 app 改进时需要 feedback')
+    await expect(improver.execute({ app: 'missing', feedback: 'x' }, exec)).rejects.toThrow('missing')
+    await expect(improver.execute({ app: 'order-service', feedback: 'x', logs: [{ path: '/nonexistent.log' }] }, exec)).rejects.toThrow('日志路径不可读')
     await expect(improver.execute(args, { ...exec, agent: { id: 'other', session: { header: { id: 'other' } } } })).rejects.toThrow('不是当前会话派发的任务')
     await expect(improver.execute(args, { ...exec, agent: { id: 'child', session: { header: { id: 'parent', delegationDepth: 1 } } } })).rejects.toThrow('不能在子 Agent 中调用')
     await expect(improver.execute({ ...args, extra: 1 }, exec)).rejects.toThrow('参数不合法')
@@ -351,7 +352,7 @@ describe('logalyze_improve_skill', () => {
     settings.skillUpdates = { ...settings.skillUpdates, enabled: true }
 
     const approval = { request: vi.fn(async () => 'allowed-once' as const) }
-    const deps = { registry, subagents: fakeSubagents().service, provider: 'spawn', settings: () => settings }
+    const deps = { registry, subagents: fakeSubagents().service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined }
     const withoutApproval = new SkillImprover({ ...deps, approval: () => undefined, repos: () => repos.service })
     await withoutApproval.inspect(task)
     await expect(withoutApproval.execute(args, exec)).rejects.toThrow('没有审批服务')
@@ -359,19 +360,18 @@ describe('logalyze_improve_skill', () => {
     await withoutRepos.inspect(task)
     await expect(withoutRepos.execute(args, exec)).rejects.toThrow('需要 dsh-repo 插件提供的 dshRepos 服务')
     await rm(join(task.workDir, 'skill-gap.md'))
-    await expect(improver.execute(args, exec)).rejects.toThrow('中没有 skill-gap.md')
+    await expect(improver.execute(args, exec)).rejects.toThrow('这次分析没有 skill-gap.md，需要在 feedback 中写明')
     expect(approval.request).not.toHaveBeenCalled()
     expect(started).toHaveLength(0)
   })
 
-  it('stops when the question is withdrawn by cancellation and lets the gap be offered again', async () => {
+  it('stops when the question is withdrawn by cancellation', async () => {
     const { task, improver, agent, answer, started } = await setup()
     const controller = new AbortController()
     controller.abort(new Error('turn cancelled'))
     answer.value = 'cancelled'
     await expect(improver.execute({ workDir: task.workDir }, { signal: controller.signal, agent })).rejects.toThrow('turn cancelled')
     expect(started).toHaveLength(0)
-    expect(improver.hasGap('parent')).toBe(true)
     answer.value = 'unavailable'
     expect((await improver.execute({ workDir: task.workDir }, { signal: new AbortController().signal, agent })).status).toBe('unavailable')
   })
@@ -385,5 +385,71 @@ describe('logalyze_improve_skill', () => {
     expect(started[0]?.spec.request.prompt[0]?.text).toContain(`分析时的提交是 \`${'a'.repeat(12)}\`，之后仓库有更新`)
     started[0]?.settle({ stopReason: 'completed', output: [] })
     expect((await running).status).toBe('failed')
+  })
+
+  it('corrects a SKILL record the analysis followed when the user points out it is wrong', async () => {
+    const { task, improver, agent, approval, repos, started, skill } = await setup()
+    await rm(join(task.workDir, 'skill-gap.md'))
+    const feedback = 'SKILL 里说 503 是库存服务的问题，其实是网关限流，看 X-RateLimit 头'
+    const running = improver.execute({ workDir: task.workDir, feedback }, { signal: new AbortController().signal, agent })
+    await waitForStarts(started, 1)
+    expect(approval.requests[0]?.displayReason?.zh).toContain(`用户要求改进「订单服务」的日志分析 SKILL：${feedback}`)
+    expect(approval.requests[0]?.displayReason?.zh).not.toContain('发现 SKILL 有不足')
+    const prompt = started[0]?.spec.request.prompt[0]?.text as string
+    expect(prompt).toContain('用户指出 SKILL 的记录有问题，用户同意改进。')
+    expect(prompt).toContain('分析子 Agent 当时没有发现 SKILL 的不足，是按 SKILL 现有的记录分析的；改进的依据是下面的用户反馈。')
+    expect(prompt).toContain(`## 用户反馈\n\n${feedback}`)
+    expect(prompt).toContain('已有案例描述的是同一个问题时更新它')
+
+    // A correction after an analysis still has to record the case.
+    await finishChild(started, 0, { 'SKILL.md': `${skill}\n503 来自网关限流。\n` })
+    const value = await running
+    expect(value).toMatchObject({ status: 'failed', error: '修改中没有案例文件 cases/<日期>-<slug>.md' })
+    expect(repos.service.commitFiles).not.toHaveBeenCalled()
+  })
+
+  it('improves a SKILL from user feedback alone, with sample logs and no case required', async () => {
+    const { origin, task, improver, agent, approval, repos, started, skill } = await setup()
+    const project = agent.session.header.cwd as string
+    await writeFile(join(project, 'sample.log'), 'line')
+    const exec = { signal: new AbortController().signal, agent }
+    const running = improver.execute({ app: 'order-service', feedback: '日志时间是 UTC，不是北京时间', logs: [{ path: 'sample.log' }] }, exec)
+    await waitForStarts(started, 1)
+    expect(approval.requests[0]?.displayReason?.zh).toContain(`是否改进 SKILL？同意后，观象会按反馈修改 SKILL，然后提交到 ${origin} 的新分支`)
+    const prompt = started[0]?.spec.request.prompt[0]?.text as string
+    expect(prompt).toContain('用户要求改进这个 SKILL，用户的反馈见下文。')
+    expect(prompt).not.toContain('## 分析时的问题')
+    expect(prompt).toContain(`- \`${join(project, 'sample.log')}\``)
+    expect(prompt).toContain('只是修正或补充 SKILL 的说明时，可以不写案例。')
+    const improveDir = improveDirOf(started[0]!)
+    expect(improveDir).toMatch(new RegExp(`^${join(project, '.logalyze', 'runs').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/20261031-220000-[0-9a-f]{6}/improve-[0-9a-f]{6}$`))
+
+    await finishChild(started, 0, { 'SKILL.md': `${skill}\n时间是 UTC。\n` }, '修正日志时区说明\n\n- SKILL.md：时间是 UTC')
+    const value = await running
+    expect(value).toMatchObject({ status: 'opened', files: [{ path: SKILL, added: 2, removed: 0 }] })
+    expect(value.workDir).toBeUndefined()
+    const [, commit] = repos.service.commitFiles.mock.calls[0]!
+    expect(commit.message).toBe('修正日志时区说明\n\n修正日志时区说明\n\n- SKILL.md：时间是 UTC\n\nProposed-by: 观象 Logalyze\nSession: parent\n')
+    expect(repos.service.createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ body: expect.stringMatching(/^由观象按用户反馈提出（应用 order-service，会话 parent）。请评审 SKILL 修改。/) }))
+    expect(task.workDir).not.toBe(improveDir)
+  })
+})
+
+describe('logalyze_show_skill', () => {
+  it('shows the SKILL file list and a file from the latest synced commit', async () => {
+    const { origin, registry, repos } = await setup()
+    const viewer = new SkillViewer({ registry, repos: () => repos.service })
+    const exec = { signal: new AbortController().signal, agent: { id: 'parent', session: { header: { id: 'parent' } } } }
+    const value = await viewer.execute({ app: 'order-service' }, exec)
+    const commit = registry.status()[0]!.commit!
+    expect(value).toMatchObject({ app: 'order-service', repo: origin, commit, dir: '.agents/skills/log-analysis', path: 'SKILL.md', truncated: false })
+    expect(value.files).toContain('SKILL.md')
+    expect(value.content).toBe(await readFile(join(origin, SKILL), 'utf8'))
+    expect(renderShowSkillValue(value)[0]?.text).toContain(`应用 order-service 的日志分析 SKILL .agents/skills/log-analysis/（${origin} 提交 ${commit.slice(0, 12)}）`)
+
+    await expect(viewer.execute({ app: 'order-service', path: 'references/none.md' }, exec)).rejects.toThrow('.agents/skills/log-analysis/references/none.md 不存在')
+    await expect(viewer.execute({ app: 'order-service', path: '../logalyze.yaml' }, exec)).rejects.toThrow('path 只能是 SKILL 目录内的相对路径')
+    await expect(viewer.execute({ app: 'missing' }, exec)).rejects.toThrow('missing')
+    await expect(viewer.execute({ app: 'order-service' }, { ...exec, agent: { id: 'c', session: { header: { id: 'parent', delegationDepth: 1 } } } })).rejects.toThrow('不能在子 Agent 中调用')
   })
 })
