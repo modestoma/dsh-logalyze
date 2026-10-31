@@ -71,8 +71,8 @@ function positive(text: string, label: string, allowZero = false): number {
 function fromDraft(draft: Draft): EditableSettings {
   const maxApps = positive(draft.maxAppsPerRequest, '单次应用数上限')
   if (!Number.isInteger(maxApps)) throw new Error('单次应用数上限必须是整数')
-  const maxFiles = positive(draft.skillMaxFiles, '提议文件数上限')
-  if (!Number.isInteger(maxFiles)) throw new Error('提议文件数上限必须是整数')
+  const maxFiles = positive(draft.skillMaxFiles, '改进文件数上限')
+  if (!Number.isInteger(maxFiles)) throw new Error('改进文件数上限必须是整数')
   return {
     repos: draft.repos.map(repo => repo.branch === undefined || repo.branch.trim() === '' ? { url: repo.url.trim() } : { url: repo.url.trim(), branch: repo.branch.trim() }),
     fetchIntervalMs: Math.round(positive(draft.fetchIntervalMin, '更新间隔', true) * MINUTE),
@@ -86,7 +86,7 @@ function fromDraft(draft: Draft): EditableSettings {
     skillUpdates: {
       enabled: draft.skillUpdatesEnabled,
       maxFiles,
-      maxFileBytes: Math.round(positive(draft.skillMaxKb, '提议单文件大小上限') * KB),
+      maxFileBytes: Math.round(positive(draft.skillMaxKb, '改进单文件大小上限') * KB),
     },
     analyze: { enabled: draft.analyzeEnabled },
   }
@@ -473,13 +473,13 @@ function AdvancedTab({ draft, setDraft, overridden, busy, onReset }: TabProps & 
         <div className="lz__list">
           <div className="lz__row">
             <div className="lz__rowText">
-              <div className="lz__rowLabel">允许提出 SKILL 修改 <Overridden keys={overridden} name="skillUpdates" /></div>
-              <div className="lz__rowSummary">子 Agent 发现应用的日志分析 SKILL 有欠缺时可以写出修改提议；经用户授权后，观象经 dsh-repo 把它提交到新分支并创建合并请求（GitLab 或 GitHub，需要安装 dsh-repo 并配置该仓库主机的令牌）。</div>
+              <div className="lz__rowLabel">询问是否改进 SKILL <Overridden keys={overridden} name="skillUpdates" /></div>
+              <div className="lz__rowSummary">子 Agent 觉得应用的日志分析 SKILL 不够用时记下不足，分析结束后询问用户是否改进；用户同意后，改进子 Agent 把问题整理为案例并修改 SKILL，观象经 dsh-repo 提交到新分支并创建合并请求（GitLab 或 GitHub，需要安装 dsh-repo 并配置该仓库主机的令牌）。</div>
             </div>
-            <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="允许提出 SKILL 修改" checked={draft.skillUpdatesEnabled} onChange={(event) => { setDraft({ ...draft, skillUpdatesEnabled: event.target.checked }) }} /></div>
+            <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="询问是否改进 SKILL" checked={draft.skillUpdatesEnabled} onChange={(event) => { setDraft({ ...draft, skillUpdatesEnabled: event.target.checked }) }} /></div>
           </div>
-          <NumberRow label="提议文件数上限" unit="个" value={draft.skillMaxFiles} onChange={(value) => { setDraft({ ...draft, skillMaxFiles: value }) }} />
-          <NumberRow label="提议单文件大小上限" unit="KB" value={draft.skillMaxKb} onChange={(value) => { setDraft({ ...draft, skillMaxKb: value }) }} />
+          <NumberRow label="改进文件数上限" unit="个" value={draft.skillMaxFiles} onChange={(value) => { setDraft({ ...draft, skillMaxFiles: value }) }} />
+          <NumberRow label="改进单文件大小上限" unit="KB" value={draft.skillMaxKb} onChange={(value) => { setDraft({ ...draft, skillMaxKb: value }) }} />
         </div>
       </section>
       <section className="lz__sec">

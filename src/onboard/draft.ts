@@ -3,7 +3,7 @@
  * 和 `repo-init/files/`（对应仓库的 `.agents/` 目录，含 `logalyze.yaml` 与
  * `skills/<skill>/` 下的文件）。
  *
- * 运行目录对 Agent 可写，读取规则与 SKILL 修改提议相同；另外只接受
+ * 运行目录对 Agent 可写，读取规则与 SKILL 改进的修改相同；另外只接受
  * `logalyze.yaml` 和它指定的 SKILL 目录下的文件，并把初稿叠加在基准提交上，按
  * 观象拉取仓库时的同一套规则检查应用描述和 SKILL。
  *

@@ -7,8 +7,9 @@
  *   `<父会话目录>/.logalyze/runs/<runId>/<序号>-<应用 id>/`，该目录也是子 Agent
  *   解压日志的可写目录。
  * - 超时（`dispatchTimeoutMs`）或调用被取消时停止全部仍在运行的子 Agent。
- * - 开启 SKILL 改进时，子 Agent 可以在运行目录写 SKILL 修改提议；派发结束后
- *   检查已完成任务的提议，并在结果中给出改动统计或提议不可用的原因。
+ * - 开启 SKILL 改进时，子 Agent 在 SKILL 不足时于运行目录写 `skill-gap.md`；派发
+ *   结束后检查已完成任务的记录，并在结果中标出 SKILL 不足，供父 Agent 询问用户
+ *   是否改进。
  * - 子会话（委派深度大于 0）中不提供本工具。
  *
  * @module dsh-logalyze/dispatch/tool
@@ -22,8 +23,9 @@ import { describeIssue } from '../config.ts'
 import type { Agent, ContentBlock, SubagentActivation, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
 import type { RepoRegistry } from '../repos/registry.ts'
 import type { AppManifest, EditableSettings } from '../settings/contract.ts'
-import { describeFiles, PROPOSE_TOOL_NAME } from '../skill-update/tool.ts'
-import type { DispatchedTask, ProposalCheck } from '../skill-update/tool.ts'
+import type { GapCheck } from '../skill-update/gap.ts'
+import { IMPROVE_TOOL_NAME } from '../skill-update/names.ts'
+import type { AnalyzedTask } from '../skill-update/tool.ts'
 import { admitUrl, downloadLog, fileNameFor } from './download.ts'
 import { renderChildPrompt } from './prompt.ts'
 import type { ChildLog } from './prompt.ts'
@@ -65,8 +67,8 @@ export interface TaskResult {
   workDir: string
   /** Absolute log paths handed to the child. */
   logs: string[]
-  /** The SKILL improvement proposal the child wrote, when proposals are enabled and it wrote one. */
-  skillProposal?: ProposalCheck
+  /** The SKILL gap record the child wrote, when SKILL improvement is enabled and it wrote one. */
+  skillGap?: GapCheck
 }
 
 /** Canonical tool value. */
@@ -98,22 +100,14 @@ const OUTPUT_SCHEMA = {
           diagnostic: { type: 'string' },
           workDir: { type: 'string' },
           logs: { type: 'array', items: { type: 'string' } },
-          skillProposal: {
+          skillGap: {
             type: 'object',
             additionalProperties: false,
             required: ['ok'],
             properties: {
               ok: { type: 'boolean' },
-              files: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  additionalProperties: false,
-                  required: ['path'],
-                  properties: { path: { type: 'string' }, added: { type: 'number' }, removed: { type: 'number' } },
-                },
-              },
-              diffPath: { type: 'string' },
+              path: { type: 'string' },
+              preview: { type: 'string' },
               error: { type: 'string' },
             },
           },
@@ -133,11 +127,11 @@ const STATUS_LABELS: Record<string, string> = {
   failed: '未能启动',
 }
 
-function renderProposal(result: TaskResult): string {
-  const proposal = result.skillProposal
-  if (proposal === undefined) return ''
-  if (!proposal.ok) return `\n\nSKILL 修改提议不可提交：${proposal.error}`
-  return `\n\nSKILL 修改提议：${describeFiles(proposal.files)}。diff 文件：${proposal.diffPath}。提交时调用 ${PROPOSE_TOOL_NAME}，workDir 为 ${result.workDir}。`
+function renderGap(result: TaskResult): string {
+  const gap = result.skillGap
+  if (gap === undefined) return ''
+  if (!gap.ok) return `\n\nSKILL 不足记录不可用：${gap.error}`
+  return `\n\nSKILL 不足（记录在 ${gap.path}）：${gap.preview}\n汇总回复写完后调用 ${IMPROVE_TOOL_NAME}（workDir 为 ${result.workDir}），工具会询问用户是否改进。`
 }
 
 /**
@@ -150,7 +144,7 @@ export function renderDispatchValue(value: DispatchValue): ContentBlock[] {
     const label = STATUS_LABELS[result.status] ?? result.status
     const body = result.output.trim() === '' ? '（子 Agent 没有给出结论）' : result.output.trim()
     const diagnostic = result.diagnostic === undefined ? '' : `\n\n诊断：${result.diagnostic}`
-    return `### ${result.name}（${result.app}）— ${label}\n\n${body}${diagnostic}${renderProposal(result)}`
+    return `### ${result.name}（${result.app}）— ${label}\n\n${body}${diagnostic}${renderGap(result)}`
   })
   return [{ type: 'text', text: `观象派发 ${value.runId} 结束，运行目录 ${value.runDir}。\n\n${sections.join('\n\n')}` }]
 }
@@ -205,22 +199,22 @@ export interface DispatchDeps {
   readonly provider: string
   /** The working-directory service, when the composition has one. */
   workingDirectory(): WorkingDirectoryService | undefined
-  /** SKILL improvement proposals; omitted never mentions them to children. */
-  readonly proposals?: ProposalInbox
+  /** SKILL gap records; omitted never mentions them to children. */
+  readonly gaps?: GapInbox
   readonly fetch?: typeof fetch
   readonly now?: () => Date
 }
 
-/** Where finished tasks go to have their SKILL proposals checked. */
-export interface ProposalInbox {
-  /** Whether children are told how to propose SKILL changes. */
+/** Where finished tasks go to have their SKILL gap records checked. */
+export interface GapInbox {
+  /** Whether children are told to record SKILL gaps. */
   enabled(): boolean
   /**
-   * Remember a finished task and check its proposal.
-   * @param task - the dispatched task.
-   * @returns the check, or undefined when the task wrote no proposal.
+   * Check a finished task's gap record and remember the task when it has one.
+   * @param task - the finished analysis.
+   * @returns the check, or undefined when the task wrote no record.
    */
-  inspect(task: DispatchedTask): Promise<ProposalCheck | undefined>
+  inspect(task: AnalyzedTask): Promise<GapCheck | undefined>
 }
 
 /**
@@ -395,14 +389,23 @@ export class Dispatcher {
         const logs = await materializeLogs(sources[index] ?? [], workDir, settings.download, exec.signal, this.deps.fetch)
         return { task, ready, workDir, logs }
       }))
-      const proposals = this.deps.proposals?.enabled() === true ? this.deps.proposals : undefined
-      const results = await this.runChildren(parent, prepared, settings, exec.signal, proposals !== undefined)
-      if (proposals !== undefined) {
+      const gaps = this.deps.gaps?.enabled() === true ? this.deps.gaps : undefined
+      const results = await this.runChildren(parent, prepared, settings, exec.signal, gaps !== undefined)
+      if (gaps !== undefined) {
         await Promise.all(results.map(async (result, index) => {
           const item = prepared[index]
           if (result.status !== 'completed' || item === undefined) return
-          const check = await proposals.inspect({ workDir: result.workDir, sessionId: parent.session.header.id, app: item.ready.app, url: item.ready.url, commit: item.ready.commit })
-          if (check !== undefined) result.skillProposal = check
+          const check = await gaps.inspect({
+            workDir: result.workDir,
+            sessionId: parent.session.header.id,
+            app: item.ready.app,
+            url: item.ready.url,
+            commit: item.ready.commit,
+            question: item.task.question,
+            output: result.output,
+            logs: result.logs,
+          })
+          if (check !== undefined) result.skillGap = check
         }))
       }
       return { runId, runDir, results }
@@ -416,7 +419,7 @@ export class Dispatcher {
     prepared: readonly { task: DispatchArgs['tasks'][number]; ready: { app: AppManifest; dir: string; commit: string }; workDir: string; logs: ChildLog[] }[],
     settings: EditableSettings,
     signal: AbortSignal,
-    proposals: boolean,
+    gaps: boolean,
   ): Promise<TaskResult[]> {
     const deadline = AbortSignal.timeout(settings.dispatchTimeoutMs)
     const stop = AbortSignal.any([signal, deadline])
@@ -431,7 +434,7 @@ export class Dispatcher {
           label: `${ready.app.name}分析`,
           request: {
             cwd: ready.dir,
-            prompt: [{ type: 'text', text: renderChildPrompt({ app: ready.app, commit: ready.commit, question: task.question, logs, workDir, proposals }) }],
+            prompt: [{ type: 'text', text: renderChildPrompt({ app: ready.app, commit: ready.commit, question: task.question, logs, workDir, gaps }) }],
             parent,
             ...maxDepth === undefined ? {} : { maxDepth },
           },

@@ -1,7 +1,7 @@
 /**
- * 检查对仓库某个目录的修改（SKILL 修改提议、接入初稿）：从 dsh-repo 镜像读取
- * 基准提交中该目录的文件，与提议的文件比较，算出逐文件行数和 unified diff，不
- * 改动任何镜像或快照。提议内容的摘要用作新分支名，提交本身经 dsh-repo 完成。
+ * 检查对仓库某个目录的修改（SKILL 改进、接入初稿）：从 dsh-repo 镜像读取
+ * 基准提交中该目录的文件，与提交的文件比较，算出逐文件行数和 unified diff，不
+ * 改动任何镜像或快照。改动内容的摘要用作新分支名，提交本身经 dsh-repo 完成。
  *
  * @module dsh-logalyze/skill-update/change
  */
@@ -17,6 +17,15 @@ export interface FileStat {
   readonly path: string
   readonly added: number
   readonly removed: number
+}
+
+/**
+ * Render line counts as `path（+a −r）`, separated by `、`.
+ * @param files - changed files.
+ * @returns one line.
+ */
+export function describeFiles(files: readonly FileStat[]): string {
+  return files.map(file => `${file.path}（+${file.added} −${file.removed}）`).join('、')
 }
 
 /** A proposal compared with its base commit. */
@@ -57,7 +66,7 @@ export async function prepareChange(repos: DshRepos, target: ChangeTarget, files
   for (const file of [...files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)) {
     const path = `${dir}/${file.path}`
     const type = types.get(path)
-    if (type === 'symlink') throw new Error(`${path} 在仓库中是符号链接，不能用提议覆盖`)
+    if (type === 'symlink') throw new Error(`${path} 在仓库中是符号链接，不能覆盖`)
     if (type === 'dir' || type === 'submodule') throw new Error(`${path} 在仓库中是目录，不能用文件覆盖`)
     const before = type === 'file' ? await repos.readMirrorFile(url, base, path, signal === undefined ? {} : { signal }) ?? '' : undefined
     if (before === file.content) continue

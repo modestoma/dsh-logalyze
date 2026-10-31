@@ -99,15 +99,15 @@ describe('plugin', () => {
     cleanups.push(h.dispose)
     apply(h.ctx, { repos: [{ url: origin }] }, { overlayPath: join(dir, 'settings.json') })
     expect(h.skills.map(skill => skill.name)).toEqual(['dsh-logalyze'])
-    expect(h.tools.map(tool => tool.definition.name)).toEqual(['logalyze_dispatch', 'logalyze_propose_skill', 'logalyze_add_repo', 'logalyze_init_repo', 'logalyze_submit_init'])
-    const [tool, propose, add, init, submit] = h.tools
+    expect(h.tools.map(tool => tool.definition.name)).toEqual(['logalyze_dispatch', 'logalyze_improve_skill', 'logalyze_add_repo', 'logalyze_init_repo', 'logalyze_submit_init'])
+    const [tool, improve, add, init, submit] = h.tools
     const signal = new AbortController().signal
     const step = (depth?: number) => ({ agent: { id: 'a', session: { header: { id: 'a', ...depth === undefined ? {} : { delegationDepth: depth } } } }, signal })
     // The condition waits for the first sync, so a step prepared during startup still sees the cloned application.
     expect(await tool!.when?.(step())).toBe(true)
     expect(await tool!.when?.(step(1))).toBe(false)
-    // SKILL proposals are off by default.
-    expect(await propose!.when?.(step())).toBe(false)
+    // SKILL improvement is offered only after a dispatch in the session recorded a SKILL gap.
+    expect(await improve!.when?.(step())).toBe(false)
     // Adding is always offered at the top level; drafting needs a repository without an application, submitting a draft.
     expect(await add!.when?.(step())).toBe(true)
     expect(await add!.when?.(step(1))).toBe(false)
@@ -117,20 +117,19 @@ describe('plugin', () => {
     expect((await h.skills[0]!.get(candidate!, {}))?.content).toContain('`order-service`')
   })
 
-  it('offers the SKILL proposal tool to top-level agents once proposals are enabled and mentions it in /logalyze', async () => {
+  it('mentions SKILL improvement in /logalyze unless it is turned off', async () => {
     const { dir, cleanup } = await tempDir()
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'order-service'))
-    const h = await harness()
-    cleanups.push(h.dispose)
-    apply(h.ctx, { repos: [{ url: origin }], skillUpdates: { enabled: true } }, { overlayPath: join(dir, 'settings.json') })
-    const propose = h.tools.find(tool => tool.definition.name === 'logalyze_propose_skill')
-    const signal = new AbortController().signal
-    const step = (depth?: number) => ({ agent: { id: 'a', session: { header: { id: 'a', ...depth === undefined ? {} : { delegationDepth: depth } } } }, signal })
-    expect(await propose!.when?.(step())).toBe(true)
-    expect(await propose!.when?.(step(1))).toBe(false)
-    const [candidate] = await h.skills[0]!.list({})
-    expect((await h.skills[0]!.get(candidate!, {}))?.content).toContain('`logalyze_propose_skill`')
+    for (const enabled of [true, false]) {
+      const h = await harness()
+      cleanups.push(h.dispose)
+      apply(h.ctx, { repos: [{ url: origin }], skillUpdates: { enabled } }, { overlayPath: join(dir, `settings-${enabled}.json`) })
+      const [candidate] = await h.skills[0]!.list({})
+      const content = (await h.skills[0]!.get(candidate!, {}))?.content
+      if (enabled) expect(content).toContain('调用一次 `logalyze_improve_skill`')
+      else expect(content).not.toContain('logalyze_improve_skill')
+    }
   })
 
   it('adds a repository from a conversation into the panel settings and offers drafting while it lacks a description', async () => {
@@ -201,8 +200,8 @@ describe('plugin', () => {
       const [listed] = await provider.list({ cwd: dir })
       expect(listed?.invocation.modelInvocable).toBe(autoInvoke)
       if (autoInvoke) expect(listed?.description).toContain('订单服务（order-service')
-      // Inside the repositories only the kit is listed.
-      expect((await provider.list({ cwd: join(h.repos.mirrorSettings().dir, '.snapshots', 'local', 'x') })).map(skill => skill.name)).toEqual(['logalyze-kit'])
+      // Inside the repositories only the bundled guides are listed.
+      expect((await provider.list({ cwd: join(h.repos.mirrorSettings().dir, '.snapshots', 'local', 'x') })).map(skill => skill.name)).toEqual(['logalyze-kit', 'logalyze-improve'])
     }
   })
 

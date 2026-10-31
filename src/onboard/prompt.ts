@@ -7,7 +7,7 @@
  */
 
 import type { ChildLog } from '../dispatch/prompt.ts'
-import { KIT_SKILL_NAME } from '../skill/kit.ts'
+import { KIT_SKILL_NAME } from '../skill/bundled.ts'
 import { AGENTS_DIR, INIT_DIR, INIT_FILES_DIR, INIT_REASON_FILE } from './draft.ts'
 
 /** Inputs of one drafting prompt. */

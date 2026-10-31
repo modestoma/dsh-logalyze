@@ -13,27 +13,26 @@
  * @module dsh-logalyze/onboard/init
  */
 
-import { randomBytes } from 'node:crypto'
-import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { z } from 'zod'
 import { describeIssue } from '../config.ts'
 import { admitLogs, isDelegatedAgent, logSchema, materializeLogs, newRunId, resolveRunBase } from '../dispatch/tool.ts'
+import { runChild } from '../dispatch/child.ts'
 import type { Agent, ContentBlock, HostApproval, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
 import type { CommitAuthor } from '../repos/contract.ts'
 import { messageOf, requireRepos } from '../repos/lookup.ts'
 import type { RepoRegistry } from '../repos/registry.ts'
 import type { AppManifest, EditableSettings } from '../settings/contract.ts'
-import { prepareChange } from '../skill-update/change.ts'
+import { describeFiles, prepareChange } from '../skill-update/change.ts'
 import type { FileStat, PreparedChange } from '../skill-update/change.ts'
 import { submitChange } from '../skill-update/commit.ts'
 import type { SubmitStatus } from '../skill-update/commit.ts'
-import { describeFiles } from '../skill-update/tool.ts'
+import { replaceFile } from '../skill-update/proposal.ts'
 import { AGENTS_DIR, checkInitDraft, INIT_DIFF_FILE, readInitDraft } from './draft.ts'
 import type { InitDraft } from './draft.ts'
 import { ADD_REPO_TOOL_NAME, INIT_REPO_TOOL_NAME, SUBMIT_INIT_TOOL_NAME } from './names.ts'
 import { renderInitPrompt } from './prompt.ts'
-
 
 /** Drafts remembered for submission; older ones are forgotten first. */
 const MAX_REMEMBERED_DRAFTS = 64
@@ -226,18 +225,6 @@ export interface RepoInitializerDeps {
   readonly now?: () => Date
 }
 
-/** Write a file in an agent-writable directory without following the entry left at its path. */
-async function replaceFile(path: string, content: string): Promise<void> {
-  const temporary = `${path}.${randomBytes(6).toString('hex')}.tmp`
-  try {
-    await writeFile(temporary, content, { flag: 'wx' })
-    await rename(temporary, path)
-  } catch (error) {
-    await rm(temporary, { force: true })
-    throw error
-  }
-}
-
 function topLevelAgent(exec: ToolRunContext, tool: string): Agent {
   const agent = exec.agent
   if (agent === undefined) throw new Error(`${tool} 需要由 Agent 调用`)
@@ -313,7 +300,7 @@ export class RepoInitializer {
     const { registry } = this.deps
     const status = registry.statusOf(url)
     if (status === undefined) throw new Error(`${url} 不在观象的应用仓库列表中，先用 ${ADD_REPO_TOOL_NAME} 添加`)
-    if (status.available) throw new Error(`${url} 的应用「${status.app?.id ?? ''}」已经可用；改进它的 SKILL 走派发结果中的 SKILL 修改提议`)
+    if (status.available) throw new Error(`${url} 的应用「${status.app?.id ?? ''}」已经可用；改进它的 SKILL 走派发结果中的 SKILL 改进`)
     if (!registry.setupPending().includes(url)) throw new Error(`${url} 还不能起草：${status.error ?? status.phase}`)
     requireRepos(this.deps.repos())
     const settings = this.deps.settings()
@@ -335,7 +322,7 @@ export class RepoInitializer {
         workDir,
         maxFiles: settings.skillUpdates.maxFiles,
       })
-      const outcome = await this.runChild(parent, lease.dir, prompt, settings.dispatchTimeoutMs, exec.signal)
+      const outcome = await runChild({ subagents: this.deps.subagents, provider: this.deps.provider, parent, label: '观象接入起草', cwd: lease.dir, prompt, timeoutMs: settings.dispatchTimeoutMs, signal: exec.signal })
       const value: InitRepoValue = { url, commit: lease.commit, workDir, ...outcome }
       if (outcome.status !== 'completed') return value
       const task: DraftTask = { workDir, sessionId: parent.session.header.id, url, commit: lease.commit }
@@ -351,49 +338,6 @@ export class RepoInitializer {
     } finally {
       lease.release()
     }
-  }
-
-  private async runChild(parent: Agent, cwd: string, prompt: string, timeoutMs: number, signal: AbortSignal): Promise<{ status: string; output: string; diagnostic?: string }> {
-    const stop = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
-    const maxDepth = this.deps.subagents.resolveMaxDepth()
-    let activation
-    try {
-      activation = await this.deps.subagents.startActivation({
-        provider: this.deps.provider,
-        label: '观象接入起草',
-        request: { cwd, prompt: [{ type: 'text', text: prompt }], parent, ...maxDepth === undefined ? {} : { maxDepth } },
-        signal: stop,
-        delivery: 'caller',
-      })
-    } catch (error) {
-      signal.throwIfAborted()
-      return { status: stop.aborted ? 'timeout' : 'failed', output: '', diagnostic: messageOf(error) }
-    }
-    const stopped = new Promise<'stopped'>((resolveStop) => {
-      if (stop.aborted) resolveStop('stopped')
-      else stop.addEventListener('abort', () => { resolveStop('stopped') }, { once: true })
-    })
-    let result: { status: string; output: string; diagnostic?: string }
-    try {
-      const outcome = await Promise.race([activation.result, stopped])
-      result = outcome === 'stopped'
-        ? { status: signal.aborted ? 'aborted' : 'timeout', output: '', diagnostic: signal.aborted ? '起草被取消' : `超过派发等待上限 ${timeoutMs} ms` }
-        : {
-            status: outcome.stopReason,
-            output: outcome.output.flatMap(block => block.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n').trim(),
-            ...outcome.diagnostic === undefined ? {} : { diagnostic: outcome.diagnostic },
-          }
-    } catch (error) {
-      result = { status: 'error', output: '', diagnostic: messageOf(error) }
-    }
-    // Disposing releases a finished child and stops one that timed out or was cancelled.
-    try {
-      await activation.dispose()
-    } catch (error) {
-      result.diagnostic = [result.diagnostic, `子 Agent 清理失败：${messageOf(error)}`].filter(Boolean).join('；')
-    }
-    signal.throwIfAborted()
-    return result
   }
 
   private remember(task: DraftTask): void {

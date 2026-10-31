@@ -2,9 +2,12 @@ import { describe, expect, it, vi } from 'vitest'
 import { abortable } from '../src/abort.ts'
 import { createEntrySkillProvider, DESCRIPTION_MAX_CHARS, describeApps, renderCatalog, renderEntrySkill } from '../src/skill/entry.ts'
 import type { AppManifest } from '../src/settings/contract.ts'
-import { loadKitSkill, parseKitSkill } from '../src/skill/kit.ts'
+import { loadBundledSkills, parseBundledSkill } from '../src/skill/bundled.ts'
 
-const kit = { description: '接入套件', content: '# 观象接入套件' }
+const bundled = [
+  { name: 'logalyze-kit', description: '接入套件', content: '# 观象接入套件' },
+  { name: 'logalyze-improve', description: '改进指南', content: '# 观象 SKILL 改进指南' },
+] as const
 const order: AppManifest = { id: 'order-service', name: '订单服务', description: '下单 | 支付', aliases: ['订单'], logHints: ['OrderController'], skill: 'log-analysis' }
 
 describe('entry skill', () => {
@@ -14,14 +17,16 @@ describe('entry skill', () => {
     const body = renderEntrySkill([order], 3, false)
     expect(body).toContain('`logalyze_dispatch`')
     expect(body).toContain('最多 3 个')
-    expect(body).not.toContain('logalyze_propose_skill')
-    expect(renderEntrySkill([order], 3, true)).toContain('然后调用 `logalyze_propose_skill`')
+    expect(body).not.toContain('logalyze_improve_skill')
+    const improving = renderEntrySkill([order], 3, true)
+    expect(improving).toContain('5. **SKILL 改进。** 派发结果中某个应用标出「SKILL 不足」时，先照常写完汇总回复')
+    expect(improving).toContain('调用一次 `logalyze_improve_skill`')
   })
 
   it('is user-invocable only and renders the live catalog on each load', async () => {
     let apps: AppManifest[] = []
     const ready = Promise.withResolvers<void>()
-    const { factory, invalidate } = createEntrySkillProvider({ prepare: signal => abortable(ready.promise, signal), apps: () => apps, maxAppsPerRequest: () => 4, skillUpdates: () => false, autoInvoke: false, inRepositories: () => false, kit })
+    const { factory, invalidate } = createEntrySkillProvider({ prepare: signal => abortable(ready.promise, signal), apps: () => apps, maxAppsPerRequest: () => 4, skillUpdates: () => false, autoInvoke: false, inRepositories: () => false, bundled })
     const control = { signal: new AbortController().signal, invalidate: vi.fn() }
     const provider = factory(control)
     const [candidate] = await provider.list({})
@@ -50,7 +55,7 @@ describe('entry skill', () => {
       skillUpdates: () => false,
       autoInvoke: true,
       inRepositories: cwd => cwd.startsWith('/repos'),
-      kit,
+      bundled,
     })
     const control = { signal: new AbortController().signal, invalidate: vi.fn() }
     const provider = factory(control)
@@ -63,7 +68,7 @@ describe('entry skill', () => {
     const [listed] = await provider.list({ cwd: '/project' })
     expect(listed).toMatchObject({ name: 'logalyze', invocation: { modelInvocable: true, userInvocable: true } })
     expect(listed?.description).toContain('订单服务（order-service、订单、OrderController）')
-    expect((await provider.list({ cwd: '/repos/.snapshots/order-service/abc' })).map(skill => skill.name)).toEqual(['logalyze-kit'])
+    expect((await provider.list({ cwd: '/repos/.snapshots/order-service/abc' })).map(skill => skill.name)).toEqual(['logalyze-kit', 'logalyze-improve'])
     invalidate()
     expect(control.invalidate).toHaveBeenCalledTimes(1)
     const skill = await provider.get(listed!, {})
@@ -81,29 +86,36 @@ describe('entry skill', () => {
     expect(describeApps([huge])).toContain('1 个应用')
   })
 
-  it('serves /logalyze-kit everywhere for users and the drafting child, never for model choice', async () => {
-    const { factory } = createEntrySkillProvider({ prepare: () => Promise.resolve(), apps: () => [order], maxAppsPerRequest: () => 4, skillUpdates: () => false, autoInvoke: true, inRepositories: cwd => cwd.startsWith('/repos'), kit })
+  it('serves the bundled guides everywhere for users and children, never for model choice', async () => {
+    const { factory } = createEntrySkillProvider({ prepare: () => Promise.resolve(), apps: () => [order], maxAppsPerRequest: () => 4, skillUpdates: () => false, autoInvoke: true, inRepositories: cwd => cwd.startsWith('/repos'), bundled })
     const provider = factory({ signal: new AbortController().signal, invalidate: vi.fn() })
     const listed = await provider.list({ cwd: '/project' })
-    expect(listed.map(skill => skill.name)).toEqual(['logalyze', 'logalyze-kit'])
-    const [inRepo] = await provider.list({ cwd: '/repos/x' })
-    expect(inRepo).toMatchObject({ name: 'logalyze-kit', description: '接入套件', invocation: { modelInvocable: false, userInvocable: true }, rank: 600 })
-    expect(await provider.get(inRepo!, {})).toMatchObject({ name: 'logalyze-kit', content: '# 观象接入套件' })
+    expect(listed.map(skill => skill.name)).toEqual(['logalyze', 'logalyze-kit', 'logalyze-improve'])
+    const [kit, improve] = await provider.list({ cwd: '/repos/x' })
+    expect(kit).toMatchObject({ name: 'logalyze-kit', description: '接入套件', invocation: { modelInvocable: false, userInvocable: true }, rank: 600, whenToUse: '仅在用户输入 /logalyze-kit 时使用。' })
+    expect(await provider.get(kit!, {})).toMatchObject({ name: 'logalyze-kit', content: '# 观象接入套件' })
+    expect(improve).toMatchObject({ name: 'logalyze-improve', invocation: { modelInvocable: false, userInvocable: true }, whenToUse: '仅在用户输入 /logalyze-improve 时使用。' })
+    expect(await provider.get(improve!, {})).toMatchObject({ name: 'logalyze-improve', content: '# 观象 SKILL 改进指南' })
   })
 })
 
-describe('logalyze-kit', () => {
-  it('ships a valid SKILL.md that covers the description, the SKILL, and references', () => {
-    const shipped = loadKitSkill(new URL('../skills/logalyze-kit/SKILL.md', import.meta.url))
-    expect(shipped.description).toContain('logalyze.yaml')
-    expect(shipped.content).toContain('references/<领域>.md')
-    expect(shipped.content).not.toMatch(/^---/)
+describe('bundled skills', () => {
+  it('ships valid SKILL.md files for the kit and the improvement guide', () => {
+    const [kit, improve] = loadBundledSkills(new URL('../skills/', import.meta.url))
+    expect(kit?.name).toBe('logalyze-kit')
+    expect(kit?.description).toContain('logalyze.yaml')
+    expect(kit?.content).toContain('references/<领域>.md')
+    expect(kit?.content).toContain('## 案例索引')
+    expect(improve?.name).toBe('logalyze-improve')
+    expect(improve?.content).toContain('cases/<YYYY-MM-DD>-<slug>.md')
+    expect(improve?.content).toContain('## 案例索引')
+    for (const skill of [kit, improve]) expect(skill?.content).not.toMatch(/^---/)
   })
 
-  it('rejects a file that would not register as /logalyze-kit', () => {
-    expect(() => parseKitSkill('# no frontmatter')).toThrow('缺少 frontmatter')
-    expect(() => parseKitSkill('---\nname: other\ndescription: x\n---\nbody')).toThrow('name 必须是 logalyze-kit')
-    expect(() => parseKitSkill('---\nname: logalyze-kit\n---\nbody')).toThrow('缺少 description 或正文')
-    expect(parseKitSkill('---\nname: logalyze-kit\ndescription: 套件\n---\n\n# 正文\n')).toEqual({ description: '套件', content: '# 正文' })
+  it('rejects a file that would not register under its name', () => {
+    expect(() => parseBundledSkill('# no frontmatter', 'logalyze-kit')).toThrow('缺少 frontmatter')
+    expect(() => parseBundledSkill('---\nname: other\ndescription: x\n---\nbody', 'logalyze-improve')).toThrow('name 必须是 logalyze-improve')
+    expect(() => parseBundledSkill('---\nname: logalyze-kit\n---\nbody', 'logalyze-kit')).toThrow('缺少 description 或正文')
+    expect(parseBundledSkill('---\nname: logalyze-kit\ndescription: 套件\n---\n\n# 正文\n', 'logalyze-kit')).toEqual({ name: 'logalyze-kit', description: '套件', content: '# 正文' })
   })
 })

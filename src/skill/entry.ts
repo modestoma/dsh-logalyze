@@ -8,11 +8,10 @@
 
 import type { SkillDefinition, SkillProvider, SkillProviderControl } from '../host.ts'
 import type { AppManifest } from '../settings/contract.ts'
-import { KIT_SKILL_NAME } from './kit.ts'
-import type { KitSkill } from './kit.ts'
+import type { BundledSkill } from './bundled.ts'
 import { DISPATCH_TOOL_NAME } from '../dispatch/tool.ts'
 import { ADD_REPO_TOOL_NAME } from '../onboard/names.ts'
-import { PROPOSE_TOOL_NAME } from '../skill-update/tool.ts'
+import { IMPROVE_TOOL_NAME } from '../skill-update/names.ts'
 
 /** Entry skill name, addressed as `/logalyze`. */
 export const ENTRY_SKILL_NAME = 'logalyze'
@@ -65,9 +64,11 @@ export function renderCatalog(apps: readonly AppManifest[]): string {
   return ['| 应用 id | 名称 | 描述 | 别名 | 日志特征 |', '| --- | --- | --- | --- | --- |', ...rows].join('\n')
 }
 
-function proposalStep(): string {
+function improveStep(): string {
   return `
-5. **SKILL 修改提议。** 派发结果中某个应用带有「SKILL 修改提议」时，在汇总回复末尾另起一节「SKILL 修改提议」：说明改动的文件和理由，附上 diff 文件中的关键改动；diff 较长时给出 diff 文件路径，在飞书话题中可以用 \`feishu_send_file\` 发送该文件。然后调用 \`${PROPOSE_TOOL_NAME}\`（\`workDir\` 取结果中给出的运行目录，\`summary\` 一句话说明改了什么）。工具会先请求用户授权，批准后推送新分支并创建合并请求。不要自己用 git 推送或修改仓库。工具返回后，把合并请求链接或「用户拒绝 / 无法授权」如实告诉用户。提议不可提交时，只说明原因。
+5. **SKILL 改进。** 派发结果中某个应用标出「SKILL 不足」时，先照常写完汇总回复，在末尾另起一节「SKILL 改进」，用一两句话说明子 Agent 认为 SKILL 哪里不足。然后对每个这样的应用调用一次 \`${IMPROVE_TOOL_NAME}\`（\`workDir\` 取结果中给出的运行目录）。
+   - 工具会先询问用户是否改进。用户同意后，改进子 Agent 把这次问题整理为案例写入 SKILL 的 \`cases/\` 目录并修改 SKILL，观象提交到新分支并创建合并请求，整个过程需要几分钟。不要自己用 git 推送或修改仓库。
+   - 工具返回后，列出改动的文件和每处改动的要点（取自结果），附上合并请求链接，请用户在合并请求中评审。用户拒绝或无法询问时，一句话说明即可；改进失败时如实说明原因。
 `
 }
 
@@ -75,7 +76,7 @@ function proposalStep(): string {
  * The entry skill body.
  * @param apps - usable applications at load time.
  * @param maxAppsPerRequest - dispatch task ceiling.
- * @param skillUpdates - whether SKILL improvement proposals are enabled.
+ * @param skillUpdates - whether SKILL improvement is enabled.
  * @returns Markdown instructions.
  */
 export function renderEntrySkill(apps: readonly AppManifest[], maxAppsPerRequest: number, skillUpdates: boolean): string {
@@ -120,7 +121,7 @@ ${renderCatalog(apps)}
 \`\`\`
 
    每个派发的应用都有一节。子 Agent 失败、超时或结论不充分时，在该节如实说明，不要编造结论。日志版本与仓库代码可能不一致，子 Agent 提示了版本差异时保留这条提示。
-${skillUpdates ? proposalStep() : ''}`
+${skillUpdates ? improveStep() : ''}`
 }
 
 /** Inputs the provider reads at each listing and load. */
@@ -137,7 +138,7 @@ export interface EntrySkillSource {
   apps(): readonly AppManifest[]
   /** Current dispatch task ceiling. */
   maxAppsPerRequest(): number
-  /** Whether SKILL improvement proposals are enabled. */
+  /** Whether SKILL improvement is enabled. */
   skillUpdates(): boolean
   /** Whether top-level agents may load the skill without `/logalyze`. */
   readonly autoInvoke: boolean
@@ -148,15 +149,15 @@ export interface EntrySkillSource {
    * @returns whether the directory belongs to the repositories.
    */
   inRepositories(cwd: string): boolean
-  /** The `/logalyze-kit` skill, served from the same provider. */
-  readonly kit: KitSkill
+  /** Bundled guide skills served from the same provider. */
+  readonly bundled: readonly BundledSkill[]
 }
 
 /**
- * Build the skill provider serving `/logalyze` and `/logalyze-kit`. The kit
- * is listed in every directory, including the repository snapshots children
- * work in, where `/logalyze` is not listed.
- * @param source - live registry view and the kit skill.
+ * Build the skill provider serving `/logalyze` and the bundled guide skills.
+ * The bundled skills are listed in every directory, including the repository
+ * snapshots children work in, where `/logalyze` is not listed.
+ * @param source - live registry view and the bundled skills.
  * @returns a provider factory for `ctx.skills.registerProvider`, plus the
  *   hook to call after the usable applications may have changed; it
  *   invalidates the DSH catalog only when the listed entry changes.
@@ -167,15 +168,18 @@ export function createEntrySkillProvider(source: EntrySkillSource): {
 } {
   let control: SkillProviderControl | undefined
   let listed: string | undefined
-  // The kit is user-invoked (or loaded by the drafting child's first line), never chosen by the model.
-  const kitSummary = {
-    name: KIT_SKILL_NAME,
-    description: source.kit.description,
-    whenToUse: '仅在用户输入 /logalyze-kit 时使用。',
-    invocation: { modelInvocable: false, userInvocable: true },
-    source: 'bundled',
-    provider: SKILL_PROVIDER_NAME,
-  } as const
+  // Bundled skills are user-invoked (or loaded by a child's first line), never chosen by the model.
+  const bundled = new Map(source.bundled.map(skill => [skill.name as string, {
+    summary: {
+      name: skill.name,
+      description: skill.description,
+      whenToUse: `仅在用户输入 /${skill.name} 时使用。`,
+      invocation: { modelInvocable: false, userInvocable: true },
+      source: 'bundled',
+      provider: SKILL_PROVIDER_NAME,
+    } as const,
+    content: skill.content,
+  }]))
   const summary = () => {
     const apps = source.apps()
     const automatic = source.autoInvoke && apps.length > 0
@@ -194,14 +198,15 @@ export function createEntrySkillProvider(source: EntrySkillSource): {
       return {
         name: SKILL_PROVIDER_NAME,
         list: (options) => {
-          const kit = { ...kitSummary, rank: BUNDLED_SKILL_RANK, locator: KIT_SKILL_NAME }
-          if (options.cwd !== undefined && source.inRepositories(options.cwd)) return Promise.resolve([kit])
+          const guides = [...bundled.values()].map(({ summary: guide }) => ({ ...guide, rank: BUNDLED_SKILL_RANK, locator: guide.name }))
+          if (options.cwd !== undefined && source.inRepositories(options.cwd)) return Promise.resolve(guides)
           const current = summary()
           listed = JSON.stringify(current)
-          return Promise.resolve([{ ...current, rank: BUNDLED_SKILL_RANK, locator: ENTRY_SKILL_NAME }, kit])
+          return Promise.resolve([{ ...current, rank: BUNDLED_SKILL_RANK, locator: ENTRY_SKILL_NAME }, ...guides])
         },
         get: async (requested, options): Promise<SkillDefinition | undefined> => {
-          if (requested.name === KIT_SKILL_NAME) return { ...kitSummary, content: source.kit.content }
+          const guide = bundled.get(requested.name)
+          if (guide !== undefined) return { ...guide.summary, content: guide.content }
           if (requested.name !== ENTRY_SKILL_NAME) return undefined
           await source.prepare(options.signal)
           return { ...summary(), content: renderEntrySkill(source.apps(), source.maxAppsPerRequest(), source.skillUpdates()) }

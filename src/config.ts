@@ -71,7 +71,7 @@ const downloadSchema = z.object({
 }).strict()
 
 const skillUpdatesSchema = z.object({
-  enabled: z.boolean().default(false),
+  enabled: z.boolean().default(true),
   maxFiles: z.number().int().min(1).max(256).default(16),
   maxFileBytes: z.number().int().min(1).max(16 * 1024 * 1024).default(256 * 1024),
 }).strict()

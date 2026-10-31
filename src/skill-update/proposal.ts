@@ -1,7 +1,8 @@
 /**
- * 子 Agent 写在运行目录里的 SKILL 修改提议：`skill-proposal/reason.md` 说明
- * 理由，`skill-proposal/files/` 按相对路径存放应用 SKILL 目录
- * `.agents/skills/<skill>/` 下要新增或修改的完整文件。
+ * SKILL 改进子 Agent 写在运行目录里的修改：`skill-proposal/reason.md` 是改动
+ * 说明，`skill-proposal/files/` 按相对路径存放应用 SKILL 目录
+ * `.agents/skills/<skill>/` 下要新增或修改的完整文件。接入初稿也用这里的读取
+ * 函数。
  *
  * 运行目录对 Agent 可写，所以这里读到的一切都按不可信输入校验：只接受普通
  * 文件和目录（不跟随符号链接）、受限的文件名、UTF-8 文本、文件数与大小上限。
@@ -9,7 +10,8 @@
  * @module dsh-logalyze/skill-update/proposal
  */
 
-import { lstat, readdir, readFile } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
+import { lstat, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { disablesUserInvocation } from '../repos/manifest.ts'
 import type { SkillUpdateSettings } from '../settings/contract.ts'
@@ -112,6 +114,24 @@ export async function readFileTree(root: string, limits: Pick<SkillUpdateSetting
   }
   await walk(root, [])
   return files
+}
+
+/**
+ * Write a file in an agent-writable directory without following whatever
+ * entry the agent left at its path: the content goes to a new file created
+ * exclusively, which then replaces the directory entry.
+ * @param path - absolute path.
+ * @param content - file content.
+ */
+export async function replaceFile(path: string, content: string): Promise<void> {
+  const temporary = `${path}.${randomBytes(6).toString('hex')}.tmp`
+  try {
+    await writeFile(temporary, content, { flag: 'wx' })
+    await rename(temporary, path)
+  } catch (error) {
+    await rm(temporary, { force: true })
+    throw error
+  }
 }
 
 /**

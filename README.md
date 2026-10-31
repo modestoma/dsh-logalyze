@@ -65,7 +65,7 @@
 - **运行目录。** 每次派发在父会话目录下创建 `.logalyze/runs/<runId>/<序号>-<应用 id>/`，下载的日志放在这里，子 Agent 也只在这里写文件；应用仓库对子 Agent 只读。
 - **等待式派发。** 工具等待所有子 Agent 结束后一次返回，一条消息对应一张完整回复；超过派发超时或调用被取消时停止仍在运行的子 Agent。子会话中不提供派发工具。
 - **在对话中接入仓库。** 用户给出 git 地址时，模型可以经用户授权把它加入应用仓库列表；仓库缺少应用描述或 SKILL 时，派一个子 Agent 读代码起草，经授权后经 `dshRepos` 服务提交为合并请求，见[在对话中接入仓库](#在对话中接入仓库)。
-- **SKILL 改进（可选，默认关闭）。** 子 Agent 发现应用的日志分析 SKILL 有欠缺时，可以在运行目录写出修改提议；经用户授权后，观象经 `dshRepos` 服务把它提交到应用仓库的新分支并创建合并请求（GitLab MR 或 GitHub PR），见 [SKILL 改进](#skill-改进)。
+- **SKILL 改进（默认开启）。** 子 Agent 觉得应用的日志分析 SKILL 没能支撑这次分析时，在运行目录记下不足；父 Agent 汇总后询问用户是否改进，用户同意后由改进子 Agent 把问题整理为案例写入 SKILL 的 `cases/` 目录并修改 SKILL，观象经 `dshRepos` 服务提交到应用仓库的新分支并创建合并请求（GitLab MR 或 GitHub PR）供评审，见 [SKILL 改进](#skill-改进)。
 
 ## 安装与配置
 
@@ -105,9 +105,9 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
     refreshWaitMs: 15000               # 加载 /logalyze 时等待 fetch 的上限；0 = 不等待
     autoInvoke: true                   # 任务匹配已注册应用时模型可自行加载入口 SKILL；false = 只能输入 /logalyze
     skillUpdates:                      # SKILL 改进，见下文
-      enabled: false                   # 默认关闭
-      maxFiles: 16                     # 一次提议最多新增或修改的文件数
-      maxFileBytes: 262144             # 提议中单个文件的大小上限
+      enabled: true                    # 默认开启；false = 子 Agent 不记录 SKILL 不足，也不询问
+      maxFiles: 16                     # 一次改进最多新增或修改的文件数
+      maxFileBytes: 262144             # 改进中单个文件和 SKILL 不足记录的大小上限
     skillUpdateAuthor:                 # 可选：SKILL 改进提交的作者；省略时是该主机令牌的主人
       name: 观象
       email: logalyze@example.com
@@ -135,7 +135,7 @@ DSH Web 左侧栏的「观象」入口打开整页设置面板：
 | 应用仓库 | git 地址列表（分支可选）、每个仓库的拉取状态、提交号、应用描述与不可用原因，单个或全部重新拉取，以及跳转到 dsh-repo 主机与令牌设置的按钮 |
 | 日志下载 | 允许下载的域名、单文件大小上限、下载超时 |
 | 分析接口 | [日志平台分析接口](#日志平台分析接口)的开关、访问令牌（只显示是否已设置）、飞书渠道是否就绪，以及调用地址与字段摘要 |
-| 高级 | 更新间隔、单次应用数上限、派发超时、SKILL 改进开关与提议上限，恢复 cordis.yml 配置 |
+| 高级 | 更新间隔、单次应用数上限、派发超时、SKILL 改进开关与文件上限，恢复 cordis.yml 配置 |
 
 面板保存的值写入 `$DSH_HOME/logalyze/settings.json`（只保存与 cordis.yml 不同的字段），按与配置相同的规则校验；分析接口令牌存入 DSH 凭据库。面板接口 `/logalyze/*` 使用 DSH 自己的登录与来源校验，写操作另做同源校验。
 
@@ -160,20 +160,22 @@ skill: log-analysis             # 对应 .agents/skills/log-analysis/SKILL.md
 
 ## SKILL 改进
 
-开启 `skillUpdates.enabled`（设置面板「高级」→「SKILL 改进」）后，分析中发现的 SKILL 欠缺可以经用户授权后提交为合并请求。提交和创建合并请求经 `dshRepos` 服务完成，应用仓库所在的主机要在提供该服务的插件中配置令牌；没有该服务或版本不符时工具报错。
+`skillUpdates.enabled` 默认开启（设置面板「高级」→「SKILL 改进」可以关闭）。分析中 SKILL 没覆盖到的问题，经用户同意后沉淀为案例和 SKILL 修改，以合并请求的形式交给仓库维护者评审。提交和创建合并请求经 `dshRepos` 服务完成，应用仓库所在的主机要在提供该服务的插件中配置令牌；没有该服务或版本不符时工具报错。
 
-1. **子 Agent 写提议。** 子 Agent 的任务消息多出一节说明：把要改的文件从 `.agents/skills/<skill>/` 复制到运行目录的 `skill-proposal/files/`（保持相对路径）后修改，理由写进 `skill-proposal/reason.md`。仓库对子 Agent 仍然只读。
-2. **派发结果标出提议。** 派发结束后，观象检查已完成任务的提议：只接受普通文件和受限的文件名、UTF-8 文本、文件数与大小上限，`SKILL.md` 不能设置 `user-invocable: false`。合格的提议在结果中给出改动行数，并在运行目录写出 `skill-proposal.diff`；不合格的给出原因。
-3. **父 Agent 展示并提交。** 入口 SKILL 让父 Agent 在汇总回复后附上改动和 diff，再调用 `logalyze_propose_skill`（参数为任务的运行目录和一句话摘要）。只接受本次 DSH 运行中由同一会话派发过的任务；应用、仓库和分析时的提交取自派发记录。
-4. **请求授权。** 工具通过 DSH 的审批服务（`ctx.approval`，`@deepseek-ai/dsh-user-approval`）请求一次性授权，说明将提交的仓库、分支、目标分支、改动文件和理由。经 dsh_channels 使用时显示为飞书决策卡片，在 DSH Web 中显示为审批提示；观象与 dsh_channels 之间没有代码依赖。只有「允许」才提交；拒绝、撤回或没有可回答的界面时都不提交。会话的审批策略为 `never`（例如 DSH 的「完全访问」权限模式）时请求一律被拒绝，所以要在「询问」类权限模式下使用；DSH 组合没有审批服务时工具报错。
-5. **提交新分支并创建合并请求。** 观象进程（不是 Agent）经 `dshRepos` 以分析时的提交为起点建新分支 `logalyze/skill-<应用 id>-<改动摘要前缀>`，提交 `.agents/skills/<skill>/` 下有改动的文件，再创建合入跟踪分支的合并请求，返回它的链接。同一改动的分支已存在时不再请求授权，也不提交；等待授权期间分支被别人建出时同样不提交。从不提交到已有分支或默认分支，合并由仓库的评审流程决定；合并后下次 `/logalyze` 拉取即生效。提交成功但合并请求创建失败时，工具返回分支和失败原因，可以在代码托管平台上手动创建。
+1. **分析子 Agent 记录不足。** 子 Agent 的任务消息多出一节说明：分析完成后，如果 SKILL 没能很好地支撑这次分析（日志格式描述不对、缺少这类故障的排查方法或排除规则、代码路径过时、靠自己摸索才找到根因），就在运行目录写 `skill-gap.md`，记下 SKILL 哪里不足、实际怎样定位、关键日志行（去掉具体数据）和代码位置。子 Agent 不修改 SKILL，SKILL 足够时不写这个文件。
+2. **派发结果标出不足。** 派发结束后，观象检查已完成任务的记录（普通文件、UTF-8 文本、大小不超过 `maxFileBytes`），在结果中标出「SKILL 不足」和记录摘要。本会话有这样的任务时，顶层 Agent 才会拿到 `logalyze_improve_skill` 工具。
+3. **询问用户。** 入口 SKILL 让父 Agent 照常写完汇总回复，在末尾说明 SKILL 哪里不足，然后对每个这样的应用调用一次 `logalyze_improve_skill`（参数为任务的运行目录）。工具经 DSH 的审批服务（`ctx.approval`，`@deepseek-ai/dsh-user-approval`）问一次「是否改进 SKILL」，说明不足摘要、仓库和目标分支。经 dsh_channels 使用时显示为飞书决策卡片，在 DSH Web 中显示为审批提示；观象与 dsh_channels 之间没有代码依赖。只有「允许」才继续；拒绝后这条记录不再提供，撤回或没有可回答的界面时可以稍后再问。会话的审批策略为 `never`（例如 DSH 的「完全访问」权限模式）时请求一律被拒绝，所以要在「询问」类权限模式下使用；DSH 组合没有审批服务时工具报错。
+4. **改进子 Agent 起草。** 用户同意后，观象在应用最新提交的只读快照里启动一个改进子 Agent，首行用 `/logalyze-improve` 加载观象自带的改进指南，任务消息给出分析时的问题、结论、`skill-gap.md`、日志和分析时的运行目录。它把修改写到任务运行目录下的 `improve-<序号>/skill-proposal/files/`（对应 `.agents/skills/<skill>/`），包括一份案例 `cases/<日期>-<slug>.md`（现象、脱敏的日志特征、根因、定位路径、确认与排除、本次 SKILL 改进）、对 `SKILL.md` 或 `references/` 的修改，以及 `SKILL.md` 中「案例索引」表的一行；改动说明写进 `skill-proposal/reason.md`，第一行是标题。等待上限是 `dispatchTimeoutMs`。
+5. **检查并提交。** 观象检查修改：只接受普通文件和受限的文件名、UTF-8 文本、文件数与大小上限；必须新增或修改 `cases/` 下的一份案例；`SKILL.md` 的 frontmatter `name` 不能变，也不能设置 `user-invocable: false`。合格后在运行目录写出 `skill-proposal.diff`，由观象进程（不是 Agent）经 `dshRepos` 以快照的提交为起点建新分支 `logalyze/skill-<应用 id>-<改动摘要前缀>`，提交 `.agents/skills/<skill>/` 下有改动的文件，再创建合入跟踪分支的合并请求。用户在第 3 步已经同意，这一步不再询问。工具返回改动文件、改进子 Agent 的改动说明和合并请求链接，父 Agent 转告用户，评审在合并请求中进行。修改不合格或子 Agent 没有完成时工具返回原因，不提交，这条记录可以再试一次；同一改动的分支已存在时不提交；提交成功但合并请求创建失败时返回分支和失败原因，可以在代码托管平台上手动创建。从不提交到已有分支或默认分支，合并后下次 `/logalyze` 拉取即生效。
+
+**改进指南 `/logalyze-improve`。** 正文在包内的 [skills/logalyze-improve/SKILL.md](skills/logalyze-improve/SKILL.md)，写明怎样判断缺口类型、案例模板与脱敏规则、哪些知识补进 `SKILL.md` 或 `references/`、怎样维护「案例索引」，以及改动说明的格式。和接入套件一样在任何目录都列出，只能由用户输入或首行手势加载；开发者也可以在自己的仓库里输入 `/logalyze-improve`，手动把一次排查沉淀为案例。
 
 注意：
 
 - 支持 GitLab（包括自建实例）和 GitHub。应用仓库的 git 地址（https、ssh 或 `user@host:path`）要能被 `dshRepos` 识别为已配置主机上的仓库；该主机的令牌在 GitLab 上需要 `api` 权限，在 GitHub 上需要 Contents 和 Pull requests 的读写权限。
 - 有写权限的令牌可以改动它能访问的所有项目。建议用只覆盖应用仓库的项目或组访问令牌，设置过期时间，并保护应用仓库的默认分支。
 - 合并请求以该主机令牌主人的身份创建，提交作者是 `skillUpdateAuthor`，省略时也是令牌主人。飞书群里点「允许」的人可能不是令牌主人；合并请求描述写明了来源会话与分析提交。
-- 日志内容不可信，可能诱导模型写出不当的 SKILL。观象只限制改动范围，内容需要授权的人和合并请求的评审者把关。
+- 日志内容不可信，可能诱导模型写出不当的 SKILL 或在案例里留下未脱敏的数据。观象只限制改动范围，内容需要合并请求的评审者把关。
 
 ## 在对话中接入仓库
 
@@ -187,7 +189,7 @@ skill: log-analysis             # 对应 .agents/skills/log-analysis/SKILL.md
 
 **接入套件 `/logalyze-kit`。** 观象自带一个 SKILL，写明怎样为应用仓库编写应用描述和日志分析 SKILL：从代码和日志配置里找什么、`logalyze.yaml` 字段、SKILL.md 与 `references/` 的结构模板、约束和自检清单。正文在包内的 [skills/logalyze-kit/SKILL.md](skills/logalyze-kit/SKILL.md)，插件加载时读取，缺失或不合法时加载失败。它在任何目录都列出（包括子 Agent 所在的仓库快照），只能由用户输入或首行手势加载，模型不会自行选用。开发者也可以在自己的仓库里运行 dsh，输入 `/logalyze-kit` 直接编写或改进 SKILL。
 
-初稿的检查规则与拉取时相同：`logalyze.yaml` 合法，SKILL 存在、frontmatter 的 `name` 等于 `skill` 字段、不设置 `user-invocable: false`，应用 id 不与其他仓库重复；初稿只能包含 `logalyze.yaml` 和它指定的 `skills/<skill>/` 下的文件，文件数和大小上限沿用 `skillUpdates.maxFiles` 与 `maxFileBytes`（不需要开启 SKILL 改进）。起草子 Agent 的等待上限是 `dispatchTimeoutMs`。授权、令牌权限、提交作者（`skillUpdateAuthor`）和合并请求的规则与 [SKILL 改进](#skill-改进) 相同；合并后下一次 `/logalyze` 拉取即启用该应用。用户拒绝提交时，初稿文件仍在运行目录中，可以手动提交。
+初稿的检查规则与拉取时相同：`logalyze.yaml` 合法，SKILL 存在、frontmatter 的 `name` 等于 `skill` 字段、不设置 `user-invocable: false`，应用 id 不与其他仓库重复；初稿只能包含 `logalyze.yaml` 和它指定的 `skills/<skill>/` 下的文件，文件数和大小上限沿用 `skillUpdates.maxFiles` 与 `maxFileBytes`（关闭 SKILL 改进时同样生效）。起草子 Agent 的等待上限是 `dispatchTimeoutMs`。授权方式、令牌权限、提交作者（`skillUpdateAuthor`）和合并请求的规则与 [SKILL 改进](#skill-改进) 相同；合并后下一次 `/logalyze` 拉取即启用该应用。用户拒绝提交时，初稿文件仍在运行目录中，可以手动提交。
 
 ## 日志平台分析接口
 
@@ -271,10 +273,11 @@ pnpm check        # 类型检查（Host 与 Client）+ 单元测试 + 构建 + �
 | `src/index.ts` | Cordis 插件入口 |
 | `src/service.ts` | 生效设置、注册表、入口 SKILL 与各工具的注册 |
 | `src/repos/` | `dshRepos` 服务需求与查找、应用描述校验、应用注册表 |
-| `src/skill/` | `/logalyze` 入口 SKILL 与 `/logalyze-kit` 接入套件的 provider |
+| `src/skill/` | `/logalyze` 入口 SKILL 与随包指导 SKILL（`/logalyze-kit`、`/logalyze-improve`）的 provider |
 | `skills/logalyze-kit/` | 接入套件 SKILL 正文 |
-| `src/dispatch/` | 派发工具、日志下载、子 Agent 首条消息 |
-| `src/skill-update/` | SKILL 修改提议的校验、diff、授权与提交 |
+| `skills/logalyze-improve/` | SKILL 改进指南正文 |
+| `src/dispatch/` | 派发工具、日志下载、子 Agent 首条消息与运行 |
+| `src/skill-update/` | SKILL 不足记录、改进工具与改进子 Agent 首条消息、修改校验、diff 与提交 |
 | `src/onboard/` | 在对话中添加仓库、起草应用描述与 SKILL、提交接入合并请求 |
 | `src/analyze/` | 日志平台分析接口：请求校验、令牌、到 `feishuTopics` 的转换 |
 | `src/settings/` | 面板契约、覆盖文件、HTTP 路由 |

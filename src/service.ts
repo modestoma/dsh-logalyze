@@ -1,6 +1,6 @@
 /**
  * 观象运行时：持有生效设置（cordis.yml + 面板覆盖）、应用注册表、入口
- * SKILL、派发工具、SKILL 提议工具与仓库接入工具的注册，并为设置面板提供状态与写入口。
+ * SKILL、派发工具、SKILL 改进工具与仓库接入工具的注册，并为设置面板提供状态与写入口。
  *
  * @module dsh-logalyze/service
  */
@@ -21,8 +21,8 @@ import type { AnalyzeWire, EditableSettings, RepoSpec, ReposWire, StateWire, Tok
 import { diffOverlay, overriddenKeys } from './settings/overlay.ts'
 import type { OverlayStore } from './settings/overlay.ts'
 import { createEntrySkillProvider } from './skill/entry.ts'
-import type { KitSkill } from './skill/kit.ts'
-import { SkillUpdater } from './skill-update/tool.ts'
+import type { BundledSkill } from './skill/bundled.ts'
+import { SkillImprover } from './skill-update/tool.ts'
 import { RepoAdder } from './onboard/add.ts'
 import { RepoInitializer } from './onboard/init.ts'
 
@@ -44,8 +44,8 @@ export interface ServiceOptions {
 
 /** Package files the service serves. */
 export interface ServiceAssets {
-  /** The `/logalyze-kit` skill. */
-  readonly kit: KitSkill
+  /** Bundled guide skills (`/logalyze-kit`, `/logalyze-improve`). */
+  readonly bundled: readonly BundledSkill[]
 }
 
 /** The plugin's long-lived state. */
@@ -56,7 +56,7 @@ export class LogalyzeService {
   private overlayError: string | undefined
   private current: EditableSettings
   private readonly dispatcher: Dispatcher
-  private readonly updater: SkillUpdater
+  private readonly improver: SkillImprover
   private readonly adder: RepoAdder
   private readonly initializer: RepoInitializer
   private readonly skill: ReturnType<typeof createEntrySkillProvider>
@@ -88,8 +88,10 @@ export class LogalyzeService {
       repos: () => ctx.get?.(DSH_REPOS_SERVICE),
       onChange: () => { this.onRegistryChange() },
     })
-    this.updater = new SkillUpdater({
+    this.improver = new SkillImprover({
       registry: this.registry,
+      subagents: ctx.subagents,
+      provider: config.subagentProvider,
       settings: () => this.current,
       ...config.skillUpdateAuthor === undefined ? {} : { author: config.skillUpdateAuthor },
       approval: () => ctx.get?.('approval') as HostApproval | undefined,
@@ -97,7 +99,7 @@ export class LogalyzeService {
     })
     this.dispatcher = new Dispatcher({
       registry: this.registry,
-      proposals: this.updater,
+      gaps: this.improver,
       subagents: ctx.subagents,
       settings: () => this.current,
       provider: config.subagentProvider,
@@ -126,7 +128,7 @@ export class LogalyzeService {
       maxAppsPerRequest: () => this.current.maxAppsPerRequest,
       skillUpdates: () => this.current.skillUpdates.enabled,
       autoInvoke: config.autoInvoke,
-      kit: assets.kit,
+      bundled: assets.bundled,
       inRepositories: (cwd) => {
         const lookup = lookupRepos(ctx.get?.(DSH_REPOS_SERVICE))
         return lookup.availability === 'ready' && isInside(cwd, lookup.service.mirrorSettings().dir)
@@ -140,7 +142,7 @@ export class LogalyzeService {
   }
 
   /**
-   * Register the dispatch, SKILL proposal, and repository onboarding tools;
+   * Register the dispatch, SKILL improvement, and repository onboarding tools;
    * called once from `apply()`. The definitions stay fixed because a step
    * drops a tool whose registration changed after the step resolved its tools.
    */
@@ -150,8 +152,8 @@ export class LogalyzeService {
       'logalyze: dispatch tool',
     )
     this.ctx.effect(
-      () => this.ctx.tools.register(this.updater.definition(), { when: async context => this.current.skillUpdates.enabled && await this.offersTool(context) }),
-      'logalyze: skill proposal tool',
+      () => this.ctx.tools.register(this.improver.definition(), { when: context => this.offersTopLevel(context, () => this.current.skillUpdates.enabled && this.improver.hasGap(context.agent.session.header.id)) }),
+      'logalyze: skill improvement tool',
     )
     this.ctx.effect(
       () => this.ctx.tools.register(this.adder.definition(), { when: context => this.offersTopLevel(context, () => true) }),
@@ -181,7 +183,7 @@ export class LogalyzeService {
   }
 
   /**
-   * Offer the dispatch and proposal tools to top-level agents once the first
+   * Offer the dispatch tool to top-level agents once the first
    * sync settled and at least one application is usable.
    * @param context - the preparing step.
    * @returns whether the step may call the tool.
