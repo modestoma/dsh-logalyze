@@ -14,20 +14,18 @@ import type { EditableSettings, RepoSpec } from './settings/contract.ts'
 /** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
 
-const SCP_LIKE = /^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^\s]+$/
-const URL_SCHEMES = new Set(['https:', 'http:', 'ssh:', 'git:', 'file:'])
+const URL_SCHEMES = new Set(['https:', 'file:'])
 const HOST_NAME = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]*[a-z0-9])?$/
 
 /**
- * Whether a string is a git remote this plugin hands to `git clone`: an
- * `https`/`http`/`ssh`/`git`/`file` URL, an scp-like `user@host:path`, or an
- * absolute local path. Other transports (notably `ext::`) are refused.
- * @param value - candidate remote address.
+ * Whether a string is a repository address the `dshRepos` service mirrors: an
+ * `https` or `file` URL, or an absolute local path. SSH, scp-like
+ * `user@host:path`, `git://`, and other transports are refused.
+ * @param value - candidate repository address.
  * @returns whether it is accepted.
  */
 export function isAcceptedGitUrl(value: string): boolean {
   if (value.startsWith('-') || /\s/.test(value)) return false
-  if (SCP_LIKE.test(value)) return true
   if (isAbsolute(value)) return true
   try {
     return URL_SCHEMES.has(new URL(value).protocol)
@@ -53,7 +51,7 @@ export function isAcceptedBranch(value: string): boolean {
 
 /** One application repository: git address and optional branch. */
 export const repoSchema = z.object({
-  url: z.string().trim().min(1, 'git 地址不能为空').refine(isAcceptedGitUrl, '不支持的 git 地址（支持 https/ssh/git/file URL、user@host:path 或绝对路径）'),
+  url: z.string().trim().min(1, 'git 地址不能为空').refine(isAcceptedGitUrl, '不支持的 git 地址（支持 https URL、file URL 或本机绝对路径，不支持 ssh 和 user@host:path）'),
   branch: z.string().trim().optional().transform(value => value === '' ? undefined : value)
     .refine(value => value === undefined || isAcceptedBranch(value), '分支名不合法'),
 }).strict()
@@ -116,8 +114,8 @@ const configSchema = z.object({
    */
   analyzeTokenRef: z.string().trim().regex(TOKEN_ENV_PATTERN, '令牌名称只能包含字母、数字和下划线，且不能以数字开头').default('LOGALYZE_ANALYZE_TOKEN'),
   /**
-   * Author of SKILL improvement commits; omitted uses the user of the token
-   * dsh-repo holds for the repository's host, who is always the committer.
+   * Author and committer of SKILL improvement and onboarding commits;
+   * default: the account that owns the host token.
    */
   skillUpdateAuthor: authorSchema.optional(),
   /** Registered `ctx.subagents` provider the children start on. */

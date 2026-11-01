@@ -14,13 +14,14 @@
  * - 询问经 DSH 审批服务（`ctx.approval`）一次性请求；dsh_channels 把它显示为
  *   飞书决策卡片，DSH Web 显示为审批提示。只有 `allowed-once` 才起草和提交，
  *   之后不再询问；没有审批服务时工具报错。
- * - 改进子 Agent 在应用最新提交的只读快照里工作，首行 `/logalyze-improve`，把
- *   修改写到运行目录下的 `improve-<序号>/skill-proposal/`；超时
- *   （`dispatchTimeoutMs`）或调用被取消时停止它。
- * - 修改只能落在 `.agents/skills/<skill>/` 下；依据一次分析时必须新增或修改
- *   `cases/` 下的一个案例。提交以快照的提交为父提交，提交到新分支
- *   `logalyze/skill-<应用 id>-<改动摘要前缀>`，从不提交到已有分支或默认分支。
- * - 提交和创建合并请求经 `dshRepos` 服务完成。子会话中不提供本工具。
+ * - 观象在运行目录下的 `improve-<序号>/repo/` 打开应用最新同步提交的可写工作区，
+ *   改进子 Agent 以它为工作目录、首行 `/logalyze-improve`，直接修改
+ *   `.agents/skills/<skill>/`，改动说明写在工作区之外的 `improve-<序号>/reason.md`；
+ *   超时（`dispatchTimeoutMs`）或调用被取消时停止它。
+ * - 改动只能是 `.agents/skills/<skill>/` 下新增或修改的文件；依据一次分析时必须
+ *   新增或修改 `cases/` 下的一个案例。合格后推送到新分支
+ *   `logalyze/skill-<应用 id>-<改动摘要前缀>`，从不推送到已有分支或默认分支。
+ * - 工作区、推送和合并请求经 `dshRepos` 服务完成。子会话中不提供本工具。
  *
  * @module dsh-logalyze/skill-update/tool
  */
@@ -33,24 +34,23 @@ import { describeIssue } from '../config.ts'
 import { runChild } from '../dispatch/child.ts'
 import type { ChildOutcome } from '../dispatch/child.ts'
 import type { ChildLog } from '../dispatch/prompt.ts'
-import { admitLogs, isDelegatedAgent, logSchema, materializeLogs, newRunId, resolveRunBase } from '../dispatch/tool.ts'
+import { admitLogs, isDelegatedAgent, logSchema, materializeLogs, newRunId, resolveRunBase, RUNS_SEGMENTS } from '../dispatch/tool.ts'
 import type { LogSource } from '../dispatch/tool.ts'
 import type { Agent, ContentBlock, HostApproval, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
 import type { CommitAuthor } from '../repos/contract.ts'
 import { messageOf, requireRepos } from '../repos/lookup.ts'
-import { skillDir, skillNameOf } from '../repos/manifest.ts'
+import { disablesUserInvocation, skillDir, skillNameOf } from '../repos/manifest.ts'
 import type { RepoRegistry } from '../repos/registry.ts'
 import type { AppManifest, EditableSettings } from '../settings/contract.ts'
-import { describeFiles, prepareChange } from './change.ts'
-import type { FileStat } from './change.ts'
-import { askApproval, commitChange } from './commit.ts'
+import { askApproval, pushChange } from './commit.ts'
 import type { SubmitStatus } from './commit.ts'
 import { GAP_FILE, GAP_PREVIEW_CHARS, previewOf, readGap } from './gap.ts'
 import type { GapCheck } from './gap.ts'
 import { IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from './names.ts'
-import { DIFF_FILE, PROPOSAL_DIR, ProposalError, readProposal, replaceFile } from './proposal.ts'
-import type { Proposal } from './proposal.ts'
+import { ProposalError, replaceFile } from './files.ts'
 import { CASES_DIR, renderImprovePrompt } from './prompt.ts'
+import { checkChanges, describeFiles, DIFF_FILE, readReason, WORKSPACE_DIR } from './workspace.ts'
+import type { CheckedChanges, FileStat } from './workspace.ts'
 
 /** Longest commit subject and merge request title taken from the reason. */
 export const MAX_TITLE_CHARS = 120
@@ -100,7 +100,7 @@ export interface ImproveValue {
   workDir?: string
   /** The improvement child's run directory; present once the user agreed. */
   improveDir?: string
-  /** New branch the change was or would be committed to. */
+  /** New branch the change was or would be pushed to. */
   branch?: string
   /** Branch the merge request targets. */
   target?: string
@@ -229,18 +229,19 @@ interface ImproveRequest {
 }
 
 /**
- * Check that a proposal keeps the SKILL loadable and, when required, carries a case.
- * @param proposal - the improvement child's proposal.
+ * Check that the changes keep the SKILL loadable and, when required, carry a case.
+ * @param changes - the checked workspace changes below the SKILL directory.
  * @param skill - the application's SKILL name.
- * @param caseRequired - whether a case file must be present.
- * @throws ProposalError when a required case is missing or SKILL.md names another skill.
+ * @param caseRequired - whether a case file must be added or updated.
+ * @throws ProposalError when a required case is missing, or SKILL.md names another skill or disables user invocation.
  */
-function checkImprovement(proposal: Proposal, skill: string, caseRequired: boolean): void {
-  if (caseRequired && !proposal.files.some(file => CASE_PATH.test(file.path))) throw new ProposalError(`修改中没有案例文件 ${CASES_DIR}/<日期>-<slug>.md`)
-  const entry = proposal.files.find(file => file.path === 'SKILL.md')
+function checkImprovement(changes: CheckedChanges, skill: string, caseRequired: boolean): void {
+  if (caseRequired && !changes.contents.some(file => CASE_PATH.test(file.relative))) throw new ProposalError(`改动中没有新增或修改案例文件 ${CASES_DIR}/<日期>-<slug>.md`)
+  const entry = changes.contents.find(file => file.relative === 'SKILL.md')
   if (entry === undefined) return
   const name = skillNameOf(entry.content)
   if (name !== skill) throw new ProposalError(`SKILL.md 的 frontmatter name 是${name === undefined ? '（缺失）' : `「${name}」`}，必须保持为「${skill}」`)
+  if (disablesUserInvocation(entry.content)) throw new ProposalError('SKILL.md 不能设置 user-invocable: false，否则派发时无法用 /<skill> 加载')
 }
 
 /** Title for the commit and merge request: the reason's first line without Markdown heading marks. */
@@ -297,9 +298,9 @@ export class SkillImprover {
   definition(): ToolDefinition<ImproveValue> {
     return {
       name: IMPROVE_TOOL_NAME,
-      description: '观象：询问用户是否改进某个应用的日志分析 SKILL。用户同意后，派一个子 Agent 修改 SKILL（需要时把问题整理为案例写入 SKILL 的 cases/ 目录），提交到新分支并创建合并请求供用户评审，不会改动默认分支。'
+      description: '观象：询问用户是否改进某个应用的日志分析 SKILL。用户同意后，派一个子 Agent 修改 SKILL（需要时把问题整理为案例写入 SKILL 的 cases/ 目录），推送到新分支并创建合并请求供用户评审，不会改动默认分支。'
         + '在两种情况下使用：派发结果标出了「SKILL 不足」；或用户要纠正、改进某个应用的 SKILL（不论本会话是否分析过）。'
-        + `后一种情况先用 ${SHOW_TOOL_NAME} 查看现有 SKILL，和用户确认哪部分不对、正确做法是什么、有没有样例日志，问清后再调用，并把用户的纠正写进 feedback。不要自己用 git 推送。`,
+        + `后一种情况先用 ${SHOW_TOOL_NAME} 查看现有 SKILL，和用户确认哪部分不对、正确做法是什么、有没有样例日志，问清后再调用，并把用户的纠正写进 feedback。不要自己修改或推送 SKILL 文件。`,
       parameters: PARAMETERS,
       output: {
         schema: OUTPUT_SCHEMA,
@@ -315,7 +316,7 @@ export class SkillImprover {
    * @param rawArgs - model arguments.
    * @param exec - execution context of the calling agent.
    * @returns how the improvement ended.
-   * @throws when the arguments, task, application, logs, approval service, or `dshRepos` service are unusable, or the commit fails; nothing is committed then.
+   * @throws when the arguments, task, application, logs, approval service, or `dshRepos` service are unusable, the workspace cannot be opened, or the push fails; nothing is pushed then.
    */
   async execute(rawArgs: unknown, exec: ToolRunContext): Promise<ImproveValue> {
     const parsed = argsSchema.safeParse(rawArgs)
@@ -363,7 +364,7 @@ export class SkillImprover {
     const { app, url } = task ?? this.deps.registry.readyApp(args.app as string)
     const { effectiveDir, baseDir } = await resolveRunBase(agent, this.deps.workingDirectory(), signal)
     const sources = await admitLogs(args.logs ?? [], effectiveDir, settings.download)
-    const parentDir = task?.workDir ?? join(baseDir, '.logalyze', 'runs', newRunId(this.deps.now?.() ?? new Date()))
+    const parentDir = task?.workDir ?? join(baseDir, ...RUNS_SEGMENTS, newRunId(this.deps.now?.() ?? new Date()))
     const key = task?.workDir ?? `${sessionId}\0${app.id}`
     return { app, url, sessionId, gap, sources, parentDir, key, ...task === undefined ? {} : { task }, ...feedback === undefined ? {} : { feedback } }
   }
@@ -379,8 +380,8 @@ export class SkillImprover {
     if (feedback !== undefined) basis.push(`用户要求改进「${app.name}」的日志分析 SKILL：${previewOf(feedback, GAP_PREVIEW_CHARS)}`)
     const what = task === undefined ? '按反馈修改 SKILL' : `把这次问题整理为案例写入 ${dir}/${CASES_DIR}/ 并修改 SKILL`
     return {
-      zh: `${basis.join('\n')}\n是否改进 SKILL？同意后，观象会${what}，然后提交到 ${url} 的新分支、创建合并请求合入 ${target}，由你在合并请求中评审。`,
-      en: `Improve the log-analysis SKILL of ${app.id}? Logalyze will update ${dir}/${task === undefined ? '' : ` and record a case under ${dir}/${CASES_DIR}/`}, commit to a new branch of ${url}, and open a merge request into ${target} for review.`,
+      zh: `${basis.join('\n')}\n是否改进 SKILL？同意后，观象会${what}，然后推送到 ${url} 的新分支、创建合并请求合入 ${target}，由你在合并请求中评审。`,
+      en: `Improve the log-analysis SKILL of ${app.id}? Logalyze will update ${dir}/${task === undefined ? '' : ` and record a case under ${dir}/${CASES_DIR}/`}, push to a new branch of ${url}, and open a merge request into ${target} for review.`,
     }
   }
 
@@ -388,89 +389,84 @@ export class SkillImprover {
     const settings = this.deps.settings()
     const { task, feedback } = request
     const caseRequired = task !== undefined
-    const lease = await this.deps.registry.acquire([request.app.id])
-    let run: { app: AppManifest; commit: string; improveDir: string; child: ChildOutcome }
+    const { app, url, commit } = this.deps.registry.readyApp(request.app.id)
+    const improveDir = join(request.parentDir, `improve-${randomBytes(3).toString('hex')}`)
+    const repoDir = join(improveDir, WORKSPACE_DIR)
+    await mkdir(improveDir, { recursive: true })
     try {
-      const leased = lease.apps.get(request.app.id)
-      if (leased === undefined) throw new Error(`应用「${request.app.id}」不可用`)
-      const { app, commit } = leased
-      const improveDir = join(request.parentDir, `improve-${randomBytes(3).toString('hex')}`)
-      await mkdir(improveDir, { recursive: true })
-      const extra = await materializeLogs(request.sources, improveDir, settings.download, exec.signal, this.deps.fetch)
-      const logs: ChildLog[] = [...(task?.logs ?? []).map(path => ({ path })), ...extra]
-      const prompt = renderImprovePrompt({
-        app,
-        commit,
-        ...task === undefined
-          ? {}
-          : {
-              analysis: {
-                commit: task.commit,
-                question: task.question,
-                conclusion: task.output.slice(0, MAX_CONCLUSION_CHARS),
-                dir: task.workDir,
-                ...request.gap ? { gapPath: join(task.workDir, GAP_FILE) } : {},
-              },
-            },
-        ...feedback === undefined ? {} : { feedback },
-        logs,
-        workDir: improveDir,
-        maxFiles: settings.skillUpdates.maxFiles,
-        caseRequired,
-        date: localDate(this.deps.now?.() ?? new Date()),
-      })
-      const child = await runChild({ subagents: this.deps.subagents, provider: this.deps.provider, parent, label: `${app.name} SKILL 改进`, cwd: leased.dir, prompt, timeoutMs: settings.dispatchTimeoutMs, signal: exec.signal })
-      run = { app, commit, improveDir, child }
-    } finally {
-      lease.release()
+      await requireRepos(this.deps.repos()).openWorkspace(url, { dir: repoDir, baseBranch: target, commit, signal: exec.signal })
+    } catch (error) {
+      exec.signal.throwIfAborted()
+      throw new Error(`应用「${app.id}」的工作区创建失败：${messageOf(error)}`)
     }
-    const { app, commit, improveDir, child } = run
-    const base = { app: app.id, repo: request.url, ...task === undefined ? {} : { workDir: task.workDir }, improveDir, target, ...child.output === '' ? {} : { output: child.output } }
+    const extra = await materializeLogs(request.sources, improveDir, settings.download, exec.signal, this.deps.fetch)
+    const logs: ChildLog[] = [...(task?.logs ?? []).map(path => ({ path })), ...extra]
+    const prompt = renderImprovePrompt({
+      app,
+      commit,
+      ...task === undefined
+        ? {}
+        : {
+            analysis: {
+              commit: task.commit,
+              question: task.question,
+              conclusion: task.output.slice(0, MAX_CONCLUSION_CHARS),
+              dir: task.workDir,
+              ...request.gap ? { gapPath: join(task.workDir, GAP_FILE) } : {},
+            },
+          },
+      ...feedback === undefined ? {} : { feedback },
+      logs,
+      workDir: improveDir,
+      maxFiles: settings.skillUpdates.maxFiles,
+      caseRequired,
+      date: localDate(this.deps.now?.() ?? new Date()),
+    })
+    const child: ChildOutcome = await runChild({ subagents: this.deps.subagents, provider: this.deps.provider, parent, label: `${app.name} SKILL 改进`, cwd: repoDir, prompt, timeoutMs: settings.dispatchTimeoutMs, signal: exec.signal })
+    const base = { app: app.id, repo: url, ...task === undefined ? {} : { workDir: task.workDir }, improveDir, target, ...child.output === '' ? {} : { output: child.output } }
     if (child.status !== 'completed') {
       return { ...base, status: 'failed', error: `改进子 Agent 没有完成（${child.status}${child.diagnostic === undefined ? '' : `：${child.diagnostic}`}）` }
     }
 
+    // The service may have reloaded while the child ran.
     const repos = requireRepos(this.deps.repos())
     const dir = skillDir(app.skill)
-    let prepared
+    let prepared: { changes: CheckedChanges; reason: string; diffPath: string }
     try {
-      const proposal = await readProposal(improveDir, settings.skillUpdates)
-      if (proposal === undefined) throw new ProposalError(`子 Agent 没有写出修改（${PROPOSAL_DIR}/）`)
-      checkImprovement(proposal, app.skill, caseRequired)
-      const change = await prepareChange(repos, { url: request.url, base: commit, dir }, proposal.files, exec.signal)
-      if (change.files.length === 0) throw new ProposalError(`修改与提交 ${commit.slice(0, 12)} 中的 SKILL 相同，没有改动`)
-      if (caseRequired && !change.files.some(file => CASE_PATH.test(file.path.slice(dir.length + 1)))) throw new ProposalError(`修改中的案例与提交 ${commit.slice(0, 12)} 中的相同，没有新增或更新案例`)
+      const changes = await checkChanges(
+        await repos.workspaceChanges(repoDir, { signal: exec.signal }),
+        { root: dir, allows: () => true, description: `${dir}/` },
+        settings.skillUpdates,
+      )
+      checkImprovement(changes, app.skill, caseRequired)
+      const reason = await readReason(improveDir, settings.skillUpdates.maxFileBytes, '改动说明')
       const diffPath = join(improveDir, DIFF_FILE)
-      await replaceFile(diffPath, change.diff)
-      prepared = { proposal, change, diffPath }
+      await replaceFile(diffPath, changes.diff)
+      prepared = { changes, reason, diffPath }
     } catch (error) {
       exec.signal.throwIfAborted()
       return { ...base, status: 'failed', error: messageOf(error) }
     }
 
-    const { proposal, change, diffPath } = prepared
-    const branch = `logalyze/skill-${app.id}-${change.digest.slice(0, 10)}`
-    const title = titleOf(proposal.reason, app)
+    const { changes, reason, diffPath } = prepared
+    const branch = `logalyze/skill-${app.id}-${changes.digest.slice(0, 10)}`
+    const title = titleOf(reason, app)
     const origin = task === undefined
       ? `由观象按用户反馈提出（应用 ${app.id}，会话 ${request.sessionId}）`
       : `由观象在日志分析后经用户同意提出（应用 ${app.id}，分析提交 ${task.commit.slice(0, 12)}，会话 ${request.sessionId}）`
-    // Only files that differ from the snapshot's commit; an unchanged one would be an empty update.
-    const changed = new Set(change.files.map(file => file.path))
-    const outcome = await commitChange({
+    const outcome = await pushChange({
       repos,
       exec,
-      url: request.url,
-      base: commit,
+      url,
+      dir: repoDir,
       branch,
       target,
-      files: proposal.files
-        .map(file => ({ action: 'write' as const, path: `${dir}/${file.path}`, content: file.content }))
-        .filter(file => changed.has(file.path)),
-      message: `${title}\n\n${proposal.reason}\n\nProposed-by: 观象 Logalyze\n${task === undefined ? '' : `Analyzed-commit: ${task.commit}\n`}Session: ${request.sessionId}\n`,
+      message: `${title}\n\n${reason}\n\nProposed-by: 观象 Logalyze\n${task === undefined ? '' : `Analyzed-commit: ${task.commit}\n`}`,
+      session: request.sessionId,
       title,
-      body: `${origin}。请评审${caseRequired ? '案例和 ' : ' '}SKILL 修改。\n\n${proposal.reason.slice(0, REASON_DESCRIPTION_CHARS)}`,
+      body: `${origin}。请评审${caseRequired ? '案例和 ' : ' '}SKILL 修改。\n\n${reason.slice(0, REASON_DESCRIPTION_CHARS)}`,
       ...this.deps.author === undefined ? {} : { author: this.deps.author },
     })
-    return { ...base, branch, files: [...change.files], diffPath, ...outcome }
+    return { ...base, branch, files: [...changes.files], diffPath, ...outcome }
   }
 }

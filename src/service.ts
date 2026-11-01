@@ -12,7 +12,7 @@ import type { LogalyzeConfig, SettingsOverlay } from './config.ts'
 import { abortable } from './abort.ts'
 import type { AnalyzeGate } from './analyze/server.ts'
 import { FEISHU_TOPICS_SERVICE, lookupTopics } from './analyze/topics.ts'
-import { Dispatcher, isDelegatedAgent, isInside } from './dispatch/tool.ts'
+import { Dispatcher, inRunDirectory, isDelegatedAgent, isInside } from './dispatch/tool.ts'
 import type { HostApproval, HostContext, HostCredentials, ToolActivationContext, WorkingDirectoryService } from './host.ts'
 import { DSH_REPOS_SERVICE, lookupRepos, messageOf } from './repos/lookup.ts'
 import { RepoRegistry } from './repos/registry.ts'
@@ -135,6 +135,7 @@ export class LogalyzeService {
       autoInvoke: config.autoInvoke,
       bundled: assets.bundled,
       inRepositories: (cwd) => {
+        if (inRunDirectory(cwd)) return true
         const lookup = lookupRepos(ctx.get?.(DSH_REPOS_SERVICE))
         return lookup.availability === 'ready' && isInside(cwd, lookup.service.mirrorSettings().dir)
       },

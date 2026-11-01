@@ -89,6 +89,7 @@ async function waitForStarts(started: Started[], count: number): Promise<void> {
 describe('logalyze_dispatch', () => {
   it('starts one child per task in the app repository and returns every result', async () => {
     const { project, dispatcher, started, parent, registry, repos } = await setup()
+    const { url, commit } = registry.status()[0]!
     const log = join(project, 'sample-logs', 'order-service.log')
     const running = dispatcher.execute({
       tasks: [{
@@ -116,6 +117,8 @@ describe('logalyze_dispatch', () => {
     expect(value.results).toEqual([{
       app: 'order-service',
       name: '订单服务',
+      url,
+      commit,
       status: 'completed',
       childId: 'child-1',
       output: '根因：促销商品没有 SKU',
@@ -125,7 +128,7 @@ describe('logalyze_dispatch', () => {
     expect(await readFile(join(value.runDir, '1-order-service', '2-app.tar.gz'), 'utf8')).toBe('packed-log')
     expect(child?.dispose).toHaveBeenCalledTimes(1)
     expect(registry.status()[0]?.activeRuns).toBe(0)
-    expect(renderDispatchValue(value)[0]?.text).toContain('### 订单服务（order-service）— 完成')
+    expect(renderDispatchValue(value)[0]?.text).toContain(`### 订单服务（order-service）— 完成\n\n仓库 ${url}，提交 ${commit!.slice(0, 12)}\n\n根因：促销商品没有 SKU`)
   })
 
   it('tells children to record SKILL gaps and marks the completed tasks that recorded one', async () => {

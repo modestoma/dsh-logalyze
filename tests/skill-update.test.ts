@@ -1,17 +1,19 @@
-import { lstat, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
-import { basename, dirname, join } from 'node:path'
+import { lstat, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Mock } from 'vitest'
 import { defaultsOf, resolveConfig } from '../src/config.ts'
 import type { Agent, ApprovalOutcome, ApprovalRequest, HostApproval, SubagentActivation, SubagentResult, SubagentService } from '../src/host.ts'
 import { RepoRegistry } from '../src/repos/registry.ts'
 import type { EditableSettings } from '../src/settings/contract.ts'
-import { DIFF_FILE, readProposal, replaceFile } from '../src/skill-update/proposal.ts'
+import type { ChangeCreate, WorkspaceChanges, WorkspaceFileChange } from '../src/repos/contract.ts'
+import { replaceFile } from '../src/skill-update/files.ts'
+import { checkChanges, DIFF_FILE } from '../src/skill-update/workspace.ts'
 import { renderShowSkillValue, SkillViewer } from '../src/skill-update/show.ts'
 import { renderImproveValue, SkillImprover } from '../src/skill-update/tool.ts'
 import type { AnalyzedTask } from '../src/skill-update/tool.ts'
 import { FakeRepos } from './fake-repos.ts'
-import { createAppRepo, tempDir } from './helpers.ts'
+import { createAppRepo, git, tempDir } from './helpers.ts'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { await Promise.all(cleanups.splice(0).map(cleanup => cleanup())) })
@@ -26,52 +28,69 @@ async function dir(): Promise<string> {
   return path
 }
 
-async function writeProposal(workDir: string, files: Record<string, string>, reason = '日志格式里漏了 traceId 字段'): Promise<void> {
-  await mkdir(join(workDir, 'skill-proposal', 'files'), { recursive: true })
-  await writeFile(join(workDir, 'skill-proposal', 'reason.md'), reason)
+/** A workspace at `root` with base files and a stand-in for what `dshRepos` reports. */
+async function workspace(files: Record<string, string>, changes: Partial<WorkspaceFileChange>[], branch?: string): Promise<{ root: string; changes: WorkspaceChanges }> {
+  const root = await dir()
   for (const [path, content] of Object.entries(files)) {
-    await mkdir(dirname(join(workDir, 'skill-proposal', 'files', path)), { recursive: true })
-    await writeFile(join(workDir, 'skill-proposal', 'files', path), content)
+    await mkdir(dirname(join(root, path)), { recursive: true })
+    await writeFile(join(root, path), content)
+  }
+  return {
+    root,
+    changes: {
+      workspace: { url: 'https://code.example.com/team/app.git', dir: root, baseCommit: 'b'.repeat(40), ...branch === undefined ? {} : { branch } },
+      files: changes.map(change => ({ path: '', status: 'added', binary: false, additions: 1, deletions: 0, ...change })),
+      diff: 'diff --git a/x b/x\n',
+    },
   }
 }
 
-describe('readProposal', () => {
-  it('returns nothing when the task wrote no proposal', async () => {
-    expect(await readProposal(await dir(), LIMITS)).toBeUndefined()
-  })
+const SCOPE = { root: '.agents/skills/log-analysis', allows: () => true, description: '.agents/skills/log-analysis/' }
 
-  it('reads the reason and every file by its path under the skill directory', async () => {
-    const workDir = await dir()
-    await writeProposal(workDir, { 'SKILL.md': '# new', 'references/formats.md': 'a' }, '  理由  \n')
-    expect(await readProposal(workDir, LIMITS)).toEqual({
-      reason: '理由',
-      files: [{ path: 'SKILL.md', content: '# new' }, { path: 'references/formats.md', content: 'a' }],
+describe('checkChanges', () => {
+  it('reads the added and modified files of the scope in path order and digests them', async () => {
+    const { changes } = await workspace({ [SKILL]: '# new\n', '.agents/skills/log-analysis/cases/a.md': 'a' }, [
+      { path: SKILL, status: 'modified', additions: 2, deletions: 1 },
+      { path: '.agents/skills/log-analysis/cases/a.md' },
+    ], 'logalyze/x')
+    const checked = await checkChanges(changes, SCOPE, LIMITS)
+    expect(checked).toMatchObject({
+      base: 'b'.repeat(40),
+      pushedBranch: 'logalyze/x',
+      files: [{ path: SKILL, added: 2, removed: 1 }, { path: '.agents/skills/log-analysis/cases/a.md', added: 1, removed: 0 }],
+      contents: expect.arrayContaining([{ path: SKILL, relative: 'SKILL.md', content: '# new\n' }]),
+      diff: 'diff --git a/x b/x\n',
     })
+    expect(checked.digest).toMatch(/^[0-9a-f]{64}$/)
+    const same = await workspace({ [SKILL]: '# new\n', '.agents/skills/log-analysis/cases/a.md': 'a' }, [{ path: '.agents/skills/log-analysis/cases/a.md' }, { path: SKILL, status: 'modified' }])
+    expect((await checkChanges(same.changes, SCOPE, LIMITS)).digest).toBe(checked.digest)
   })
 
-  it('rejects proposals that cannot be submitted', async () => {
-    const cases: [string, (workDir: string) => Promise<void>, RegExp][] = [
-      ['no reason', async (workDir) => { await writeProposal(workDir, { 'SKILL.md': 'x' }, '  ') }, /reason.md 不能为空/],
-      ['no files', async (workDir) => { await writeProposal(workDir, {}) }, /没有文件/],
-      ['symbolic link', async (workDir) => {
-        await writeProposal(workDir, {})
-        await symlink('/etc/passwd', join(workDir, 'skill-proposal', 'files', 'SKILL.md'))
-      }, /不是普通文件/],
-      ['hidden name', async (workDir) => { await writeProposal(workDir, { '.env': 'x' }) }, /文件名不合法/],
-      ['too many files', async (workDir) => { await writeProposal(workDir, { a: '1', b: '2', c: '3', d: '4', e: '5' }) }, /文件数超过上限 4/],
-      ['too large', async (workDir) => { await writeProposal(workDir, { 'SKILL.md': 'x'.repeat(5000) }) }, /超过上限 4096/],
-      ['binary', async (workDir) => { await writeProposal(workDir, { 'SKILL.md': '\u0000' }) }, /NUL/],
-      ['not user-invocable', async (workDir) => { await writeProposal(workDir, { 'SKILL.md': '---\nname: log-analysis\nuser-invocable: false\n---\n' }) }, /user-invocable/],
+  it('rejects the whole change when anything is out of scope or not an added or modified text file', async () => {
+    const cases: [Record<string, string>, Partial<WorkspaceFileChange>[], RegExp][] = [
+      [{}, [], /没有改动/],
+      [{ [SKILL]: 'x', 'src/Main.java': 'x' }, [{ path: SKILL }, { path: 'src/Main.java' }], /工作区改动了 src\/Main.java，只允许新增或修改 .agents\/skills\/log-analysis\/ 下的文件/],
+      [{ '.agents/skills/log-analysis/.env': 'x' }, [{ path: '.agents/skills/log-analysis/.env' }], /工作区改动了 .agents\/skills\/log-analysis\/.env/],
+      [{}, [{ path: SKILL, status: 'deleted' }], /不能删除 .agents\/skills\/log-analysis\/SKILL.md/],
+      [{ [SKILL]: 'x' }, [{ path: SKILL, status: 'renamed', previousPath: '.agents/skills/log-analysis/old.md' }], /不能重命名/],
+      [{ [SKILL]: 'x' }, [{ path: SKILL, status: 'renamed', previousPath: 'README.md' }], /工作区改动了 README.md/],
+      [{ [SKILL]: 'x' }, [{ path: SKILL, status: 'type-changed' }], /改变了文件类型/],
+      [{ [SKILL]: 'x' }, [{ path: SKILL, binary: true }], /二进制文件/],
+      [{ a: '' }, ['a', 'b', 'c', 'd', 'e'].map(name => ({ path: `.agents/skills/log-analysis/${name}` })), /改动了 5 个文件，超过上限 4/],
+      [{ [SKILL]: 'x'.repeat(5000) }, [{ path: SKILL }], /超过上限 4096/],
+      [{ [SKILL]: '\u0000' }, [{ path: SKILL }], /NUL/],
     ]
-    for (const [, arrange, message] of cases) {
-      const workDir = await dir()
-      await arrange(workDir)
-      await expect(readProposal(workDir, LIMITS)).rejects.toThrow(message)
+    for (const [files, changes, message] of cases) {
+      const arranged = await workspace(files, changes)
+      await expect(checkChanges(arranged.changes, SCOPE, LIMITS)).rejects.toThrow(message)
     }
-    const invalid = await dir()
-    await writeProposal(invalid, {})
-    await writeFile(join(invalid, 'skill-proposal', 'files', 'SKILL.md'), Buffer.from([0xff, 0xfe]))
-    await expect(readProposal(invalid, LIMITS)).rejects.toThrow(/不是 UTF-8/)
+    const link = await workspace({}, [{ path: SKILL }])
+    await mkdir(join(link.root, '.agents/skills/log-analysis'), { recursive: true })
+    await symlink('/etc/passwd', join(link.root, SKILL))
+    await expect(checkChanges(link.changes, SCOPE, LIMITS)).rejects.toThrow('不是普通文件')
+    const invalid = await workspace({ [SKILL]: '' }, [{ path: SKILL }])
+    await writeFile(join(invalid.root, SKILL), Buffer.from([0xff, 0xfe]))
+    await expect(checkChanges(invalid.changes, SCOPE, LIMITS)).rejects.toThrow(/不是 UTF-8/)
   })
 })
 
@@ -88,26 +107,17 @@ describe('replaceFile', () => {
   })
 })
 
-/**
- * A local `dshRepos` stand-in whose commit, branch, and merge request calls
- * record their arguments and track which branches exist.
- */
+/** The fake `dshRepos` service with a recording merge request call and a spy on pushes. */
 function fakeRepos(root: string) {
-  const state = { branches: new Set<string>(), changeError: undefined as Error | undefined }
-  const conflict = (branch: string) => Object.assign(new Error(`分支 ${branch} 已存在`), { name: 'RepoError', code: 'conflict' })
-  const service = Object.assign(Object.create(new FakeRepos(root)) as FakeRepos, {
-    getBranch: vi.fn(async (_repo: string, name: string) => state.branches.has(name) ? { name, commit: 'f'.repeat(40), protected: false, default: false } : undefined),
-    commitFiles: vi.fn(async (_repo: string, request: Record<string, unknown> & { branch: string }) => {
-      if (state.branches.has(request.branch)) throw conflict(request.branch)
-      state.branches.add(request.branch)
-      return { sha: 'c'.repeat(40), branch: request.branch, createdBranch: true }
-    }),
-    createChange: vi.fn(async () => {
-      if (state.changeError !== undefined) throw state.changeError
-      return { number: 7, webUrl: MR_URL }
-    }),
+  const state = { changeError: undefined as Error | undefined }
+  const service = new FakeRepos(root)
+  const createChange = vi.fn(async (_repo: string, _change: ChangeCreate) => {
+    if (state.changeError !== undefined) throw state.changeError
+    return { webUrl: MR_URL }
   })
-  return { state, service }
+  Object.assign(service, { createChange })
+  const pushWorkspace = vi.spyOn(service, 'pushWorkspace')
+  return { state, service, createChange, pushWorkspace }
 }
 
 interface Started {
@@ -194,20 +204,33 @@ async function setup(): Promise<Setup> {
   return { origin, registry, task, improver, settings, agent, approval, answer, repos, started, skill }
 }
 
-/** The improvement directory named in a child prompt. */
+/** The improvement run directory holding a child's workspace. */
 function improveDirOf(started: Started): string {
-  return /修改目录是 `([^`]+)\/skill-proposal\/files\/`/.exec(started.spec.request.prompt[0]?.text as string)?.[1] as string
+  return dirname(started.spec.request.cwd)
 }
 
-/** Let the next improvement child write a proposal and finish. */
-async function finishChild(started: Started[], index: number, files: Record<string, string>, reason = REASON, output = '- SKILL.md：补充 traceId\n- cases/2026-10-31-trace-id.md：新增案例'): Promise<string> {
+/**
+ * Let the next improvement child edit its workspace and finish.
+ * @param files - contents by repository path; undefined deletes the file.
+ */
+async function finishChild(started: Started[], index: number, files: Record<string, string | undefined>, reason: string | null = REASON, output = '- SKILL.md：补充 traceId\n- cases/2026-10-31-trace-id.md：新增案例'): Promise<string> {
   await waitForStarts(started, index + 1)
   const child = started[index]!
-  const improveDir = improveDirOf(child)
-  if (Object.keys(files).length > 0) await writeProposal(improveDir, files, reason)
+  const repo = child.spec.request.cwd
+  for (const [path, content] of Object.entries(files)) {
+    if (content === undefined) {
+      await rm(join(repo, path))
+      continue
+    }
+    await mkdir(dirname(join(repo, path)), { recursive: true })
+    await writeFile(join(repo, path), content)
+  }
+  if (reason !== null) await writeFile(join(improveDirOf(child), 'reason.md'), reason)
   child.settle({ stopReason: 'completed', output: [{ type: 'text', text: output }] })
-  return improveDir
+  return improveDirOf(child)
 }
+
+const IN_SKILL = (path: string) => `.agents/skills/log-analysis/${path}`
 
 describe('logalyze_improve_skill', () => {
   it('asks first, then drafts a case with the improvement child and opens a merge request without asking again', async () => {
@@ -218,25 +241,31 @@ describe('logalyze_improve_skill', () => {
     const [request] = approval.requests
     expect(request).toMatchObject({ agent, toolName: 'logalyze_improve_skill', callId: 'call-1', signal: exec.signal })
     expect(request?.displayReason?.zh).toContain('观象分析「订单服务」的日志时发现 SKILL 有不足：SKILL 没写日志第四列是 traceId')
-    expect(request?.displayReason?.zh).toContain(`是否改进 SKILL？同意后，观象会把这次问题整理为案例写入 .agents/skills/log-analysis/cases/ 并修改 SKILL，然后提交到 ${origin} 的新分支、创建合并请求合入 main`)
+    expect(request?.displayReason?.zh).toContain(`是否改进 SKILL？同意后，观象会把这次问题整理为案例写入 .agents/skills/log-analysis/cases/ 并修改 SKILL，然后推送到 ${origin} 的新分支、创建合并请求合入 main`)
 
     const [child] = started
     const status = registry.status()[0]!
     expect(child?.spec).toMatchObject({ provider: 'spawn', label: '订单服务 SKILL 改进', delivery: 'caller', request: { parent: agent, maxDepth: 1 } })
-    expect(child?.spec.request.cwd).toBe(join(repos.service.root, '.snapshots', basename(repos.service.mirrorDir(status.url)), status.commit!.slice(0, 12)))
-    expect(status.activeRuns).toBe(1)
+    const improveDir = improveDirOf(child!)
+    expect(improveDir).toMatch(new RegExp(`^${task.workDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/improve-[0-9a-f]{6}$`))
+    expect(child?.spec.request.cwd).toBe(join(improveDir, 'repo'))
+    // The workspace is a checkout of the latest synced commit, without git metadata inside it.
+    expect(await readFile(join(improveDir, 'repo', SKILL), 'utf8')).toBe(skill)
+    expect(await stat(join(improveDir, 'repo', '.git')).then(() => true, () => false)).toBe(false)
     const prompt = child?.spec.request.prompt[0]?.text as string
     expect(prompt.split('\n')[0]).toBe('/logalyze-improve')
     expect(prompt).toContain('## 分析时的问题\n\n21 点下单报 500')
     expect(prompt).toContain('## 分析结论\n\n根因：促销商品没有 SKU')
     expect(prompt).toContain(`记录写在 \`${join(task.workDir, 'skill-gap.md')}\`，先读它。`)
     expect(prompt).toContain('- `/logs/order.log`')
-    const improveDir = improveDirOf(child!)
-    expect(improveDir).toMatch(new RegExp(`^${task.workDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/improve-[0-9a-f]{6}$`))
-    expect(prompt).toContain(`否则新建 \`${improveDir}/skill-proposal/files/cases/2026-10-31-<slug>.md\``)
+    expect(prompt).toContain('当前工作目录是该应用代码仓库在提交')
+    expect(prompt).toContain('的可写工作区')
+    expect(prompt).toContain('否则新建 `.agents/skills/log-analysis/cases/2026-10-31-<slug>.md`')
+    expect(prompt).toContain(`在工作区之外的 \`${improveDir}/reason.md\` 写改动说明`)
+    expect(prompt).toContain('不要执行任何 git 写操作')
     expect(prompt).not.toContain('分析时的提交是')
 
-    await finishChild(started, 0, { 'SKILL.md': `${skill}\n## 案例索引\n\n| ${CASE} | traceId | 下单 |\n`, [CASE]: '# traceId 串联\n' })
+    await finishChild(started, 0, { [SKILL]: `${skill}\n## 案例索引\n\n| ${CASE} | traceId | 下单 |\n`, [IN_SKILL(CASE)]: '# traceId 串联\n' })
     const value = await running
     expect(value).toMatchObject({
       status: 'opened',
@@ -251,22 +280,24 @@ describe('logalyze_improve_skill', () => {
       output: '- SKILL.md：补充 traceId\n- cases/2026-10-31-trace-id.md：新增案例',
     })
     expect(value.branch).toMatch(/^logalyze\/skill-order-service-[0-9a-f]{10}$/)
+    expect(value.diffPath).toBe(join(improveDir, 'changes.diff'))
     expect(await readFile(value.diffPath!, 'utf8')).toContain('+# traceId 串联')
     expect(approval.request).toHaveBeenCalledTimes(1)
     expect(child?.dispose).toHaveBeenCalledTimes(1)
     expect(registry.status()[0]?.activeRuns).toBe(0)
-    const [repo, commit] = repos.service.commitFiles.mock.calls[0]!
-    expect(repo).toBe(origin)
-    expect(commit).toMatchObject({
+    expect(repos.pushWorkspace).toHaveBeenCalledWith(join(improveDir, 'repo'), {
       branch: value.branch,
-      baseSha: status.commit,
-      newBranch: true,
+      message: expect.any(String),
       author: { name: '观象', email: 'logalyze@example.com' },
+      session: 'parent',
       signal: exec.signal,
     })
-    expect((commit.files as { path: string }[]).map(file => file.path)).toEqual([SKILL, `.agents/skills/log-analysis/${CASE}`])
-    expect(commit.message).toMatch(new RegExp(`^补充 traceId 字段说明与案例\\n\\n# 补充 traceId[\\s\\S]*\\n\\nProposed-by: 观象 Logalyze\\nAnalyzed-commit: ${task.commit}\\nSession: parent\\n$`))
-    expect(repos.service.createChange).toHaveBeenCalledWith(origin, {
+    const [push] = repos.service.pushes
+    expect(Object.keys(push!.files)).toEqual([SKILL, IN_SKILL(CASE)])
+    expect(push?.author).toEqual({ name: '观象', email: 'logalyze@example.com' })
+    expect(git(origin, 'rev-parse', `${value.branch}^`).trim()).toBe(status.commit)
+    expect(push?.message).toMatch(new RegExp(`^补充 traceId 字段说明与案例\\n\\n# 补充 traceId[\\s\\S]*\\n\\nProposed-by: 观象 Logalyze\\nAnalyzed-commit: ${task.commit}\\n$`))
+    expect(repos.createChange).toHaveBeenCalledWith(origin, {
       title: '补充 traceId 字段说明与案例',
       body: expect.stringMatching(/^由观象在日志分析后经用户同意提出（应用 order-service，分析提交 [0-9a-f]{12}，会话 parent）。请评审案例和 SKILL 修改。\n\n# 补充 traceId/),
       sourceBranch: value.branch,
@@ -288,7 +319,7 @@ describe('logalyze_improve_skill', () => {
     expect(rejected.status).toBe('rejected')
     expect(renderImproveValue(rejected)[0]?.text).toContain('用户不改进这次的 SKILL，没有起草也没有提交')
     expect(started).toHaveLength(0)
-    expect(repos.service.commitFiles).not.toHaveBeenCalled()
+    expect(repos.pushWorkspace).not.toHaveBeenCalled()
   })
 
   it('reports an improvement that produced nothing submittable', async () => {
@@ -303,17 +334,28 @@ describe('logalyze_improve_skill', () => {
       return value
     }
     const nothing = await attempt(0, () => finishChild(started, 0, {}, REASON, ''))
-    expect(nothing.error).toBe('子 Agent 没有写出修改（skill-proposal/）')
+    expect(nothing.error).toMatch(/^工作区与提交 [0-9a-f]{12} 相比没有改动$/)
     expect(renderImproveValue(nothing)[0]?.text).toContain(`运行目录：${nothing.improveDir}`)
-    expect((await attempt(1, () => finishChild(started, 1, { 'SKILL.md': `${skill}\n更多\n` }))).error).toContain('修改中没有案例文件 cases/<日期>-<slug>.md')
-    expect((await attempt(2, () => finishChild(started, 2, { 'SKILL.md': '---\nname: other\ndescription: x\n---\n', [CASE]: '# c\n' }))).error).toBe('SKILL.md 的 frontmatter name 是「other」，必须保持为「log-analysis」')
-    const stopped = await attempt(3, async () => {
-      await waitForStarts(started, 4)
-      started[3]!.settle({ stopReason: 'error', output: [], diagnostic: '模型出错' })
+    const failures: [Record<string, string | undefined>, string | null, string][] = [
+      [{ [SKILL]: `${skill}\n更多\n` }, REASON, '改动中没有新增或修改案例文件 cases/<日期>-<slug>.md'],
+      [{ [SKILL]: '---\nname: other\ndescription: x\n---\n', [IN_SKILL(CASE)]: '# c\n' }, REASON, 'SKILL.md 的 frontmatter name 是「other」，必须保持为「log-analysis」'],
+      [{ [SKILL]: '---\nname: log-analysis\nuser-invocable: false\n---\n', [IN_SKILL(CASE)]: '# c\n' }, REASON, 'SKILL.md 不能设置 user-invocable: false，否则派发时无法用 /<skill> 加载'],
+      [{ [IN_SKILL(CASE)]: '# c\n', 'src/main/java/com/example/order/OrderService.java': '// fixed\n' }, REASON, '工作区改动了 src/main/java/com/example/order/OrderService.java，只允许新增或修改 .agents/skills/log-analysis/ 下的文件'],
+      [{ [IN_SKILL(CASE)]: '# c\n', 'scratch.log': 'x' }, REASON, '工作区改动了 scratch.log'],
+      [{ [IN_SKILL(CASE)]: '# c\n', [SKILL]: undefined }, REASON, `不能删除 ${SKILL}`],
+      [{ [IN_SKILL(CASE)]: '# c\n' }, null, '缺少 reason.md（改动说明）'],
+    ]
+    for (const [index, [files, reason, error]] of failures.entries()) {
+      expect((await attempt(index + 1, () => finishChild(started, index + 1, files, reason))).error).toContain(error)
+    }
+    const last = failures.length + 1
+    const stopped = await attempt(last, async () => {
+      await waitForStarts(started, last + 1)
+      started[last]!.settle({ stopReason: 'error', output: [], diagnostic: '模型出错' })
     })
     expect(stopped.error).toBe('改进子 Agent 没有完成（error：模型出错）')
-    expect(approval.request).toHaveBeenCalledTimes(4)
-    expect(repos.service.commitFiles).not.toHaveBeenCalled()
+    expect(approval.request).toHaveBeenCalledTimes(last + 1)
+    expect(repos.pushWorkspace).not.toHaveBeenCalled()
   })
 
   it('reports a pushed branch when the merge request fails, and an existing branch for the same change', async () => {
@@ -321,16 +363,19 @@ describe('logalyze_improve_skill', () => {
     const exec = { signal: new AbortController().signal, agent }
     repos.state.changeError = Object.assign(new Error('令牌没有权限'), { name: 'RepoError', code: 'forbidden' })
     const running = improver.execute({ workDir: task.workDir }, exec)
-    await finishChild(started, 0, { [CASE]: '# c\n' })
+    await finishChild(started, 0, { [IN_SKILL(CASE)]: '# c\n' })
     const pushed = await running
     expect(pushed).toMatchObject({ status: 'pushed', mergeRequestError: '令牌没有权限' })
     expect(renderImproveValue(pushed)[0]?.text).toContain('创建合并请求失败（令牌没有权限）')
 
     await improver.inspect(task)
     const again = improver.execute({ workDir: task.workDir }, exec)
-    await finishChild(started, 1, { [CASE]: '# c\n' })
+    await finishChild(started, 1, { [IN_SKILL(CASE)]: '# c\n' })
     const exists = await again
     expect(exists).toMatchObject({ status: 'exists', branch: pushed.branch })
+    expect(repos.pushWorkspace).toHaveBeenCalledTimes(2)
+    expect(repos.service.pushes).toHaveLength(1)
+    expect(repos.createChange).toHaveBeenCalledTimes(1)
     expect(renderImproveValue(exists)[0]?.text).toContain('已存在，同一改动可能已经提交过')
   })
 
@@ -402,10 +447,10 @@ describe('logalyze_improve_skill', () => {
     expect(prompt).toContain('已有案例描述的是同一个问题时更新它')
 
     // A correction after an analysis still has to record the case.
-    await finishChild(started, 0, { 'SKILL.md': `${skill}\n503 来自网关限流。\n` })
+    await finishChild(started, 0, { [SKILL]: `${skill}\n503 来自网关限流。\n` })
     const value = await running
-    expect(value).toMatchObject({ status: 'failed', error: '修改中没有案例文件 cases/<日期>-<slug>.md' })
-    expect(repos.service.commitFiles).not.toHaveBeenCalled()
+    expect(value).toMatchObject({ status: 'failed', error: '改动中没有新增或修改案例文件 cases/<日期>-<slug>.md' })
+    expect(repos.pushWorkspace).not.toHaveBeenCalled()
   })
 
   it('improves a SKILL from user feedback alone, with sample logs and no case required', async () => {
@@ -415,7 +460,7 @@ describe('logalyze_improve_skill', () => {
     const exec = { signal: new AbortController().signal, agent }
     const running = improver.execute({ app: 'order-service', feedback: '日志时间是 UTC，不是北京时间', logs: [{ path: 'sample.log' }] }, exec)
     await waitForStarts(started, 1)
-    expect(approval.requests[0]?.displayReason?.zh).toContain(`是否改进 SKILL？同意后，观象会按反馈修改 SKILL，然后提交到 ${origin} 的新分支`)
+    expect(approval.requests[0]?.displayReason?.zh).toContain(`是否改进 SKILL？同意后，观象会按反馈修改 SKILL，然后推送到 ${origin} 的新分支`)
     const prompt = started[0]?.spec.request.prompt[0]?.text as string
     expect(prompt).toContain('用户要求改进这个 SKILL，用户的反馈见下文。')
     expect(prompt).not.toContain('## 分析时的问题')
@@ -424,13 +469,14 @@ describe('logalyze_improve_skill', () => {
     const improveDir = improveDirOf(started[0]!)
     expect(improveDir).toMatch(new RegExp(`^${join(project, '.logalyze', 'runs').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/20261031-220000-[0-9a-f]{6}/improve-[0-9a-f]{6}$`))
 
-    await finishChild(started, 0, { 'SKILL.md': `${skill}\n时间是 UTC。\n` }, '修正日志时区说明\n\n- SKILL.md：时间是 UTC')
+    await finishChild(started, 0, { [SKILL]: `${skill}\n时间是 UTC。\n` }, '修正日志时区说明\n\n- SKILL.md：时间是 UTC')
     const value = await running
     expect(value).toMatchObject({ status: 'opened', files: [{ path: SKILL, added: 2, removed: 0 }] })
     expect(value.workDir).toBeUndefined()
-    const [, commit] = repos.service.commitFiles.mock.calls[0]!
-    expect(commit.message).toBe('修正日志时区说明\n\n修正日志时区说明\n\n- SKILL.md：时间是 UTC\n\nProposed-by: 观象 Logalyze\nSession: parent\n')
-    expect(repos.service.createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ body: expect.stringMatching(/^由观象按用户反馈提出（应用 order-service，会话 parent）。请评审 SKILL 修改。/) }))
+    const [push] = repos.service.pushes
+    expect(push?.message).toBe('修正日志时区说明\n\n修正日志时区说明\n\n- SKILL.md：时间是 UTC\n\nProposed-by: 观象 Logalyze\n')
+    expect(push?.session).toBe('parent')
+    expect(repos.createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ body: expect.stringMatching(/^由观象按用户反馈提出（应用 order-service，会话 parent）。请评审 SKILL 修改。/) }))
     expect(task.workDir).not.toBe(improveDir)
   })
 })

@@ -203,8 +203,10 @@ describe('plugin', () => {
       const [listed] = await provider.list({ cwd: dir })
       expect(listed?.invocation.modelInvocable).toBe(autoInvoke)
       if (autoInvoke) expect(listed?.description).toContain('订单服务（order-service')
-      // Inside the repositories only the bundled guides are listed.
-      expect((await provider.list({ cwd: join(h.repos.mirrorSettings().dir, '.snapshots', 'local', 'x') })).map(skill => skill.name)).toEqual(['logalyze-kit', 'logalyze-improve'])
+      // Inside the repositories and the run directories' workspaces only the bundled guides are listed.
+      for (const cwd of [join(h.repos.mirrorSettings().dir, '.snapshots', 'local', 'x'), join(dir, '.logalyze', 'runs', 'r1', 'init', 'repo')]) {
+        expect((await provider.list({ cwd })).map(skill => skill.name)).toEqual(['logalyze-kit', 'logalyze-improve'])
+      }
     }
   })
 

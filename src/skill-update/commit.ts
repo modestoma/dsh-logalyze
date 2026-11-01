@@ -1,11 +1,13 @@
 /**
- * 把一组文件提交到新分支并创建合并请求。接入初稿先检查分支、再请求授权、最后
- * 提交（{@link submitChange}）；SKILL 改进在起草前就已经征得用户同意，起草后
- * 直接提交（{@link commitChange}）：
+ * 把工作区推送到新分支并创建合并请求。接入初稿先请求授权、再推送
+ * （{@link submitChange}）；SKILL 改进在起草前就已经征得用户同意，起草后直接
+ * 推送（{@link pushChange}）：
  *
- * - 授权经 DSH 审批服务一次性请求，只有 `allowed-once` 才继续。
- * - 提交用 `newBranch: true`，同名分支已存在时报告 `exists`，从不提交到已有分支。
- * - 提交以基准提交为父提交；分支创建后合并请求失败时报告 `pushed`，由用户手动创建。
+ * - 授权经 DSH 审批服务一次性请求，只有 `allowed-once` 才继续；授权后重新检查
+ *   工作区，改动与提问时不同则不推送。
+ * - 推送经 `dshRepos` 的 `pushWorkspace` 完成，提交工作区里未提交的改动，从不
+ *   强推；远端已有同名分支时报告 `exists`。
+ * - 分支推送后合并请求失败时报告 `pushed`，由用户手动创建。
  *
  * @module dsh-logalyze/skill-update/commit
  */
@@ -13,6 +15,7 @@
 import type { Agent, ApprovalOutcome, HostApproval, ToolRunContext } from '../host.ts'
 import type { CommitAuthor, DshRepos } from '../repos/contract.ts'
 import { messageOf, repoErrorCode } from '../repos/lookup.ts'
+import { ProposalError } from './files.ts'
 
 /** How one submission ended. */
 export type SubmitStatus = 'opened' | 'pushed' | 'exists' | 'rejected' | 'cancelled' | 'unavailable'
@@ -29,28 +32,33 @@ export interface ApprovalAsk {
   readonly prompt: { readonly zh: string; readonly en: string }
 }
 
-/** One commit and merge request. */
-export interface CommitRequest {
+/** One push and merge request. */
+export interface PushRequest {
   readonly repos: DshRepos
   readonly exec: ToolRunContext
   /** Repository address. */
   readonly url: string
-  /** Full commit id the new branch starts from. */
-  readonly base: string
+  /** Workspace directory. */
+  readonly dir: string
   /** New branch. */
   readonly branch: string
   /** Branch the merge request targets. */
   readonly target: string
-  /** Files to write, by repository-relative path; only files that differ from {@link base}. */
-  readonly files: readonly { readonly action: 'write'; readonly path: string; readonly content: string }[]
   readonly message: string
   readonly title: string
   readonly body: string
   readonly author?: CommitAuthor
+  /** Session recorded in the commit message by `dshRepos`. */
+  readonly session: string
 }
 
-/** One submission that asks before committing. */
-export interface SubmitRequest extends CommitRequest, ApprovalAsk {}
+/** One submission that asks before pushing. */
+export interface SubmitRequest extends PushRequest, ApprovalAsk {
+  /** Digest of the checked changes the prompt describes. */
+  readonly digest: string
+  /** Checks the workspace again and returns its current digest. */
+  readonly recheck: () => Promise<string>
+}
 
 /** Outcome of one submission. */
 export interface SubmitOutcome {
@@ -81,36 +89,34 @@ export async function askApproval(ask: ApprovalAsk): Promise<ApprovalOutcome> {
 }
 
 /**
- * Check the branch, ask once, then commit and open the merge request.
- * @param request - repository, change, and approval context.
+ * Ask once, then push and open the merge request.
+ * @param request - workspace, change, and approval context.
  * @returns how the submission ended.
- * @throws the cancellation reason when the turn is cancelled, or the commit failure; the branch is not created then.
+ * @throws the cancellation reason when the turn is cancelled, ProposalError when the changes differ from the approved ones or no longer pass the checks, or the push failure; the branch is not created then.
  */
 export async function submitChange(request: SubmitRequest): Promise<SubmitOutcome> {
-  const { repos, exec, url, branch } = request
-  if (await repos.getBranch(url, branch, { signal: exec.signal }) !== undefined) return { status: 'exists' }
   const outcome = await askApproval(request)
   if (outcome !== 'allowed-once') return { status: outcome }
-  return await commitChange(request)
+  // The workspace stays writable while the user decides.
+  if (await request.recheck() !== request.digest) throw new ProposalError('等待授权期间工作区的改动变了，没有推送；请重新提交，按新的改动重新请求授权')
+  return await pushChange(request)
 }
 
 /**
- * Commit to a new branch and open the merge request, without asking.
- * @param request - repository and change.
+ * Push the workspace to a new branch and open the merge request, without asking.
+ * @param request - workspace and change.
  * @returns `opened`, `pushed`, or `exists`.
- * @throws the cancellation reason when the turn is cancelled, or the commit failure; the branch is not created then.
+ * @throws the cancellation reason when the turn is cancelled, or the push failure; the branch is not created then.
  */
-export async function commitChange(request: CommitRequest): Promise<SubmitOutcome> {
+export async function pushChange(request: PushRequest): Promise<SubmitOutcome> {
   const { repos, exec, url, branch } = request
   exec.signal.throwIfAborted()
   try {
-    await repos.commitFiles(url, {
+    await repos.pushWorkspace(request.dir, {
       branch,
-      baseSha: request.base,
-      newBranch: true,
       message: request.message,
-      files: request.files,
       ...request.author === undefined ? {} : { author: request.author },
+      session: request.session,
       signal: exec.signal,
     })
   } catch (error) {

@@ -58,7 +58,7 @@ function cell(text: string): string {
  */
 export function renderCatalog(apps: readonly AppManifest[]): string {
   if (apps.length === 0) {
-    return `当前没有可用的应用，不要自行分析日志。用户给出了应用代码仓库的 git 地址时，用 \`${ADD_REPO_TOOL_NAME}\` 添加并按工具结果继续；否则请用户提供 git 地址，或在 DSH Web 左侧栏「观象」面板的「应用仓库」中添加，然后结束本次回复。`
+    return `当前没有可用的应用，不要自行分析日志。用户给出了应用代码仓库的 https 地址时，用 \`${ADD_REPO_TOOL_NAME}\` 添加并按工具结果继续；否则请用户提供仓库的 https 地址（不支持 ssh 地址），或在 DSH Web 左侧栏「观象」面板的「应用仓库」中添加，然后结束本次回复。`
   }
   const rows = apps.map(app => `| \`${app.id}\` | ${cell(app.name)} | ${cell(app.description)} | ${cell(app.aliases.join('、') || '—')} | ${cell(app.logHints.map(hint => `\`${hint}\``).join(' ') || '—')} |`)
   return ['| 应用 id | 名称 | 描述 | 别名 | 日志特征 |', '| --- | --- | --- | --- | --- |', ...rows].join('\n')
@@ -66,7 +66,7 @@ export function renderCatalog(apps: readonly AppManifest[]): string {
 
 function improveStep(): string {
   return `
-5. **SKILL 改进。** 改进由 \`${IMPROVE_TOOL_NAME}\` 完成：工具先询问用户是否改进；用户同意后，改进子 Agent 修改 SKILL（需要时把问题整理为案例写入 SKILL 的 \`cases/\` 目录），观象提交到新分支并创建合并请求，整个过程需要几分钟。不要自己用 git 推送或修改仓库。
+5. **SKILL 改进。** 改进由 \`${IMPROVE_TOOL_NAME}\` 完成：工具先询问用户是否改进；用户同意后，改进子 Agent 修改 SKILL（需要时把问题整理为案例写入 SKILL 的 \`cases/\` 目录），观象推送到新分支并创建合并请求，整个过程需要几分钟。SKILL 改进一律通过这个工具，不要自己修改或推送 SKILL 文件。
    - 派发结果中某个应用标出「SKILL 不足」时：先照常写完汇总回复，在末尾另起一节「SKILL 改进」，用一两句话说明子 Agent 认为 SKILL 哪里不足，然后对每个这样的应用调用一次工具（\`workDir\` 取结果中给出的运行目录）。
    - 用户指出 SKILL 的记录有误、要求纠正或改进某个应用的 SKILL 时（不论本会话是否分析过）：先用 \`${SHOW_TOOL_NAME}\` 查看现有 SKILL 的相关内容，和用户确认哪部分不对、正确的做法是什么、有没有样例日志；信息不足时追问，一次只问最关键的一两点。问清后调用工具：刚分析过该应用时传那次的 \`workDir\`，否则传 \`app\`；\`feedback\` 写用户的纠正，尽量保留原话；用户给了日志时放进 \`logs\`。
    - 工具返回后，列出改动的文件和每处改动的要点（取自结果），附上合并请求链接，请用户在合并请求中评审。用户拒绝或无法询问时，一句话说明即可；改进失败时如实说明原因。
@@ -122,6 +122,8 @@ ${renderCatalog(apps)}
 \`\`\`
 
    每个派发的应用都有一节。子 Agent 失败、超时或结论不充分时，在该节如实说明，不要编造结论。日志版本与仓库代码可能不一致，子 Agent 提示了版本差异时保留这条提示。
+
+   用户之后要求修复分析发现的代码问题时，按普通编码任务处理：从派发结果中该应用的仓库地址和提交开始修改，不要在观象的运行目录或代码快照里改代码。
 ${skillUpdates ? improveStep() : ''}`
 }
 
@@ -144,8 +146,8 @@ export interface EntrySkillSource {
   /** Whether top-level agents may load the skill without `/logalyze`. */
   readonly autoInvoke: boolean
   /**
-   * Whether a lookup directory lies in the repository directory children work
-   * in; the skill is not listed there.
+   * Whether a lookup directory lies where children work (the repository
+   * mirrors or a run directory's workspace); the skill is not listed there.
    * @param cwd - lookup working directory.
    * @returns whether the directory belongs to the repositories.
    */
@@ -156,8 +158,8 @@ export interface EntrySkillSource {
 
 /**
  * Build the skill provider serving `/logalyze` and the bundled guide skills.
- * The bundled skills are listed in every directory, including the repository
- * snapshots children work in, where `/logalyze` is not listed.
+ * The bundled skills are listed in every directory, including the snapshots
+ * and workspaces children work in, where `/logalyze` is not listed.
  * @param source - live registry view and the bundled skills.
  * @returns a provider factory for `ctx.skills.registerProvider`, plus the
  *   hook to call after the usable applications may have changed; it

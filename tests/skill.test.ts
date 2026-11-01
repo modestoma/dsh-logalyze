@@ -23,6 +23,15 @@ describe('entry skill', () => {
     expect(improving).toContain('先用 `logalyze_show_skill` 查看现有 SKILL 的相关内容')
   })
 
+  it('limits the hands-off rule to SKILL files and points code fixes at the analysed repository and commit', () => {
+    for (const body of [renderEntrySkill([order], 3, false), renderEntrySkill([order], 3, true)]) {
+      expect(body).not.toContain('不要自己用 git 推送或修改仓库')
+      expect(body).toContain('用户之后要求修复分析发现的代码问题时，按普通编码任务处理：从派发结果中该应用的仓库地址和提交开始修改')
+      expect(body).not.toMatch(/dsh-repo|repo_/)
+    }
+    expect(renderEntrySkill([order], 3, true)).toContain('SKILL 改进一律通过这个工具，不要自己修改或推送 SKILL 文件。')
+  })
+
   it('is user-invocable only and renders the live catalog on each load', async () => {
     let apps: AppManifest[] = []
     const ready = Promise.withResolvers<void>()

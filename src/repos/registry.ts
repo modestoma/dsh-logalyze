@@ -264,42 +264,6 @@ export class RepoRegistry {
   }
 
   /**
-   * Hold a snapshot of a configured repository's latest synced commit.
-   * @param url - configured repository address.
-   * @returns the commit, its read-only checkout, and the release; release exactly once.
-   * @throws when the address is not configured or never synced, dsh-repo is unavailable, or the snapshot cannot be created.
-   */
-  async acquireRepo(url: string): Promise<{ readonly commit: string; readonly dir: string; release(): void }> {
-    const entry = this.entries.find(item => item.spec.url === url)
-    if (entry === undefined) throw new Error(`仓库 ${url} 不在应用仓库列表中`)
-    const commit = entry.commit
-    if (commit === undefined) throw new Error(`仓库 ${url} 还没有同步成功${entry.error === undefined ? '' : `：${entry.error}`}`)
-    const service = requireRepos(this.deps.repos())
-    entry.activeRuns += 1
-    this.deps.onChange()
-    let lease: SnapshotLease
-    try {
-      lease = await service.acquireSnapshot(url, commit)
-    } catch (error) {
-      entry.activeRuns -= 1
-      this.deps.onChange()
-      throw new Error(`仓库 ${url} 的代码快照创建失败：${messageOf(error)}`)
-    }
-    let released = false
-    return {
-      commit,
-      dir: lease.dir,
-      release: () => {
-        if (released) return
-        released = true
-        lease.release()
-        entry.activeRuns -= 1
-        this.deps.onChange()
-      },
-    }
-  }
-
-  /**
    * The branch the last successful sync of a configured address resolved: the
    * configured branch, or the remote's default branch when none is configured.
    * @param url - configured repository address.
