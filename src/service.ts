@@ -97,7 +97,6 @@ export class LogalyzeService {
       settings: () => this.current,
       workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
       ...config.skillUpdateAuthor === undefined ? {} : { author: config.skillUpdateAuthor },
-      approval: () => ctx.get?.('approval') as HostApproval | undefined,
       repos: () => ctx.get?.(DSH_REPOS_SERVICE),
       ...options.fetch === undefined ? {} : { fetch: options.fetch },
     })
@@ -151,8 +150,12 @@ export class LogalyzeService {
    * Register the dispatch, SKILL improvement and view, and repository onboarding tools;
    * called once from `apply()`. The definitions stay fixed because a step
    * drops a tool whose registration changed after the step resolved its tools.
+   * The improvement tool counts finished turns from `turn/end` Session events.
    */
   registerTool(): void {
+    this.ctx.on('session/event', (session, event) => {
+      if (event.type === 'turn/end') this.improver.turnEnded(session.header.id)
+    })
     this.ctx.effect(
       () => this.ctx.tools.register(this.dispatcher.definition(), { when: context => this.offersTool(context) }),
       'logalyze: dispatch tool',

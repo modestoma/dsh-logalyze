@@ -1,6 +1,6 @@
 /**
  * 把工作区推送到新分支并创建合并请求。接入初稿先请求授权、再推送
- * （{@link submitChange}）；SKILL 改进在起草前就已经征得用户同意，起草后直接
+ * （{@link submitChange}）；SKILL 改进由用户在对话中同意后才会发起，起草后直接
  * 推送（{@link pushChange}）：
  *
  * - 授权经 DSH 审批服务一次性请求，只有 `allowed-once` 才继续；授权后重新检查
@@ -20,8 +20,11 @@ import { ProposalError } from './files.ts'
 /** Conventional Commits prefix of every SKILL improvement and onboarding commit subject and merge request title; no other type is allowed. */
 export const SKILL_COMMIT_PREFIX = 'chore: '
 
-/** How one submission ended. */
-export type SubmitStatus = 'opened' | 'pushed' | 'exists' | 'rejected' | 'cancelled' | 'unavailable'
+/** How one push ended. */
+export type PushStatus = 'opened' | 'pushed' | 'exists'
+
+/** How one submission ended: a push status, or the approval outcome that stopped it. */
+export type SubmitStatus = PushStatus | 'rejected' | 'cancelled' | 'unavailable'
 
 /** One approval request about a tool call. */
 export interface ApprovalAsk {
@@ -71,6 +74,11 @@ export interface SubmitOutcome {
   readonly mergeRequestError?: string
 }
 
+/** Outcome of one push. */
+export interface PushOutcome extends SubmitOutcome {
+  readonly status: PushStatus
+}
+
 /**
  * Ask the user once.
  * @param ask - approval service, caller, and prompt.
@@ -111,7 +119,7 @@ export async function submitChange(request: SubmitRequest): Promise<SubmitOutcom
  * @returns `opened`, `pushed`, or `exists`.
  * @throws the cancellation reason when the turn is cancelled, or the push failure; the branch is not created then.
  */
-export async function pushChange(request: PushRequest): Promise<SubmitOutcome> {
+export async function pushChange(request: PushRequest): Promise<PushOutcome> {
   const { repos, exec, url, branch } = request
   exec.signal.throwIfAborted()
   try {

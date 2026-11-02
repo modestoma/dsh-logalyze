@@ -67,7 +67,7 @@ async function setup(overrides: Partial<EditableSettings> = {}, gaps = false) {
   registry.configure(settings.repos)
   await registry.syncAll()
   const { service, started } = fakeSubagents()
-  const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, approval: () => undefined, repos: () => repos })
+  const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: () => repos })
   const dispatcher = new Dispatcher({
     registry,
     ...gaps ? { gaps: improver } : {},
@@ -138,6 +138,7 @@ describe('logalyze_dispatch', () => {
     await waitForStarts(started, 2)
     const prompt = started[0]?.spec.request.prompt[0]?.text as string
     expect(prompt).toContain('## SKILL 不足时')
+    expect(prompt).toContain('只是多查了几步，或者缺的是只在这一次出现、以后用不上的细节，都不算不足，不要记录。')
     expect(prompt).toContain('仓库中的 `.agents/skills/log-analysis/`')
     expect(prompt).toContain('不要修改 SKILL，是否改进由用户决定。')
     const workDir = /`([^`]+)\/skill-gap\.md`/.exec(prompt)?.[1] as string
@@ -151,7 +152,7 @@ describe('logalyze_dispatch', () => {
     expect(value.results[1]?.skillGap).toBeUndefined()
     const text = renderDispatchValue(value)[0]?.text
     expect(text).toContain(`SKILL 不足（记录在 ${join(workDir, 'skill-gap.md')}）：SKILL 没写 traceId 字段 靠 grep 找到的`)
-    expect(text).toContain(`汇总回复写完后调用 logalyze_improve_skill（workDir 为 ${workDir}），工具会询问用户是否改进。`)
+    expect(text).toContain('在汇总回复末尾的「SKILL 改进建议」中用一两句说明，并问用户是否改进。本回合不要调用 logalyze_improve_skill（工具会拒绝）；用户同意后再调用，app 为 order-service。')
   })
 
   it('reports a gap record that cannot be read instead of offering it', async () => {

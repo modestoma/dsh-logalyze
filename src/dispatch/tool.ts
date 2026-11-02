@@ -8,8 +8,8 @@
  *   解压日志的可写目录。
  * - 超时（`dispatchTimeoutMs`）或调用被取消时停止全部仍在运行的子 Agent。
  * - 开启 SKILL 改进时，子 Agent 在 SKILL 不足时于运行目录写 `skill-gap.md`；派发
- *   结束后检查已完成任务的记录，并在结果中标出 SKILL 不足，供父 Agent 询问用户
- *   是否改进。
+ *   结束后检查已完成任务的记录，并在结果中标出 SKILL 不足，供父 Agent 在汇总回复
+ *   末尾给出改进建议，用户在之后的消息里同意后再改进。
  * - 每个任务的结果带上应用仓库地址和分析的提交，后续修复代码可以从同一仓库和
  *   提交开始。
  * - 子会话（委派深度大于 0）中不提供本工具。
@@ -139,7 +139,7 @@ function renderGap(result: TaskResult): string {
   const gap = result.skillGap
   if (gap === undefined) return ''
   if (!gap.ok) return `\n\nSKILL 不足记录不可用：${gap.error}`
-  return `\n\nSKILL 不足（记录在 ${gap.path}）：${gap.preview}\n汇总回复写完后调用 ${IMPROVE_TOOL_NAME}（workDir 为 ${result.workDir}），工具会询问用户是否改进。`
+  return `\n\nSKILL 不足（记录在 ${gap.path}）：${gap.preview}\n在汇总回复末尾的「SKILL 改进建议」中用一两句说明，并问用户是否改进。本回合不要调用 ${IMPROVE_TOOL_NAME}（工具会拒绝）；用户同意后再调用，app 为 ${result.app}。`
 }
 
 /**

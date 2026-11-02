@@ -65,6 +65,7 @@ async function harness(services: Record<string, unknown>, config: Record<string,
     subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('not used')) },
     logger: { warn },
     get: (name: string) => all[name],
+    on: () => () => {},
     effect: (callback) => {
       const dispose = callback()
       const wrapped = (): void => { dispose?.() }
