@@ -152,7 +152,9 @@ describe('report tracking', () => {
     expect(h.runs).toEqual([])
 
     await writeFile(join(h.workDir, 'report', 'chart.png'), 'png')
-    await writeFile(join(h.workDir, 'report', 'report.md'), 'written by the agent')
+    const outside = join(h.workDir, 'outside.md')
+    await writeFile(outside, 'outside the report directory')
+    await symlink(outside, join(h.workDir, 'report', 'report.md'))
     h.turn(1, { question: `${REQUEST.prompt}\n\n## 报告文件`, reply: '根因：内存溢出 ![图](report/chart.png) [日志](/var/log/app.log)' })
     await h.uploads(1)
     const reportDir = join(h.workDir, 'report')
@@ -160,6 +162,7 @@ describe('report tracking', () => {
     expect(h.runs[0]!.report).toContain('## 分析结论\n\n根因：内存溢出 ![图](chart.png)')
     expect(h.runs[0]!.report).not.toContain('我先看看日志')
     expect(h.runs[0]!.report).not.toContain('本轮文件')
+    expect(await readFile(outside, 'utf8')).toBe('outside the report directory')
 
     await writeFile(join(h.workDir, 'report', 'detail.md'), '# 细节')
     h.turn(2, { question: '<feishu_quote>x</feishu_quote>为什么会溢出？', reply: '因为缓存没有上限。' })

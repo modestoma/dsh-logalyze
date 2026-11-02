@@ -18,6 +18,7 @@
  * @module dsh-logalyze/report/tracker
  */
 
+import { randomUUID } from 'node:crypto'
 import { lstat, mkdir, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { AnalyzeRequest } from '../analyze/contract.ts'
@@ -454,8 +455,10 @@ export class ReportTracker {
       await mkdir(dir, { recursive: true })
       if (!(await lstat(dir)).isDirectory()) return { ok: false, retryable: false, error: `报告目录 ${dir} 不是普通目录（可能是符号链接），没有上传` }
       const entry = join(dir, REPORT_ENTRY)
-      const temporary = join(dir, `.${REPORT_ENTRY}.${process.pid}.tmp`)
-      await writeFile(temporary, renderReport(record, record.sections), 'utf8')
+      // The directory is agent-writable: create the temporary file exclusively
+      // under a fresh name, so an existing entry (a symbolic link included) is never followed.
+      const temporary = join(dir, `.${REPORT_ENTRY}.${randomUUID()}.tmp`)
+      await writeFile(temporary, renderReport(record, record.sections), { encoding: 'utf8', flag: 'wx' })
       // Renaming replaces whatever the agent left under the entry name, a symbolic link included.
       await rename(temporary, entry)
       const listing = await listReport(dir)
