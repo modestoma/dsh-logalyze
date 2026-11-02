@@ -422,9 +422,12 @@ export class SkillImprover {
         return record
       })
     }
-    const checked = await Promise.all(records.map(async record => ({ record, gap: await readGap(record.task.workDir, settings.skillUpdates.maxFileBytes) !== undefined })))
-    // Without workDirs only analyses that recorded a gap count; named ones count even without a record.
-    const bases = args.workDirs === undefined ? checked.filter(basis => basis.gap) : checked
+    const hasGap = async (record: TaskRecord): Promise<boolean> => await readGap(record.task.workDir, settings.skillUpdates.maxFileBytes) !== undefined
+    // Without workDirs only analyses with a usable gap record count, and an unusable record (already reported by the
+    // dispatch result) only drops its own analysis; named analyses count even without a record and must read cleanly.
+    const bases: Basis[] = args.workDirs === undefined
+      ? (await Promise.all(records.map(async record => ({ record, gap: await hasGap(record).catch(() => false) })))).filter(basis => basis.gap)
+      : await Promise.all(records.map(async record => ({ record, gap: await hasGap(record) })))
     if (feedback === undefined && !bases.some(basis => basis.gap)) {
       throw new Error(`本会话中应用「${app.id}」没有待改进的 ${GAP_FILE} 记录，需要在 feedback 中写明用户指出的问题和期望的改法`)
     }

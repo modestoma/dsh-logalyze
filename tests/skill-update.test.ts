@@ -318,6 +318,11 @@ describe('logalyze_improve_skill', () => {
     await improver.inspect({ ...task, workDir: second, question: '库存扣减超时', output: '根因：库存服务慢', logs: ['/logs/order.log', '/logs/stock.log'] })
     // An analysis without a gap record is not an improvement point by itself.
     await improver.inspect({ ...task, workDir: quiet, question: '无关问题', output: '正常' })
+    // An unusable gap record drops only its own analysis.
+    const broken = join(root, 'project', '.logalyze', 'runs', 'r4', '1-order-service')
+    await mkdir(broken, { recursive: true })
+    await writeFile(join(broken, 'skill-gap.md'), '')
+    expect(await improver.inspect({ ...task, workDir: broken, question: '记录损坏', output: '?' })).toEqual({ ok: false, error: 'skill-gap.md 是空的' })
     improver.turnEnded('parent')
     const feedback = '另外日志时间是 UTC'
     const running = improver.execute({ app: 'order-service', feedback }, { signal: new AbortController().signal, agent })
@@ -328,6 +333,7 @@ describe('logalyze_improve_skill', () => {
     expect(prompt).toContain(`## 分析 2\n\n运行目录：\`${second}\``)
     expect(prompt).toContain(`记录写在 \`${join(second, 'skill-gap.md')}\``)
     expect(prompt).not.toContain(quiet)
+    expect(prompt).not.toContain(broken)
     expect(prompt).toContain(`## 用户反馈\n\n${feedback}`)
     expect(prompt).toContain('- `/logs/order.log`\n- `/logs/stock.log`\n')
     expect(prompt).toContain('每个不同的问题一个案例，几次分析是同一个问题时只写一个')
@@ -447,6 +453,12 @@ describe('logalyze_improve_skill', () => {
     await improver.inspect({ ...task, workDir: other, app: { ...task.app, id: 'billing' } })
     improver.turnEnded('parent')
     await expect(improver.execute({ ...args, workDirs: [other] }, exec)).rejects.toThrow(`${other} 分析的是应用「billing」，不是「order-service」`)
+    const broken = join(dirname(task.workDir), '3-order-service')
+    await mkdir(broken, { recursive: true })
+    await writeFile(join(broken, 'skill-gap.md'), '')
+    await improver.inspect({ ...task, workDir: broken })
+    improver.turnEnded('parent')
+    await expect(improver.execute({ ...args, workDirs: [broken], feedback: 'x' }, exec)).rejects.toThrow('skill-gap.md 是空的')
 
     const withoutRepos = new SkillImprover({ registry, subagents: fakeSubagents().service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: () => undefined })
     await withoutRepos.inspect(task)
