@@ -25,7 +25,7 @@ import type { CommitAuthor } from '../repos/contract.ts'
 import { messageOf, requireRepos } from '../repos/lookup.ts'
 import type { RepoRegistry } from '../repos/registry.ts'
 import type { AppManifest, EditableSettings } from '../settings/contract.ts'
-import { submitChange } from '../skill-update/commit.ts'
+import { SKILL_COMMIT_PREFIX, submitChange } from '../skill-update/commit.ts'
 import type { SubmitStatus } from '../skill-update/commit.ts'
 import { replaceFile } from '../skill-update/files.ts'
 import { describeFiles, DIFF_FILE, WORKSPACE_DIR } from '../skill-update/workspace.ts'
@@ -399,7 +399,7 @@ export class RepoInitializer {
     // A workspace pushes to one branch; once pushed, the draft has been submitted.
     if (changes.pushedBranch !== undefined) return { ...base, status: 'exists', branch: changes.pushedBranch }
     const branch = `logalyze/init-${app.id}-${changes.digest.slice(0, 10)}`
-    const title = `接入观象日志分析：${app.name}（${app.id}）`
+    const title = `${SKILL_COMMIT_PREFIX}接入观象日志分析：${app.name}（${app.id}）`
     const preview = reason.replace(/\s+/g, ' ').slice(0, REASON_PREVIEW_CHARS)
     const outcome = await submitChange({
       digest: changes.digest,

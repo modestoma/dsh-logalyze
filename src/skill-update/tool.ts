@@ -42,7 +42,7 @@ import { messageOf, requireRepos } from '../repos/lookup.ts'
 import { disablesUserInvocation, skillDir, skillNameOf } from '../repos/manifest.ts'
 import type { RepoRegistry } from '../repos/registry.ts'
 import type { AppManifest, EditableSettings } from '../settings/contract.ts'
-import { askApproval, pushChange } from './commit.ts'
+import { askApproval, pushChange, SKILL_COMMIT_PREFIX } from './commit.ts'
 import type { SubmitStatus } from './commit.ts'
 import { GAP_FILE, GAP_PREVIEW_CHARS, previewOf, readGap } from './gap.ts'
 import type { GapCheck } from './gap.ts'
@@ -52,8 +52,11 @@ import { CASES_DIR, renderImprovePrompt } from './prompt.ts'
 import { checkChanges, describeFiles, DIFF_FILE, readReason, WORKSPACE_DIR } from './workspace.ts'
 import type { CheckedChanges, FileStat } from './workspace.ts'
 
-/** Longest commit subject and merge request title taken from the reason. */
+/** Longest commit subject and merge request title, including {@link SKILL_COMMIT_PREFIX}. */
 export const MAX_TITLE_CHARS = 120
+
+/** A leading Conventional Commits type such as `feat:` or `fix(skill)!:`, removed from the reason's title. */
+const COMMIT_TYPE = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^()\r\n]*\))?!?\s*[:：]\s*/i
 
 /** Longest accepted user feedback. */
 export const MAX_FEEDBACK_CHARS = 8000
@@ -244,10 +247,13 @@ function checkImprovement(changes: CheckedChanges, skill: string, caseRequired: 
   if (disablesUserInvocation(entry.content)) throw new ProposalError('SKILL.md 不能设置 user-invocable: false，否则派发时无法用 /<skill> 加载')
 }
 
-/** Title for the commit and merge request: the reason's first line without Markdown heading marks. */
+/**
+ * Title for the commit and merge request: {@link SKILL_COMMIT_PREFIX} followed by the reason's first line without
+ * Markdown heading marks or a Conventional Commits type the child wrote.
+ */
 function titleOf(reason: string, app: AppManifest): string {
-  const line = (reason.split(/\r?\n/).find(text => text.trim() !== '') ?? '').replace(/^#+\s*/, '').trim()
-  const title = line === '' ? `改进${app.name}日志分析 SKILL` : line
+  const line = (reason.split(/\r?\n/).find(text => text.trim() !== '') ?? '').replace(/^#+\s*/, '').trim().replace(COMMIT_TYPE, '').trim()
+  const title = `${SKILL_COMMIT_PREFIX}${line === '' ? `改进${app.name}日志分析 SKILL` : line}`
   return title.length <= MAX_TITLE_CHARS ? title : `${title.slice(0, MAX_TITLE_CHARS - 1)}…`
 }
 

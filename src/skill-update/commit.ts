@@ -17,6 +17,9 @@ import type { CommitAuthor, DshRepos } from '../repos/contract.ts'
 import { messageOf, repoErrorCode } from '../repos/lookup.ts'
 import { ProposalError } from './files.ts'
 
+/** Conventional Commits prefix of every SKILL improvement and onboarding commit subject and merge request title; no other type is allowed. */
+export const SKILL_COMMIT_PREFIX = 'chore: '
+
 /** How one submission ended. */
 export type SubmitStatus = 'opened' | 'pushed' | 'exists' | 'rejected' | 'cancelled' | 'unavailable'
 

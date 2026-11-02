@@ -259,6 +259,7 @@ describe('logalyze_improve_skill', () => {
     expect(prompt).toContain(`记录写在 \`${join(task.workDir, 'skill-gap.md')}\`，先读它。`)
     expect(prompt).toContain('- `/logs/order.log`')
     expect(prompt).toContain('当前工作目录是该应用代码仓库在提交')
+    expect(prompt).toContain('不写 `feat:`、`fix:` 等类型前缀，观象提交时统一加上 `chore: `')
     expect(prompt).toContain('的可写工作区')
     expect(prompt).toContain('否则新建 `.agents/skills/log-analysis/cases/2026-10-31-<slug>.md`')
     expect(prompt).toContain(`在工作区之外的 \`${improveDir}/reason.md\` 写改动说明`)
@@ -296,9 +297,9 @@ describe('logalyze_improve_skill', () => {
     expect(Object.keys(push!.files)).toEqual([SKILL, IN_SKILL(CASE)])
     expect(push?.author).toEqual({ name: '观象', email: 'logalyze@example.com' })
     expect(git(origin, 'rev-parse', `${value.branch}^`).trim()).toBe(status.commit)
-    expect(push?.message).toMatch(new RegExp(`^补充 traceId 字段说明与案例\\n\\n# 补充 traceId[\\s\\S]*\\n\\nProposed-by: 观象 Logalyze\\nAnalyzed-commit: ${task.commit}\\n$`))
+    expect(push?.message).toMatch(new RegExp(`^chore: 补充 traceId 字段说明与案例\\n\\n# 补充 traceId[\\s\\S]*\\n\\nProposed-by: 观象 Logalyze\\nAnalyzed-commit: ${task.commit}\\n$`))
     expect(repos.createChange).toHaveBeenCalledWith(origin, {
-      title: '补充 traceId 字段说明与案例',
+      title: 'chore: 补充 traceId 字段说明与案例',
       body: expect.stringMatching(/^由观象在日志分析后经用户同意提出（应用 order-service，分析提交 [0-9a-f]{12}，会话 parent）。请评审案例和 SKILL 修改。\n\n# 补充 traceId/),
       sourceBranch: value.branch,
       targetBranch: 'main',
@@ -469,14 +470,14 @@ describe('logalyze_improve_skill', () => {
     const improveDir = improveDirOf(started[0]!)
     expect(improveDir).toMatch(new RegExp(`^${join(project, '.logalyze', 'runs').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/20261031-220000-[0-9a-f]{6}/improve-[0-9a-f]{6}$`))
 
-    await finishChild(started, 0, { [SKILL]: `${skill}\n时间是 UTC。\n` }, '修正日志时区说明\n\n- SKILL.md：时间是 UTC')
+    await finishChild(started, 0, { [SKILL]: `${skill}\n时间是 UTC。\n` }, 'fix(skill)!: 修正日志时区说明\n\n- SKILL.md：时间是 UTC')
     const value = await running
     expect(value).toMatchObject({ status: 'opened', files: [{ path: SKILL, added: 2, removed: 0 }] })
     expect(value.workDir).toBeUndefined()
     const [push] = repos.service.pushes
-    expect(push?.message).toBe('修正日志时区说明\n\n修正日志时区说明\n\n- SKILL.md：时间是 UTC\n\nProposed-by: 观象 Logalyze\n')
+    expect(push?.message).toBe('chore: 修正日志时区说明\n\nfix(skill)!: 修正日志时区说明\n\n- SKILL.md：时间是 UTC\n\nProposed-by: 观象 Logalyze\n')
     expect(push?.session).toBe('parent')
-    expect(repos.createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ body: expect.stringMatching(/^由观象按用户反馈提出（应用 order-service，会话 parent）。请评审 SKILL 修改。/) }))
+    expect(repos.createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ title: 'chore: 修正日志时区说明', body: expect.stringMatching(/^由观象按用户反馈提出（应用 order-service，会话 parent）。请评审 SKILL 修改。/) }))
     expect(task.workDir).not.toBe(improveDir)
   })
 })
