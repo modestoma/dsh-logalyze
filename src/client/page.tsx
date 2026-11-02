@@ -2,14 +2,14 @@
  * 左侧栏「观象」主区页面：应用仓库、日志下载、分析接口、高级（含 SKILL 改进）四个
  * 分页，共用一份草稿和底部保存条。拉取仓库用的主机与令牌在「插件 → dsh-repo」
  * 页面管理，应用仓库分页提供跳转。
- * 仓库拉取中时每 2 秒刷新状态。
+ * 仓库拉取中时每 2 秒刷新状态；打开「分析接口」分页时每 5 秒刷新回传记录。
  *
  * @module dsh-logalyze/client/page
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { AnalyzeWire, EditableKey, EditableSettings, RepoSpec, RepoStatusWire, StateWire, TokenStatusWire } from '../settings/contract.ts'
-import { clearToken, fetchState, messageOf, resetSettings, saveSettings, saveToken, syncRepos } from './api.ts'
+import type { AnalyzeWire, EditableKey, EditableSettings, ReportStatus, ReportWire, RepoSpec, RepoStatusWire, StateWire, TokenStatusWire, UploadPhase } from '../settings/contract.ts'
+import { clearToken, fetchState, messageOf, resetSettings, retryReport, saveSettings, saveToken, syncRepos } from './api.ts'
 
 /** Sidebar label and page title. */
 export const PANEL_TITLE = '观象'
@@ -40,6 +40,13 @@ interface Draft {
   skillMaxFiles: string
   skillMaxKb: string
   analyzeEnabled: boolean
+  /** Upload command, one argument per line. */
+  uploadCommand: string
+  uploadTimeoutSec: string
+  uploadRetries: string
+  uploadRetryDelaySec: string
+  uploadMaxFiles: string
+  uploadMaxMb: string
 }
 
 function trimNumber(value: number): string {
@@ -59,7 +66,19 @@ function toDraft(settings: EditableSettings): Draft {
     skillMaxFiles: String(settings.skillUpdates.maxFiles),
     skillMaxKb: trimNumber(settings.skillUpdates.maxFileBytes / KB),
     analyzeEnabled: settings.analyze.enabled,
+    uploadCommand: settings.analyze.upload.command.join('\n'),
+    uploadTimeoutSec: trimNumber(settings.analyze.upload.timeoutMs / 1000),
+    uploadRetries: String(settings.analyze.upload.retries),
+    uploadRetryDelaySec: trimNumber(settings.analyze.upload.retryDelayMs / 1000),
+    uploadMaxFiles: String(settings.analyze.upload.maxFiles),
+    uploadMaxMb: trimNumber(settings.analyze.upload.maxBytes / MB),
   }
+}
+
+function integer(text: string, label: string, allowZero = false): number {
+  const value = positive(text, label, allowZero)
+  if (!Number.isInteger(value)) throw new Error(`${label}必须是整数`)
+  return value
 }
 
 function positive(text: string, label: string, allowZero = false): number {
@@ -88,7 +107,17 @@ function fromDraft(draft: Draft): EditableSettings {
       maxFiles,
       maxFileBytes: Math.round(positive(draft.skillMaxKb, '改进单文件大小上限') * KB),
     },
-    analyze: { enabled: draft.analyzeEnabled },
+    analyze: {
+      enabled: draft.analyzeEnabled,
+      upload: {
+        command: draft.uploadCommand.split('\n').map(arg => arg.trim()).filter(arg => arg !== ''),
+        timeoutMs: Math.round(positive(draft.uploadTimeoutSec, '回传超时') * 1000),
+        retries: integer(draft.uploadRetries, '重试次数', true),
+        retryDelayMs: Math.round(positive(draft.uploadRetryDelaySec, '重试间隔') * 1000),
+        maxFiles: integer(draft.uploadMaxFiles, '报告文件数上限'),
+        maxBytes: Math.round(positive(draft.uploadMaxMb, '报告总大小上限') * MB),
+      },
+    },
   }
 }
 
@@ -187,6 +216,12 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
     return () => { clearInterval(timer) }
   }, [syncing, reload])
 
+  useEffect(() => {
+    if (tab !== 'analyze') return
+    const timer = setInterval(() => { void reload(false) }, 5000)
+    return () => { clearInterval(timer) }
+  }, [tab, reload])
+
   const dirty = state !== undefined && draft !== undefined && !sameSettings(draft, state.settings)
 
   const run = async (action: () => Promise<StateWire>, success: string, resetDraft: boolean): Promise<StateWire | undefined> => {
@@ -257,6 +292,7 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
               busy={busy}
               onSave={async value => await run(() => saveToken(state.analyze.tokenEnv, value), '已保存分析接口令牌，下一个请求起生效', false) !== undefined}
               onClear={() => { void run(() => clearToken(state.analyze.tokenEnv), '已清除面板保存的分析接口令牌', false) }}
+              onRetry={(id) => { void run(() => retryReport(id), '已开始重新上传', false) }}
             />
           : null}
         {tab === 'advanced' ? <AdvancedTab draft={draft} setDraft={setDraft} overridden={state.overridden} busy={busy} onReset={() => { void run(resetSettings, '已恢复为 cordis.yml 中的配置', true) }} /> : null}
@@ -390,13 +426,52 @@ const TOPICS_STATUS: Readonly<Record<AnalyzeWire['topics'], { pill: string; text
   incompatible: { pill: 'lz__pill--bad', text: '飞书渠道版本不兼容' },
 }
 
-function AnalyzeTab({ draft, setDraft, analyze, credentialsAvailable, overridden, busy, onSave, onClear }: TabProps & {
+const REPORT_STATUS: Readonly<Record<ReportStatus, { pill: string; text: string }>> = {
+  done: { pill: 'lz__pill--ok', text: '已完成' },
+  stopped: { pill: '', text: '已停止' },
+  error: { pill: 'lz__pill--bad', text: '失败' },
+  failed: { pill: 'lz__pill--bad', text: '未能开始' },
+  interrupted: { pill: 'lz__pill--warn', text: '已中断' },
+}
+
+const UPLOAD_PHASE: Readonly<Record<UploadPhase, { pill: string; text: string }>> = {
+  pending: { pill: '', text: '等待上传' },
+  running: { pill: 'lz__pill--warn', text: '上传中' },
+  waiting: { pill: 'lz__pill--warn', text: '等待重试' },
+  done: { pill: 'lz__pill--ok', text: '已上传' },
+  failed: { pill: 'lz__pill--bad', text: '上传失败' },
+}
+
+function ReportRow({ report, busy, onRetry }: { report: ReportWire; busy: boolean; onRetry: (id: string) => void }): JSX.Element {
+  const status = report.status === undefined ? { pill: 'lz__pill--warn', text: '分析中' } : REPORT_STATUS[report.status]
+  const phase = report.status === undefined && report.phase === 'pending' ? undefined : UPLOAD_PHASE[report.phase]
+  return (
+    <div className="lz__row lz__row--top">
+      <div className="lz__rowText">
+        <div className="lz__rowLabel">
+          <span className="lz__mono">{report.logId}</span>
+          <span className="lz__tag">{report.app} · {report.errorCode}</span>
+          <span className={`lz__pill ${status.pill}`}><span className="lz__dot" />{status.text}</span>
+          {report.followups > 0 ? <span className="lz__tag">追问 {report.followups}</span> : null}
+          {phase === undefined ? null : <span className={`lz__pill ${phase.pill}`}><span className="lz__dot" />{phase.text}</span>}
+          <span className="lz__rowSummary">{formatTime(report.uploadedAt ?? report.acceptedAt)}</span>
+        </div>
+        {report.error === undefined || report.phase === 'done' ? null : <div className="lz__rowError">{report.error}</div>}
+        {report.warnings.length === 0 ? null : <div className="lz__rowSummary">链接提示：{report.warnings.join('；')}</div>}
+      </div>
+      <div className="lz__rowCtl"><button type="button" className="lz__btn" disabled={busy || report.phase === 'running'} title={report.dir} onClick={() => { onRetry(report.id) }}>重新上传</button></div>
+    </div>
+  )
+}
+
+function AnalyzeTab({ draft, setDraft, analyze, credentialsAvailable, overridden, busy, onSave, onClear, onRetry }: TabProps & {
   analyze: AnalyzeWire
   credentialsAvailable: boolean
   overridden: readonly EditableKey[]
   busy: boolean
   onSave: (value: string) => Promise<boolean>
   onClear: () => void
+  onRetry: (id: string) => void
 }): JSX.Element {
   const [value, setValue] = useState('')
   const token = analyze.token
@@ -440,11 +515,36 @@ function AnalyzeTab({ draft, setDraft, analyze, credentialsAvailable, overridden
         </div>
       </section>
       <section className="lz__sec">
+        <h2 className="lz__secTitle">报告回传</h2>
+        <div className="lz__list">
+          <div className="lz__row lz__row--top">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">回传命令 <Overridden keys={overridden} name="analyze" /></div>
+              <div className="lz__rowSummary">请求带 <span className="lz__mono">logId</span> 时，分析话题每一轮结束后，观象更新话题工作目录下的 <span className="lz__mono">report/</span>（入口 <span className="lz__mono">report.md</span> 记录首轮结论和每轮追问），再执行这条命令上传整个目录。每行一个参数，不经过 shell；可用占位符 <span className="lz__mono">{'{logId}'}</span>、<span className="lz__mono">{'{dir}'}</span>（报告目录绝对路径）、<span className="lz__mono">{'{entry}'}</span>（report.md）。</div>
+              {analyze.reportsSupported || analyze.topics !== 'ready' ? null : <div className="lz__rowError">当前 dsh-channels 版本不提供话题状态查询，报告不会回传；请升级 dsh-channels。</div>}
+              <textarea className="lz__input lz__mono lz__textarea" rows={Math.max(3, draft.uploadCommand.split('\n').length)} spellCheck={false} aria-label="回传命令" value={draft.uploadCommand} onChange={(event) => { setDraft({ ...draft, uploadCommand: event.target.value }) }} />
+            </div>
+          </div>
+          <NumberRow label="单次上传超时" unit="秒" value={draft.uploadTimeoutSec} onChange={(value) => { setDraft({ ...draft, uploadTimeoutSec: value }) }} />
+          <NumberRow label="失败重试次数" summary="命令失败后再试的次数；第一次重试前等待下面的间隔，之后每次加倍。" unit="次" value={draft.uploadRetries} onChange={(value) => { setDraft({ ...draft, uploadRetries: value }) }} />
+          <NumberRow label="重试间隔" unit="秒" value={draft.uploadRetryDelaySec} onChange={(value) => { setDraft({ ...draft, uploadRetryDelaySec: value }) }} />
+          <NumberRow label="报告文件数上限" summary="报告目录里有符号链接、文件数或总大小超过上限时不上传。" unit="个" value={draft.uploadMaxFiles} onChange={(value) => { setDraft({ ...draft, uploadMaxFiles: value }) }} />
+          <NumberRow label="报告总大小上限" unit="MB" value={draft.uploadMaxMb} onChange={(value) => { setDraft({ ...draft, uploadMaxMb: value }) }} />
+        </div>
+      </section>
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">回传记录</h2>
+        <div className="lz__list">
+          {analyze.reports.length === 0 ? <div className="lz__emptyRow">还没有带 logId 的分析请求。</div> : null}
+          {analyze.reports.map(report => <ReportRow key={report.id} report={report} busy={busy} onRetry={onRetry} />)}
+        </div>
+      </section>
+      <section className="lz__sec">
         <h2 className="lz__secTitle">调用方式</h2>
         <div className="lz__list">
           <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">地址</div><div className="lz__rowSummary lz__mono">POST {endpoint}</div></div></div>
           <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">请求头</div><div className="lz__rowSummary lz__mono">Authorization: Bearer &lt;令牌&gt; · Idempotency-Key: &lt;1-200 个可见 ASCII 字符&gt; · Content-Type: application/json</div></div></div>
-          <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">请求体</div><div className="lz__rowSummary lz__mono">requesterUserId, triggeredAt, app, errorCode, logDetails[{'{'}name, url{'}'}], chatId, prompt</div></div></div>
+          <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">请求体</div><div className="lz__rowSummary lz__mono">requesterUserId, triggeredAt, app, errorCode, logDetails[{'{'}name, url{'}'}], chatId, prompt, logId（可选，带上即回传报告）</div></div></div>
           <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">响应</div><div className="lz__rowSummary">202 已发出分析卡片（同一 Idempotency-Key 重试返回同一张卡片）；400/401/404/405/409/413/415 请求问题；403 目标群未授权；502 卡片发送失败；503 飞书未连接或令牌未设置。字段说明见观象 README。</div></div></div>
         </div>
       </section>

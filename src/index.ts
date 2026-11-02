@@ -13,12 +13,14 @@
  * `.agents/logalyze.yaml`。顶层 Agent 还可以用 `logalyze_add_repo` 在对话中
  * 添加仓库，并用 `logalyze_init_repo` / `logalyze_submit_init` 为缺少应用描述
  * 的仓库在工作区里起草并推送接入合并请求。另提供日志平台分析接口 `POST /open-api/logalyze`，
- * 经 dsh-channels 的 `feishuTopics` 服务在飞书群话题中开始分析。
+ * 经 dsh-channels 的 `feishuTopics` 服务在飞书群话题中开始分析；带 `logId` 的请求在
+ * 话题每轮结束后把报告目录交给回传命令。
  *
  * @module dsh-logalyze
  */
 
 import { mountAnalyzeRoute } from './analyze/server.ts'
+import { FEISHU_TOPICS_SERVICE } from './analyze/topics.ts'
 import { resolveConfig } from './config.ts'
 import type { HostContext } from './host.ts'
 import { DSH_REPOS_SERVICE, lookupRepos } from './repos/lookup.ts'
@@ -52,6 +54,8 @@ export { readAppManifest, MANIFEST_PATH } from './repos/manifest.ts'
 export { LogalyzeService } from './service.ts'
 export { ANALYZE_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_ROUTE } from './settings/contract.ts'
 export { analyzeRequestHash, parseAnalyzeRequest } from './analyze/contract.ts'
+export { ReportTracker } from './report/tracker.ts'
+export type { CommandRunner } from './report/command.ts'
 export type { AnalyzeAccepted, AnalyzeRefused, AnalyzeRequest } from './analyze/contract.ts'
 
 /** Cordis plugin name. */
@@ -85,13 +89,19 @@ export function apply(ctx: HostContext, config?: unknown, options: LogalyzePlugi
   service.registerSkill()
   service.registerTool()
   mountSettingsRoutes(ctx, service)
-  mountAnalyzeRoute(ctx, service.analyzeGate())
+  mountAnalyzeRoute(ctx, service.analyzeGate(), (request, key) => service.trackReport(request, key))
   ctx.effect(() => {
     void service.boot().catch((error: unknown) => {
       ctx.logger?.error?.('logalyze: 启动失败：%s', error instanceof Error ? error.message : String(error))
     })
     return () => { service.shutdown() }
   }, 'logalyze: repositories')
+  // Check reports waiting for their first turn whenever dsh-channels' service appears.
+  ctx.inject?.([FEISHU_TOPICS_SERVICE], () => {
+    void service.topicsAvailable().catch((error: unknown) => {
+      ctx.logger?.error?.('logalyze: 核对分析报告失败：%s', error instanceof Error ? error.message : String(error))
+    })
+  })
   // Sync again whenever dsh-repo's service appears, including after it reloads,
   // and after every host or token change made in it.
   ctx.inject?.([DSH_REPOS_SERVICE], (child) => {

@@ -45,6 +45,7 @@ const CSS = `
 .lz__input:focus{border-color:var(--lz-accent)}
 .lz__input--num{width:120px;text-align:right;font-variant-numeric:tabular-nums}
 .lz__input--wide{width:320px}
+.lz__textarea{height:auto;margin-top:6px;padding:6px 10px;line-height:18px;resize:vertical}
 .lz__check{width:16px;height:16px;margin:0;accent-color:var(--lz-accent);cursor:pointer}
 .lz__unit{min-width:36px;color:var(--lz-fg3);font-size:12px}
 .lz__addRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 14px}

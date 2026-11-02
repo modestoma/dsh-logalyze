@@ -114,6 +114,13 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
       email: logalyze@example.com
     analyze:                           # 日志平台分析接口，见下文
       enabled: false                   # 默认关闭
+      upload:                          # 报告回传（请求带 logId 时），见下文
+        command: [cli, log-analysis, upload, --log-id, '{logId}', --dir, '{dir}', --entry, '{entry}']
+        timeoutMs: 300000              # 单次上传超时
+        retries: 3                     # 失败后再试的次数
+        retryDelayMs: 60000            # 第一次重试前的等待，之后每次加倍
+        maxFiles: 200                  # 报告目录文件数上限
+        maxBytes: 209715200            # 报告目录总大小上限
     analyzeTokenRef: LOGALYZE_ANALYZE_TOKEN  # 接口访问令牌在 DSH 凭据库中的名称
 ```
 
@@ -135,7 +142,7 @@ DSH Web 左侧栏的「观象」入口打开整页设置面板：
 |---|---|
 | 应用仓库 | 仓库 https 地址列表（分支可选）、每个仓库的拉取状态、提交号、应用描述与不可用原因，单个或全部重新拉取，以及跳转到 dsh-repo 主机与令牌设置的按钮 |
 | 日志下载 | 允许下载的域名、单文件大小上限、下载超时 |
-| 分析接口 | [日志平台分析接口](#日志平台分析接口)的开关、访问令牌（只显示是否已设置）、飞书渠道是否就绪，以及调用地址与字段摘要 |
+| 分析接口 | [日志平台分析接口](#日志平台分析接口)的开关、访问令牌（只显示是否已设置）、飞书渠道是否就绪、[报告回传](#报告回传)的命令与上限、最近 50 份报告的回传记录（可手动重新上传），以及调用地址与字段摘要 |
 | 高级 | 更新间隔、单次应用数上限、派发超时、SKILL 改进开关与文件上限，恢复 cordis.yml 配置 |
 
 面板保存的值写入 `$DSH_HOME/logalyze/settings.json`（只保存与 cordis.yml 不同的字段），按与配置相同的规则校验；分析接口令牌存入 DSH 凭据库。面板接口 `/logalyze/*` 使用 DSH 自己的登录与来源校验，写操作另做同源校验。
@@ -222,7 +229,8 @@ Content-Type: application/json
     { "name": "设备 B 崩溃日志", "url": "https://logs.example.com/detail/2" }
   ],
   "chatId": "oc_xxx",
-  "prompt": "/logalyze https://logs.example.com/1.zip https://logs.example.com/2.zip 请分析这些日志"
+  "prompt": "/logalyze https://logs.example.com/1.zip https://logs.example.com/2.zip 请分析这些日志",
+  "logId": "LA-20261022-0001"
 }
 ```
 
@@ -231,8 +239,9 @@ Content-Type: application/json
 - `app` / `errorCode`：只允许 `A-Z a-z 0-9 . _ -`（1–128 字符），决定工作区 `<dsh_channels baseDir>/analyze/<app>/<errorCode>/`；同一应用同一错误码的所有分析都在这个工作区里，每次分析各有一个话题目录。
 - `logDetails`：触发分析的日志在日志平台上的详情页，1–50 条，每条 `name`（1–200 字符）+ `url`（http/https）。只在分析卡的表格里列出，观象不会访问这些地址。
 - `chatId`：目标群，必须是 dsh_channels 已授权的群（`/auth group add` 或其面板「访问与授权」），机器人需在群内；dsh_channels `accessMode: open` 时不校验。
-- `prompt`：1–100000 字符，原样作为首条用户消息，不追加任何内容。
-- 只接受以上 7 个字段，多余字段返回 400。
+- `prompt`：1–100000 字符，原样作为首条用户消息；带 `logId` 时最多 98000 字符，观象在后面追加一节「报告文件」，说明报告目录的写法（见[报告回传](#报告回传)），不带时不追加任何内容。
+- `logId`：可选，日志平台上这次分析的 id，1–128 个 `A-Z a-z 0-9 . _ -`，不能以 `-` 或 `.` 开头。带上后观象在每一轮结束时把报告回传给平台；它计入幂等指纹。
+- 只接受以上 8 个字段，多余字段返回 400。
 
 **响应**：校验通过、分析卡发出后立即返回 `202`：
 
@@ -246,9 +255,31 @@ Content-Type: application/json
 
 **群里看到的**：先是分析卡「@发起人 于 <triggeredAt> 发起了对 X 应用 Y 错误码不良日志的分析」，下面是日志详情页表格，标题栏标签为「分析中」；紧接着话题内一张流式卡片，首轮分析在这里流式输出，带停止按钮。首轮结束后分析卡的标签变成「已完成」「已停止」或「失败」；DSH 在首轮进行中重启时，重新连上飞书后仍是「分析中」的分析卡会改成「已中断」，在话题内回复即可继续。分析话题是群内共享的：群里任何通过 dsh_channels 准入的成员都可以在话题内追问、停止或回答审批卡。卡片、话题与权限的细节见 dsh_channels README 的「群话题服务（feishuTopics）」。
 
+## 报告回传
+
+请求带 `logId` 时，观象把分析结论整理成一个报告目录，在分析话题的每一轮结束后调用回传命令上传整个目录，平台网页端渲染其中的入口文件。
+
+**报告目录**：话题的实际工作目录下的 `report/`（`<dsh_channels baseDir>/analyze/<app>/<errorCode>/topics/<话题>/report/`）；话题没能建立时改用 `$DSH_HOME/logalyze/reports/<报告 id>/report/`。
+
+- 入口 `report.md` 只由观象生成：开头是应用、错误码、发起时间和首轮状态，接着是「分析结论」（首轮的最终回复），之后每有一轮追问就追加一节「追问 N」（用户的问题加这一轮的最终回复）。每次上传前按记录重写这个文件，模型写进目录的同名文件会被替换。
+- 其他文件由分析 Agent 写入：追加在 prompt 后的「报告文件」一节要求它把图片、日志片段、较长的分析过程等放进 `report/`，并在回复中用 `report/` 开头的相对路径引用。写入 `report.md` 时这些链接会去掉 `report/` 前缀，变成相对报告目录的路径。本轮新增或改动、回复里却没有引用的文件，追加在该节末尾的「本轮文件」里，图片内嵌，其他文件列成链接。
+- 回复里引用本机绝对路径、`report/` 以外的路径或不存在的文件时照常上传，并在回传记录里列出这些链接。
+- 首轮失败、被停止或话题没能建立时，「分析结论」写明状态和原因；DSH 在首轮进行中重启时写明已中断，在话题内回复继续后，后续轮次照常追加。
+
+**回传命令**：`analyze.upload.command` 是参数列表，不经过 shell 执行，工作目录是报告目录。`{logId}` 换成请求的 `logId`，`{dir}` 换成报告目录的绝对路径，`{entry}` 换成 `report.md`；命令必须包含 `{logId}` 和 `{dir}`，可执行文件本身不能含占位符。默认命令是 `cli log-analysis upload --log-id {logId} --dir {dir} --entry {entry}`，每一轮都以相同参数调用，由平台的 CLI 处理更新。命令在 DSH 进程的环境变量下运行，需要能在 `PATH` 中找到。
+
+**上传规则**：
+
+- 同一份报告的上传串行执行；上传进行中又有新的轮次结束时，结束后再上传一次最新内容。
+- 命令失败（非零退出、超时、找不到命令）后按 `retryDelayMs` 起步、每次加倍的间隔重试 `retries` 次；仍失败时停在「上传失败」，下一轮结束或在面板点「重新上传」时再试。
+- 报告目录里有符号链接或其他非普通文件，或者文件数、总大小超过 `maxFiles` / `maxBytes` 时不上传，回传记录写明原因，等内容变化或手动重新上传。
+- 回传记录保存在 `$DSH_HOME/logalyze/reports/`，DSH 重启后继续上传没有完成的报告，并核对仍在等待首轮的报告：首轮在观象未运行时结束的，「分析结论」注明没有记录到回复。
+
+**前提**：dsh_channels 的 `feishuTopics` 服务要提供话题状态查询（`state`、`launchKeyOf` 和 `feishu-topics/status` 事件）。旧版本 dsh_channels 没有这些功能时，接口照常接受请求，但报告不会回传，面板会提示升级。
+
 ## 通过飞书使用
 
-在飞书里使用 `/logalyze` 不需要观象与 [dsh_channels](https://github.com/modestoma/dsh_channels) 之间的任何接口：dsh_channels 把不在自己命令表中的 `/` 开头消息作为普通 prompt 交给 dsh，dsh 识别 `/logalyze` 后展开入口 SKILL。飞书附件的宿主路径会出现在消息里，入口 SKILL 会把它作为日志路径派发。只有[日志平台分析接口](#日志平台分析接口)经 dsh_channels 的 `feishuTopics` 服务发卡开话题；观象只在开发时依赖 dsh_channels 的类型，运行时按服务名查找，没有加载 dsh_channels 时其余功能不受影响。
+在飞书里使用 `/logalyze` 不需要观象与 [dsh_channels](https://github.com/modestoma/dsh_channels) 之间的任何接口：dsh_channels 把不在自己命令表中的 `/` 开头消息作为普通 prompt 交给 dsh，dsh 识别 `/logalyze` 后展开入口 SKILL。飞书附件的宿主路径会出现在消息里，入口 SKILL 会把它作为日志路径派发。只有[日志平台分析接口](#日志平台分析接口)经 dsh_channels 的 `feishuTopics` 服务发卡开话题；观象在 `src/analyze/feishu-topics.ts` 本地声明它用到的服务接口，不依赖 dsh_channels 的包，运行时按服务名查找，没有加载 dsh_channels 时其余功能不受影响。
 
 ## 开发
 
@@ -256,8 +287,6 @@ Content-Type: application/json
 pnpm install
 pnpm check        # 类型检查（Host 与 Client）+ 单元测试 + 构建 + 两个加载自检
 ```
-
-`@modesto_ma/dsh-channels` 是开发依赖，只用来引入 `feishuTopics` 服务的类型（`@modesto_ma/dsh-channels/topics`，`import type`），构建产物不包含它。
 
 ## 发布
 
@@ -281,7 +310,8 @@ pnpm check        # 类型检查（Host 与 Client）+ 单元测试 + 构建 + �
 | `src/dispatch/` | 派发工具、日志下载、子 Agent 首条消息与运行 |
 | `src/skill-update/` | SKILL 查看工具、SKILL 不足记录、改进工具与改进子 Agent 首条消息、工作区改动检查、推送与合并请求 |
 | `src/onboard/` | 在对话中添加仓库、在工作区起草应用描述与 SKILL、推送接入合并请求 |
-| `src/analyze/` | 日志平台分析接口：请求校验、令牌、到 `feishuTopics` 的转换 |
+| `src/analyze/` | 日志平台分析接口：请求校验、令牌、`feishuTopics` 接口声明与转换 |
+| `src/report/` | 报告回传：轮次记录、`report.md` 生成、目录检查、回传命令、持久化 |
 | `src/settings/` | 面板契约、覆盖文件、HTTP 路由 |
 | `src/client/` | 左侧栏入口与设置页面 |
 | `examples/order-service/` | 示例应用仓库 |

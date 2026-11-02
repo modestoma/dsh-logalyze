@@ -5,7 +5,8 @@
  * `Authorization: Bearer <令牌>`、`Idempotency-Key` 请求头和 JSON 请求体：
  * 发起人、触发时间、应用与错误码、日志详情页、目标群和提示词。合法请求把
  * 分析根卡片发进群并回 `202`，分析随后在卡片下的话题里流式进行。日志包由
- * 提示词调用的分析 SKILL 自行获取，详情页只列在卡片上。
+ * 提示词调用的分析 SKILL 自行获取，详情页只列在卡片上。带 `logId` 的请求在
+ * 分析结束后把报告目录交给回传命令（见 `../report/`）。
  *
  * @module dsh-logalyze/analyze/contract
  */
@@ -20,6 +21,13 @@ export const ANALYZE_MAX_BODY_BYTES = 1024 * 1024
 
 /** Largest accepted prompt, in characters. */
 export const ANALYZE_MAX_PROMPT_CHARS = 100_000
+
+/**
+ * Characters kept free in the prompt of a request with `logId` for the
+ * report section appended to it, so the launched prompt stays within the
+ * `feishuTopics` limit of {@link ANALYZE_MAX_PROMPT_CHARS}.
+ */
+export const REPORT_PROMPT_RESERVE = 2000
 
 /**
  * `Idempotency-Key` format: 1–200 visible ASCII characters without spaces, so
@@ -43,6 +51,12 @@ export const ANALYZE_MAX_LOG_DETAILS = 50
 /** Feishu group chat id (`oc_…`). */
 const CHAT_ID = /^oc_[A-Za-z0-9_-]{1,128}$/u
 
+/**
+ * Caller-side id of the analysis, passed to the upload command as one
+ * argument: path-safe characters only, never starting with `-` or `.`.
+ */
+export const LOG_ID_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/u
+
 /** JSON body of one analyze request. */
 export const analyzeRequestSchema = z.object({
   /** Feishu user_id of the person who started the analysis on the platform. */
@@ -65,7 +79,13 @@ export const analyzeRequestSchema = z.object({
   /** Prompt forwarded verbatim as the analysis Session's first user message. */
   prompt: z.string().min(1).max(ANALYZE_MAX_PROMPT_CHARS)
     .refine(value => value.trim() !== '', 'must not be blank'),
-}).strict()
+  /** Caller-side analysis id; present means the report is uploaded after every turn. */
+  logId: z.string().regex(LOG_ID_PATTERN, 'must be 1-128 of A-Z a-z 0-9 . _ - and start with a letter, digit, or _').optional(),
+}).strict().superRefine((request, issues) => {
+  if (request.logId !== undefined && request.prompt.length > ANALYZE_MAX_PROMPT_CHARS - REPORT_PROMPT_RESERVE) {
+    issues.addIssue({ code: 'custom', path: ['prompt'], message: `must be at most ${ANALYZE_MAX_PROMPT_CHARS - REPORT_PROMPT_RESERVE} characters when logId is given` })
+  }
+})
 
 /** One validated analyze request. */
 export type AnalyzeRequest = z.infer<typeof analyzeRequestSchema>
@@ -95,7 +115,8 @@ export interface AnalyzeResponse {
 /**
  * Fingerprint of one validated request, used to tell a retry of the same
  * request from a reused `Idempotency-Key`. Field order is fixed so stored
- * digests stay comparable.
+ * digests stay comparable; `logId` is appended only when present, so requests
+ * without it keep their earlier digests.
  * @param request - the validated request.
  * @returns SHA-256 hex digest.
  */
@@ -103,6 +124,7 @@ export function analyzeRequestHash(request: AnalyzeRequest): string {
   const canonical = JSON.stringify([
     request.requesterUserId, request.triggeredAt, request.app, request.errorCode,
     request.logDetails.map(detail => [detail.name, detail.url]), request.chatId, request.prompt,
+    ...request.logId === undefined ? [] : [request.logId],
   ])
   return createHash('sha256').update(canonical).digest('hex')
 }

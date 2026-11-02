@@ -1,6 +1,6 @@
 /**
  * 观象运行时：持有生效设置（cordis.yml + 面板覆盖）、应用注册表、入口
- * SKILL、派发工具、SKILL 查看与改进工具、仓库接入工具的注册，并为设置面板提供状态与写入口。
+ * SKILL、派发工具、SKILL 查看与改进工具、仓库接入工具的注册和分析报告回传，并为设置面板提供状态与写入口。
  *
  * @module dsh-logalyze/service
  */
@@ -10,8 +10,14 @@ import { z } from 'zod'
 import { applyOverlay, defaultsOf, describeIssue, editableSettingsSchema } from './config.ts'
 import type { LogalyzeConfig, SettingsOverlay } from './config.ts'
 import { abortable } from './abort.ts'
+import type { AnalyzeRequest } from './analyze/contract.ts'
+import { FEISHU_TOPICS_STATUS_EVENT } from './analyze/feishu-topics.ts'
 import type { AnalyzeGate } from './analyze/server.ts'
 import { FEISHU_TOPICS_SERVICE, lookupTopics } from './analyze/topics.ts'
+import type { CommandRunner } from './report/command.ts'
+import { defaultReportsDir, ReportStore } from './report/store.ts'
+import { ReportTracker } from './report/tracker.ts'
+import type { ReportTopics } from './report/tracker.ts'
 import { Dispatcher, inRunDirectory, isDelegatedAgent, isInside } from './dispatch/tool.ts'
 import type { HostApproval, HostContext, HostCredentials, ToolActivationContext, WorkingDirectoryService } from './host.ts'
 import { DSH_REPOS_SERVICE, lookupRepos, messageOf } from './repos/lookup.ts'
@@ -37,10 +43,15 @@ const tokenValue = z.string().trim()
   .refine(value => value.length > 0 && value.length <= MAX_TOKEN_LENGTH && !/[\u0000-\u001f\u007f]/.test(value), `令牌不能为空、超过 ${MAX_TOKEN_LENGTH} 个字符或包含换行等控制字符`)
 const tokenClearSchema = z.object({ tokenEnv: z.string() }).strict()
 const tokenSetSchema = tokenClearSchema.extend({ value: tokenValue }).strict()
+const reportRetrySchema = z.object({ id: z.string().regex(/^[0-9a-f]{24}$/u, '报告 id 不合法') }).strict()
 
 /** Optional seams for tests. */
 export interface ServiceOptions {
   readonly fetch?: typeof fetch
+  /** Report record directory; defaults to `$DSH_HOME/logalyze/reports`. */
+  readonly reportsDir?: string
+  /** Runs the upload command. */
+  readonly runCommand?: CommandRunner
 }
 
 /** Package files the service serves. */
@@ -62,6 +73,7 @@ export class LogalyzeService {
   private readonly adder: RepoAdder
   private readonly initializer: RepoInitializer
   private readonly skill: ReturnType<typeof createEntrySkillProvider>
+  private readonly reports: ReportTracker
   private active = true
   private readonly refreshWaitMs: number
   private readonly analyzeTokenRef: string
@@ -126,6 +138,13 @@ export class LogalyzeService {
       ...config.skillUpdateAuthor === undefined ? {} : { author: config.skillUpdateAuthor },
       ...options.fetch === undefined ? {} : { fetch: options.fetch },
     })
+    this.reports = new ReportTracker({
+      store: new ReportStore(options.reportsDir ?? defaultReportsDir(), message => ctx.logger?.warn?.(message)),
+      topics: () => this.reportTopics(),
+      upload: () => this.current.analyze.upload,
+      warn: message => ctx.logger?.warn?.(message),
+      ...options.runCommand === undefined ? {} : { run: options.runCommand },
+    })
     this.skill = createEntrySkillProvider({
       prepare: signal => this.prepareCatalog(signal),
       apps: () => this.registry.readyApps().map(ready => ready.app),
@@ -155,7 +174,9 @@ export class LogalyzeService {
   registerTool(): void {
     this.ctx.on('session/event', (session, event) => {
       if (event.type === 'turn/end') this.improver.turnEnded(session.header.id)
+      this.reports.sessionEvent(session, event)
     })
+    this.ctx.on(FEISHU_TOPICS_STATUS_EVENT, (state) => { this.reports.statusChanged(state) })
     this.ctx.effect(
       () => this.ctx.tools.register(this.dispatcher.definition(), { when: context => this.offersTool(context) }),
       'logalyze: dispatch tool',
@@ -245,6 +266,9 @@ export class LogalyzeService {
       this.ctx.logger?.warn?.('logalyze: 忽略面板设置：%s', read.error)
     }
     this.current = applyOverlay(this.defaults, this.overlay)
+    await this.reports.boot().catch((error: unknown) => {
+      this.ctx.logger?.error?.('logalyze: 读取回传记录失败：%s', messageOf(error))
+    })
     this.registry.configure(this.current.repos)
     await this.registry.syncAll()
   }
@@ -275,10 +299,54 @@ export class LogalyzeService {
     })
   }
 
-  /** Stop registering tools; in-flight syncs finish without side effects on the host. */
+  /** Stop registering tools and retrying uploads; in-flight syncs and uploads finish without side effects on the host. */
   shutdown(): void {
     this.active = false
+    this.reports.shutdown()
     this.booted.resolve()
+  }
+
+  /**
+   * Check reports waiting for their first turn against `feishuTopics`; called
+   * whenever the service appears.
+   * @returns when the check settled.
+   */
+  async topicsAvailable(): Promise<void> {
+    await this.booted.promise
+    if (!this.active) return
+    await this.reports.reconcile()
+  }
+
+  /**
+   * Start tracking the report of an accepted analyze request with `logId`.
+   * @param request - the validated request.
+   * @param key - its `Idempotency-Key`.
+   */
+  async trackReport(request: AnalyzeRequest & { readonly logId: string }, key: string): Promise<void> {
+    await this.booted.promise
+    await this.reports.track(request, key)
+  }
+
+  /**
+   * Upload one report again now.
+   * @param raw - request body `{ id }`.
+   * @returns the new panel state.
+   * @throws SettingsError when the body is invalid or the report is unknown.
+   */
+  async retryReport(raw: unknown): Promise<StateWire> {
+    const parsed = reportRetrySchema.safeParse(raw)
+    if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
+    if (!this.reports.retry(parsed.data.id)) throw new SettingsError(`没有这份报告：${parsed.data.id}`)
+    return await this.state()
+  }
+
+  /** The launch-state methods of the loaded `feishuTopics`, when it has them. */
+  private reportTopics(): ReportTopics | undefined {
+    const lookup = lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE))
+    if (lookup.availability !== 'ready') return undefined
+    const { service } = lookup
+    if (typeof service.state !== 'function' || typeof service.launchKeyOf !== 'function') return undefined
+    return { state: key => service.state?.(key), launchKeyOf: sessionId => service.launchKeyOf?.(sessionId) }
   }
 
   /** @returns current effective settings. */
@@ -323,6 +391,8 @@ export class LogalyzeService {
       tokenEnv: this.analyzeTokenRef,
       ...store === undefined ? {} : { token: await describeToken(store, this.analyzeTokenRef) },
       topics: lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE)).availability,
+      reportsSupported: this.reportTopics() !== undefined,
+      reports: this.reports.list(),
     }
   }
 

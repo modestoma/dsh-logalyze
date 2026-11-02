@@ -8,7 +8,7 @@
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import { z } from 'zod'
-import { TOKEN_ENV_PATTERN } from './settings/contract.ts'
+import { TOKEN_ENV_PATTERN, UPLOAD_PLACEHOLDERS } from './settings/contract.ts'
 import type { EditableSettings, RepoSpec } from './settings/contract.ts'
 
 /** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
@@ -74,8 +74,37 @@ const skillUpdatesSchema = z.object({
   maxFileBytes: z.number().int().min(1).max(16 * 1024 * 1024).default(256 * 1024),
 }).strict()
 
+/** Default upload command: the log platform's CLI. */
+export const DEFAULT_UPLOAD_COMMAND: readonly string[] = ['cli', 'log-analysis', 'upload', '--log-id', '{logId}', '--dir', '{dir}', '--entry', '{entry}']
+
+const PLACEHOLDER = /\{[^{}]*\}/g
+
+const uploadCommandSchema = z.array(z.string().min(1, '回传命令的参数不能为空').max(4096))
+  .min(1, '回传命令不能为空').max(64, '回传命令最多 64 个参数')
+  .superRefine((argv, issues) => {
+    for (const [index, arg] of argv.entries()) {
+      for (const token of arg.match(PLACEHOLDER) ?? []) {
+        if (!(UPLOAD_PLACEHOLDERS as readonly string[]).includes(token)) issues.addIssue({ code: 'custom', path: [index], message: `未知占位符 ${token}（可用 ${UPLOAD_PLACEHOLDERS.join(' ')}）` })
+      }
+    }
+    if ((argv[0] ?? '').match(PLACEHOLDER) !== null) issues.addIssue({ code: 'custom', path: [0], message: '可执行文件不能包含占位符' })
+    for (const required of ['{logId}', '{dir}']) {
+      if (!argv.some(arg => arg.includes(required))) issues.addIssue({ code: 'custom', message: `回传命令必须包含 ${required}` })
+    }
+  })
+
+const uploadSchema = z.object({
+  command: uploadCommandSchema.default([...DEFAULT_UPLOAD_COMMAND]),
+  timeoutMs: durationMs(1000).default(5 * 60 * 1000),
+  retries: z.number().int().min(0).max(20).default(3),
+  retryDelayMs: durationMs(1000).default(60 * 1000),
+  maxFiles: z.number().int().min(1).max(10_000).default(200),
+  maxBytes: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(200 * 1024 * 1024),
+}).strict()
+
 const analyzeSchema = z.object({
   enabled: z.boolean().default(false),
+  upload: uploadSchema.prefault({}),
 }).strict()
 
 const authorSchema = z.object({
@@ -219,7 +248,7 @@ export function defaultsOf(config: LogalyzeConfig): EditableSettings {
     dispatchTimeoutMs: config.dispatchTimeoutMs,
     download: { ...config.download, allowedHosts: [...config.download.allowedHosts] },
     skillUpdates: { ...config.skillUpdates },
-    analyze: { ...config.analyze },
+    analyze: { ...config.analyze, upload: { ...config.analyze.upload, command: [...config.analyze.upload.command] } },
   }
 }
 

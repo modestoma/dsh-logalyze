@@ -2,10 +2,10 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { FeishuTopicService, TopicLaunchResult, TopicLaunchSpec } from '@modesto_ma/dsh-channels/topics'
-import { analyzeRequestHash, parseAnalyzeRequest } from '../src/analyze/contract.ts'
+import type { FeishuTopicService, TopicLaunchResult, TopicLaunchSpec } from '../src/analyze/feishu-topics.ts'
+import { ANALYZE_MAX_PROMPT_CHARS, analyzeRequestHash, parseAnalyzeRequest, REPORT_PROMPT_RESERVE } from '../src/analyze/contract.ts'
 import type { AnalyzeRequest } from '../src/analyze/contract.ts'
-import { analyzeResponseOf, analyzeTopicSpec, lookupTopics } from '../src/analyze/topics.ts'
+import { analyzeResponseOf, analyzeTopicSpec, lookupTopics, REPORT_PROMPT_SECTION } from '../src/analyze/topics.ts'
 import { apply } from '../src/index.ts'
 import type { HostContext, HostCredentials } from '../src/host.ts'
 import type { StateWire } from '../src/settings/contract.ts'
@@ -76,7 +76,7 @@ async function harness(services: Record<string, unknown>, config: Record<string,
     inject: (deps, callback) => { if (deps.every(dep => all[dep] !== undefined)) callback(ctx) },
   }
   const { dir, cleanup } = await tempDir()
-  apply(ctx, config, { overlayPath: join(dir, 'settings.json') })
+  apply(ctx, config, { overlayPath: join(dir, 'settings.json'), reportsDir: join(dir, 'reports') })
   const server: Server = createServer((req, res) => {
     const handler = routes.get(new URL(req.url ?? '/', 'http://x').pathname)
     if (handler === undefined) {
@@ -143,6 +143,18 @@ describe('analyze contract', () => {
     })
   })
 
+  it('adds logId to the fingerprint only when present and asks for report files in the prompt', () => {
+    const withLogId = { ...REQUEST, logId: 'L-1' }
+    expect(analyzeRequestHash(withLogId)).not.toBe(analyzeRequestHash(REQUEST))
+    expect(parseAnalyzeRequest(withLogId)).toEqual({ ok: true, value: withLogId })
+    for (const logId of ['-x', '.x', 'a b', 'a/b', '']) expect(parseAnalyzeRequest({ ...REQUEST, logId }).ok).toBe(false)
+    const long = parseAnalyzeRequest({ ...withLogId, prompt: 'x'.repeat(ANALYZE_MAX_PROMPT_CHARS - REPORT_PROMPT_RESERVE + 1) })
+    expect(long.ok === false && long.error).toContain('prompt')
+    expect(REPORT_PROMPT_SECTION.length).toBeLessThan(REPORT_PROMPT_RESERVE)
+    expect(analyzeTopicSpec(withLogId, 'req-1').prompt).toBe(`${REQUEST.prompt}${REPORT_PROMPT_SECTION}`)
+    expect(REPORT_PROMPT_SECTION).toContain('report/')
+  })
+
   it('maps launch results to HTTP answers', () => {
     expect(analyzeResponseOf({ ok: true, replayed: true, chatId: 'oc_a', messageId: 'om_a' })).toEqual({ status: 202, body: { ok: true, chatId: 'oc_a', messageId: 'om_a' } })
     const status = (code: Exclude<TopicLaunchResult, { ok: true }>['code']): number => analyzeResponseOf({ ok: false, code, message: 'x' }).status
@@ -163,7 +175,7 @@ describe('analyze route', () => {
     const h = await harness({ credentials }, { analyze: { enabled: true } })
     expect(h.routes.has('/open-api/logalyze')).toBe(false)
     const state = await (await fetch(`${h.base}/logalyze/state`)).json() as StateWire
-    expect(state.analyze).toEqual({ route: '/open-api/logalyze', tokenEnv: 'LOGALYZE_ANALYZE_TOKEN', token: { tokenEnv: 'LOGALYZE_ANALYZE_TOKEN', configured: false, writable: true }, topics: 'missing' })
+    expect(state.analyze).toEqual({ route: '/open-api/logalyze', tokenEnv: 'LOGALYZE_ANALYZE_TOKEN', token: { tokenEnv: 'LOGALYZE_ANALYZE_TOKEN', configured: false, writable: true }, topics: 'missing', reportsSupported: false, reports: [] })
   })
 
   it('is not registered for an incompatible provider', async () => {
@@ -230,6 +242,21 @@ describe('analyze route', () => {
     expect(cleared.status).toBe(200)
     expect(credentials.stored.size).toBe(0)
     expect((await post(h.base, REQUEST)).status).toBe(503)
+  })
+
+  it('tracks the report of every accepted request with logId', async () => {
+    const credentials = fakeCredentials()
+    credentials.stored.set('LOGALYZE_ANALYZE_TOKEN', 'secret-token')
+    const topics = Object.assign(fakeTopics(), { state: () => undefined, launchKeyOf: () => undefined })
+    const h = await harness({ credentials, feishuTopics: topics }, { analyze: { enabled: true } })
+    expect((await post(h.base, REQUEST)).status).toBe(202)
+    expect((await post(h.base, { ...REQUEST, logId: 'L-1' }, { 'idempotency-key': 'req-2' })).status).toBe(202)
+    expect(topics.specs.at(-1)?.prompt).toBe(`${REQUEST.prompt}${REPORT_PROMPT_SECTION}`)
+    const state = await (await fetch(`${h.base}/logalyze/state`)).json() as StateWire
+    expect(state.analyze.reportsSupported).toBe(true)
+    expect(state.analyze.reports).toEqual([expect.objectContaining({ logId: 'L-1', app: 'order-service', errorCode: 'E1001', phase: 'pending', followups: 0, warnings: [] })])
+    const retried = await fetch(`${h.base}/logalyze/reports/upload`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'f'.repeat(24) }) })
+    expect(retried.status).toBe(400)
   })
 
   it('reads the token from the configured reference and answers 500 when the service throws', async () => {

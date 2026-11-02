@@ -20,9 +20,14 @@ interface Harness {
   base: string
   rejection: { value: 401 | 403 | undefined }
   /** Listeners registered for `session/event`. */
-  sessionListeners: Parameters<HostContext['on']>[1][]
+  sessionListeners: HostListener[]
+  /** Listeners registered for `feishu-topics/status`. */
+  statusListeners: HostListener[]
   dispose: () => Promise<void>
 }
+
+/** Any listener passed to `ctx.on`. */
+type HostListener = (...args: never[]) => void
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { await Promise.all(cleanups.splice(0).map(cleanup => cleanup())) })
@@ -41,6 +46,7 @@ async function harness(services: Record<string, unknown> = {}): Promise<Harness>
   const disposers: (() => void)[] = []
   const rejection: Harness['rejection'] = { value: undefined }
   const sessionListeners: Harness['sessionListeners'] = []
+  const statusListeners: Harness['statusListeners'] = []
   const webServer = { register: (route: { path: string; handler: Handler }) => { routes.set(route.path, route.handler); return () => { routes.delete(route.path) } } }
   const connection = { requestRejection: () => rejection.value }
   const ctx: HostContext = {
@@ -60,9 +66,10 @@ async function harness(services: Record<string, unknown> = {}): Promise<Harness>
     },
     subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('not used')) },
     get: (name: string) => ({ webServer, connection, ...services } as Record<string, unknown>)[name],
-    on: (_name, listener) => {
-      sessionListeners.push(listener)
-      return () => { sessionListeners.splice(sessionListeners.indexOf(listener), 1) }
+    on: (name: string, listener: HostListener) => {
+      const listeners = name === 'session/event' ? sessionListeners : statusListeners
+      listeners.push(listener)
+      return () => { listeners.splice(listeners.indexOf(listener), 1) }
     },
     effect: (callback) => {
       const dispose = callback()
@@ -84,7 +91,7 @@ async function harness(services: Record<string, unknown> = {}): Promise<Harness>
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`
   return {
-    ctx, repos, tools, skills, base, rejection, sessionListeners,
+    ctx, repos, tools, skills, base, rejection, sessionListeners, statusListeners,
     dispose: async () => {
       for (const dispose of disposers.reverse()) dispose()
       await new Promise(resolve => server.close(resolve))
@@ -125,8 +132,9 @@ describe('plugin', () => {
     expect(await submit!.when?.(step())).toBe(false)
     const [candidate] = await h.skills[0]!.list({})
     expect((await h.skills[0]!.get(candidate!, {}))?.content).toContain('`order-service`')
-    // The improvement tool counts finished turns from the Session event feed.
+    // The improvement tool and report tracking read the Session event feed; reports also follow launch states.
     expect(h.sessionListeners).toHaveLength(1)
+    expect(h.statusListeners).toHaveLength(1)
   })
 
   it('mentions SKILL improvement in /logalyze unless it is turned off', async () => {
