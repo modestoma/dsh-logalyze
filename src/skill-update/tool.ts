@@ -42,7 +42,7 @@ import { messageOf, requireRepos } from '../repos/lookup.ts'
 import { disablesUserInvocation, skillDir, skillNameOf } from '../repos/manifest.ts'
 import type { RepoRegistry } from '../repos/registry.ts'
 import type { AppManifest, EditableSettings } from '../settings/contract.ts'
-import { askApproval, pushChange } from './commit.ts'
+import { askApproval, pushChange, SKILL_COMMIT_PREFIX } from './commit.ts'
 import type { SubmitStatus } from './commit.ts'
 import { GAP_FILE, GAP_PREVIEW_CHARS, previewOf, readGap } from './gap.ts'
 import type { GapCheck } from './gap.ts'
@@ -54,9 +54,6 @@ import type { CheckedChanges, FileStat } from './workspace.ts'
 
 /** Longest commit subject and merge request title, including {@link SKILL_COMMIT_PREFIX}. */
 export const MAX_TITLE_CHARS = 120
-
-/** Conventional Commits prefix of every SKILL improvement commit subject and merge request title; no other type is allowed. */
-export const SKILL_COMMIT_PREFIX = 'chore: '
 
 /** A leading Conventional Commits type such as `feat:` or `fix(skill)!:`, removed from the reason's title. */
 const COMMIT_TYPE = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^()\r\n]*\))?!?\s*[:：]\s*/i

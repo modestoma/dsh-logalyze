@@ -187,7 +187,7 @@ skill: log-analysis             # 对应 .agents/skills/log-analysis/SKILL.md
 |---|---|---|
 | `logalyze_add_repo` | 总是 | 参数为仓库 https 地址和可选分支。经用户一次性授权后写入与面板相同的 `settings.json`，等待第一次拉取结束，返回应用可用、需要起草或拉取失败的原因。地址已在列表中时不请求授权，只重新拉取 |
 | `logalyze_init_repo` | 有仓库已拉取但缺少应用描述或 SKILL 时 | 参数为仓库地址、可选的用户说明和样例日志（`path` 或白名单内的 `url`）。经 `dshRepos` 在运行目录 `.logalyze/runs/<runId>/init/repo/` 打开最新同步提交的可写工作区，以它为工作目录启动一个起草子 Agent，首行用 `/logalyze-kit` 加载接入套件，直接在工作区写出 `.agents/logalyze.yaml` 和一个日志分析 SKILL（大型仓库按领域拆到 `references/`），说明写在工作区之外的 `init/reason.md`；结束后检查初稿并写出 `init/changes.diff`，不推送 |
-| `logalyze_submit_init` | 本会话有起草结果时 | 参数为起草的运行目录（`…/init`）。在其中找到工作区并重新检查初稿；工作区已经推送过时直接报告分支已存在。经用户一次性授权后把工作区的改动提交并推送到新分支 `logalyze/init-<应用 id>-<改动摘要前缀>`，并创建合入跟踪分支的合并请求 |
+| `logalyze_submit_init` | 本会话有起草结果时 | 参数为起草的运行目录（`…/init`）。在其中找到工作区并重新检查初稿；工作区已经推送过时直接报告分支已存在。经用户一次性授权后把工作区的改动提交并推送到新分支 `logalyze/init-<应用 id>-<改动摘要前缀>`，并创建合入跟踪分支的合并请求；提交说明首行和合并请求标题是 `chore: 接入观象日志分析：<应用名>（<应用 id>）` |
 
 **接入套件 `/logalyze-kit`。** 观象自带一个 SKILL，写明怎样为应用仓库编写应用描述和日志分析 SKILL：从代码和日志配置里找什么、`logalyze.yaml` 字段、SKILL.md 与 `references/` 的结构模板、约束和自检清单。正文在包内的 [skills/logalyze-kit/SKILL.md](skills/logalyze-kit/SKILL.md)，插件加载时读取，缺失或不合法时加载失败。它在任何目录都列出（包括子 Agent 所在的仓库快照），只能由用户输入或首行手势加载，模型不会自行选用。开发者也可以在自己的仓库里运行 dsh，输入 `/logalyze-kit` 直接编写或改进 SKILL。
 

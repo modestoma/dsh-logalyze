@@ -288,9 +288,9 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
       '.agents/skills/order-logs/SKILL.md': SKILL,
       '.agents/skills/order-logs/references/payment.md': '# 支付回调\n',
     })
-    expect(push?.message).toMatch(new RegExp(`^接入观象日志分析：订单服务（billing-service）\\n\\n按 Controller[\\s\\S]*Base-commit: ${value.commit}\\n`))
+    expect(push?.message).toMatch(new RegExp(`^chore: 接入观象日志分析：订单服务（billing-service）\\n\\n按 Controller[\\s\\S]*Base-commit: ${value.commit}\\n`))
     expect(git(origin, 'rev-parse', `${opened.branch}^`).trim()).toBe(value.commit)
-    expect(createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ title: '接入观象日志分析：订单服务（billing-service）', sourceBranch: opened.branch, targetBranch: 'main' }))
+    expect(createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ title: 'chore: 接入观象日志分析：订单服务（billing-service）', sourceBranch: opened.branch, targetBranch: 'main' }))
     expect(renderSubmitInitValue(opened)[0]?.text).toContain('合并后观象下一次加载 /logalyze 时启用应用 billing-service')
 
     // The workspace already pushed its branch; submitting again neither asks nor pushes.
