@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Mock } from 'vitest'
 import { defaultsOf, resolveConfig } from '../src/config.ts'
-import type { Agent, ApprovalOutcome, ApprovalRequest, HostApproval, SubagentActivation, SubagentResult, SubagentService } from '../src/host.ts'
+import type { Agent, SubagentActivation, SubagentResult, SubagentService } from '../src/host.ts'
 import { RepoRegistry } from '../src/repos/registry.ts'
 import type { EditableSettings } from '../src/settings/contract.ts'
 import type { ChangeCreate, WorkspaceChanges, WorkspaceFileChange } from '../src/repos/contract.ts'
@@ -159,14 +159,17 @@ interface Setup {
   improver: SkillImprover
   settings: EditableSettings
   agent: Agent
-  approval: { requests: ApprovalRequest[]; request: Mock<HostApproval['request']> }
-  answer: { value: ApprovalOutcome }
   repos: ReturnType<typeof fakeRepos>
   started: Started[]
   skill: string
+  root: string
 }
 
-async function setup(): Promise<Setup> {
+/**
+ * An improver that remembers one finished analysis of the order service with a gap record.
+ * @param endTurn - whether the turn that dispatched the analysis has ended.
+ */
+async function setup(endTurn = true): Promise<Setup> {
   const root = await dir()
   const origin = await createAppRepo(join(root, 'order-service'))
   const settings: EditableSettings = {
@@ -179,9 +182,6 @@ async function setup(): Promise<Setup> {
   registry.configure(settings.repos)
   await registry.syncAll()
   const [ready] = registry.readyApps()
-  const answer: Setup['answer'] = { value: 'allowed-once' }
-  const requests: ApprovalRequest[] = []
-  const approval = { requests, request: vi.fn(async (req: ApprovalRequest) => { requests.push(req); return answer.value }) }
   const { service, started } = fakeSubagents()
   const improver = new SkillImprover({
     registry,
@@ -190,7 +190,6 @@ async function setup(): Promise<Setup> {
     settings: () => settings,
     workingDirectory: () => undefined,
     author: { name: '观象', email: 'logalyze@example.com' },
-    approval: () => approval,
     repos: () => repos.service,
     now: () => new Date(2026, 9, 31, 22, 0, 0),
   })
@@ -199,9 +198,10 @@ async function setup(): Promise<Setup> {
   await writeFile(join(workDir, 'skill-gap.md'), GAP)
   const task: AnalyzedTask = { workDir, sessionId: 'parent', app: ready!.app, url: origin, commit: ready!.commit, question: '21 点下单报 500', output: '根因：促销商品没有 SKU', logs: ['/logs/order.log'] }
   expect(await improver.inspect(task)).toEqual({ ok: true, path: join(workDir, 'skill-gap.md'), preview: 'SKILL 没写日志第四列是 traceId，靠 grep 才串起请求。 关键日志：<ts> ERROR [<trace>] OrderController' })
+  if (endTurn) improver.turnEnded('parent')
   const agent: Agent = { id: 'parent', session: { header: { id: 'parent', cwd: join(root, 'project') } } }
   const skill = await readFile(join(origin, SKILL), 'utf8')
-  return { origin, registry, task, improver, settings, agent, approval, answer, repos, started, skill }
+  return { origin, registry, task, improver, settings, agent, repos, started, skill, root }
 }
 
 /** The improvement run directory holding a child's workspace. */
@@ -232,31 +232,32 @@ async function finishChild(started: Started[], index: number, files: Record<stri
 
 const IN_SKILL = (path: string) => `.agents/skills/log-analysis/${path}`
 
+const escape = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
 describe('logalyze_improve_skill', () => {
-  it('asks first, then drafts a case with the improvement child and opens a merge request without asking again', async () => {
-    const { origin, registry, task, improver, agent, approval, repos, started, skill } = await setup()
+  it('drafts a case with the improvement child and opens a merge request without asking', async () => {
+    const { origin, registry, task, improver, agent, repos, started, skill } = await setup()
     const exec = { signal: new AbortController().signal, agent, callId: 'call-1' }
-    const running = improver.execute({ workDir: task.workDir }, exec)
+    const running = improver.execute({ app: 'order-service' }, exec)
     await waitForStarts(started, 1)
-    const [request] = approval.requests
-    expect(request).toMatchObject({ agent, toolName: 'logalyze_improve_skill', callId: 'call-1', signal: exec.signal })
-    expect(request?.displayReason?.zh).toContain('观象分析「订单服务」的日志时发现 SKILL 有不足：SKILL 没写日志第四列是 traceId')
-    expect(request?.displayReason?.zh).toContain(`是否改进 SKILL？同意后，观象会把这次问题整理为案例写入 .agents/skills/log-analysis/cases/ 并修改 SKILL，然后推送到 ${origin} 的新分支、创建合并请求合入 main`)
 
     const [child] = started
     const status = registry.status()[0]!
     expect(child?.spec).toMatchObject({ provider: 'spawn', label: '订单服务 SKILL 改进', delivery: 'caller', request: { parent: agent, maxDepth: 1 } })
     const improveDir = improveDirOf(child!)
-    expect(improveDir).toMatch(new RegExp(`^${task.workDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/improve-[0-9a-f]{6}$`))
+    expect(improveDir).toMatch(new RegExp(`^${escape(join(agent.session.header.cwd as string, '.logalyze', 'runs'))}/20261031-220000-[0-9a-f]{6}/improve-[0-9a-f]{6}$`))
     expect(child?.spec.request.cwd).toBe(join(improveDir, 'repo'))
     // The workspace is a checkout of the latest synced commit, without git metadata inside it.
     expect(await readFile(join(improveDir, 'repo', SKILL), 'utf8')).toBe(skill)
     expect(await stat(join(improveDir, 'repo', '.git')).then(() => true, () => false)).toBe(false)
     const prompt = child?.spec.request.prompt[0]?.text as string
     expect(prompt.split('\n')[0]).toBe('/logalyze-improve')
-    expect(prompt).toContain('## 分析时的问题\n\n21 点下单报 500')
-    expect(prompt).toContain('## 分析结论\n\n根因：促销商品没有 SKU')
+    expect(prompt).toContain('本会话的一次日志分析之后，分析子 Agent 认为这个 SKILL 没能很好地覆盖遇到的问题，用户同意改进。下面列出的所有改进点都在这一次修改中完成。')
+    expect(prompt).toContain(`## 分析 1\n\n运行目录：\`${task.workDir}\``)
+    expect(prompt).toContain('### 问题\n\n21 点下单报 500')
+    expect(prompt).toContain('### 结论\n\n根因：促销商品没有 SKU')
     expect(prompt).toContain(`记录写在 \`${join(task.workDir, 'skill-gap.md')}\`，先读它。`)
+    expect(prompt).not.toContain('## 分析 2')
     expect(prompt).toContain('- `/logs/order.log`')
     expect(prompt).toContain('当前工作目录是该应用代码仓库在提交')
     expect(prompt).toContain('不写 `feat:`、`fix:` 等类型前缀，观象提交时统一加上 `chore: `')
@@ -272,7 +273,7 @@ describe('logalyze_improve_skill', () => {
       status: 'opened',
       app: 'order-service',
       repo: origin,
-      workDir: task.workDir,
+      workDirs: [task.workDir],
       improveDir,
       target: 'main',
       mergeRequestUrl: MR_URL,
@@ -281,9 +282,7 @@ describe('logalyze_improve_skill', () => {
       output: '- SKILL.md：补充 traceId\n- cases/2026-10-31-trace-id.md：新增案例',
     })
     expect(value.branch).toMatch(/^logalyze\/skill-order-service-[0-9a-f]{10}$/)
-    expect(value.diffPath).toBe(join(improveDir, 'changes.diff'))
     expect(await readFile(value.diffPath!, 'utf8')).toContain('+# traceId 串联')
-    expect(approval.request).toHaveBeenCalledTimes(1)
     expect(child?.dispose).toHaveBeenCalledTimes(1)
     expect(registry.status()[0]?.activeRuns).toBe(0)
     expect(repos.pushWorkspace).toHaveBeenCalledWith(join(improveDir, 'repo'), {
@@ -310,28 +309,76 @@ describe('logalyze_improve_skill', () => {
     expect(text).toContain('改进子 Agent 的说明：\n- SKILL.md：补充 traceId')
   })
 
-  it('starts nothing unless the user agrees', async () => {
-    const { task, improver, agent, answer, repos, started } = await setup()
+  it('merges every improvement point of an application into one child', async () => {
+    const { root, origin, task, improver, agent, repos, started, skill } = await setup(false)
+    const second = join(root, 'project', '.logalyze', 'runs', 'r2', '1-order-service')
+    const quiet = join(root, 'project', '.logalyze', 'runs', 'r3', '1-order-service')
+    for (const path of [second, quiet]) await mkdir(path, { recursive: true })
+    await writeFile(join(second, 'skill-gap.md'), 'SKILL 没写库存服务的超时阈值')
+    await improver.inspect({ ...task, workDir: second, question: '库存扣减超时', output: '根因：库存服务慢', logs: ['/logs/order.log', '/logs/stock.log'] })
+    // An analysis without a gap record is not an improvement point by itself.
+    await improver.inspect({ ...task, workDir: quiet, question: '无关问题', output: '正常' })
+    improver.turnEnded('parent')
+    const feedback = '另外日志时间是 UTC'
+    const running = improver.execute({ app: 'order-service', feedback }, { signal: new AbortController().signal, agent })
+    await waitForStarts(started, 1)
+    const prompt = started[0]?.spec.request.prompt[0]?.text as string
+    expect(prompt).toContain('本会话的 2 次日志分析之后')
+    expect(prompt).toContain(`## 分析 1\n\n运行目录：\`${task.workDir}\``)
+    expect(prompt).toContain(`## 分析 2\n\n运行目录：\`${second}\``)
+    expect(prompt).toContain(`记录写在 \`${join(second, 'skill-gap.md')}\``)
+    expect(prompt).not.toContain(quiet)
+    expect(prompt).toContain(`## 用户反馈\n\n${feedback}`)
+    expect(prompt).toContain('- `/logs/order.log`\n- `/logs/stock.log`\n')
+    expect(prompt).toContain('每个不同的问题一个案例，几次分析是同一个问题时只写一个')
+
+    await finishChild(started, 0, { [SKILL]: `${skill}\n超时阈值 3s。\n`, [IN_SKILL(CASE)]: '# c\n' })
+    const value = await running
+    expect(value).toMatchObject({ status: 'opened', workDirs: [task.workDir, second] })
+    expect(started).toHaveLength(1)
+    expect(repos.service.pushes[0]?.message).toContain(`Analyzed-commit: ${task.commit}\n`)
+    expect(repos.service.pushes[0]?.message).not.toMatch(/Analyzed-commit[^\n]*\nAnalyzed-commit/)
+    expect(repos.createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ body: expect.stringMatching(/分析提交 [0-9a-f]{12}，会话 parent/) }))
+  })
+
+  it('waits for the turn that dispatched the analysis to end and starts one improvement per application and turn', async () => {
+    const { task, improver, agent, started } = await setup(false)
     const exec = { signal: new AbortController().signal, agent }
-    answer.value = 'unavailable'
-    expect(await improver.execute({ workDir: task.workDir }, exec)).toEqual({ status: 'unavailable', app: 'order-service', repo: task.url, workDir: task.workDir })
-    answer.value = 'rejected'
-    const rejected = await improver.execute({ workDir: task.workDir }, exec)
-    expect(rejected.status).toBe('rejected')
-    expect(renderImproveValue(rejected)[0]?.text).toContain('用户不改进这次的 SKILL，没有起草也没有提交')
+    await expect(improver.execute({ app: 'order-service' }, exec)).rejects.toThrow('应用「order-service」的分析是本回合派发的：先把分析结论回复给用户')
+    await expect(improver.execute({ app: 'order-service', feedback: 'x' }, exec)).rejects.toThrow('是本回合派发的')
+    // Another session's turn does not end this one.
+    improver.turnEnded('other')
+    await expect(improver.execute({ app: 'order-service' }, exec)).rejects.toThrow('是本回合派发的')
     expect(started).toHaveLength(0)
-    expect(repos.pushWorkspace).not.toHaveBeenCalled()
+
+    improver.turnEnded('parent')
+    const first = improver.execute({ app: 'order-service' }, exec)
+    await waitForStarts(started, 1)
+    await expect(improver.execute({ app: 'order-service', feedback: 'x' }, exec)).rejects.toThrow('应用「order-service」的 SKILL 改进正在进行')
+    started[0]!.settle({ stopReason: 'error', output: [], diagnostic: '模型出错' })
+    expect((await first).status).toBe('failed')
+    await expect(improver.execute({ app: 'order-service', feedback: 'x' }, exec)).rejects.toThrow('本回合已经为应用「order-service」发起过一次 SKILL 改进')
+
+    // A used analysis, even a failed one, is not picked again unless named.
+    improver.turnEnded('parent')
+    await expect(improver.execute({ app: 'order-service' }, exec)).rejects.toThrow('本会话中应用「order-service」没有待改进的 skill-gap.md 记录')
+    const retry = improver.execute({ app: 'order-service', workDirs: [task.workDir] }, exec)
+    await waitForStarts(started, 2)
+    expect(started[1]?.spec.request.prompt[0]?.text).toContain(`## 分析 1\n\n运行目录：\`${task.workDir}\``)
+    started[1]!.settle({ stopReason: 'completed', output: [] })
+    expect((await retry).status).toBe('failed')
   })
 
   it('reports an improvement that produced nothing submittable', async () => {
-    const { task, improver, agent, approval, repos, started, skill } = await setup()
+    const { task, improver, agent, repos, started, skill } = await setup()
     const exec = { signal: new AbortController().signal, agent }
     const attempt = async (index: number, arrange: () => Promise<unknown>) => {
-      const running = improver.execute({ workDir: task.workDir }, exec)
+      const running = improver.execute({ app: 'order-service', workDirs: [task.workDir] }, exec)
       await arrange()
       const value = await running
       expect(value.status).toBe('failed')
       expect(started[index]?.dispose).toHaveBeenCalledTimes(1)
+      improver.turnEnded('parent')
       return value
     }
     const nothing = await attempt(0, () => finishChild(started, 0, {}, REASON, ''))
@@ -355,7 +402,6 @@ describe('logalyze_improve_skill', () => {
       started[last]!.settle({ stopReason: 'error', output: [], diagnostic: '模型出错' })
     })
     expect(stopped.error).toBe('改进子 Agent 没有完成（error：模型出错）')
-    expect(approval.request).toHaveBeenCalledTimes(last + 1)
     expect(repos.pushWorkspace).not.toHaveBeenCalled()
   })
 
@@ -363,14 +409,14 @@ describe('logalyze_improve_skill', () => {
     const { task, improver, agent, repos, started } = await setup()
     const exec = { signal: new AbortController().signal, agent }
     repos.state.changeError = Object.assign(new Error('令牌没有权限'), { name: 'RepoError', code: 'forbidden' })
-    const running = improver.execute({ workDir: task.workDir }, exec)
+    const running = improver.execute({ app: 'order-service' }, exec)
     await finishChild(started, 0, { [IN_SKILL(CASE)]: '# c\n' })
     const pushed = await running
     expect(pushed).toMatchObject({ status: 'pushed', mergeRequestError: '令牌没有权限' })
     expect(renderImproveValue(pushed)[0]?.text).toContain('创建合并请求失败（令牌没有权限）')
 
-    await improver.inspect(task)
-    const again = improver.execute({ workDir: task.workDir }, exec)
+    improver.turnEnded('parent')
+    const again = improver.execute({ app: 'order-service', workDirs: [task.workDir] }, exec)
     await finishChild(started, 1, { [IN_SKILL(CASE)]: '# c\n' })
     const exists = await again
     expect(exists).toMatchObject({ status: 'exists', branch: pushed.branch })
@@ -380,69 +426,58 @@ describe('logalyze_improve_skill', () => {
     expect(renderImproveValue(exists)[0]?.text).toContain('已存在，同一改动可能已经提交过')
   })
 
-  it('refuses calls it cannot serve before asking', async () => {
+  it('refuses calls it cannot serve before starting a child', async () => {
     const { registry, task, improver, agent, settings, repos, started } = await setup()
     const exec = { signal: new AbortController().signal, agent }
-    const args = { workDir: task.workDir }
-    await expect(improver.execute({ workDir: '/elsewhere' }, exec)).rejects.toThrow('不是本次 DSH 运行中已完成的观象派发任务')
-    await expect(improver.execute({ workDir: task.workDir, app: 'order-service' }, exec)).rejects.toThrow('workDir 和 app 必须给出且只能给出一个')
-    await expect(improver.execute({}, exec)).rejects.toThrow('workDir 和 app 必须给出且只能给出一个')
-    await expect(improver.execute({ app: 'order-service' }, exec)).rejects.toThrow('按 app 改进时需要 feedback')
+    const args = { app: 'order-service' }
+    await expect(improver.execute({ app: 'order-service', workDirs: ['/elsewhere'] }, exec)).rejects.toThrow('不是本次 DSH 运行中已完成的观象派发任务')
+    await expect(improver.execute({}, exec)).rejects.toThrow('参数不合法')
+    await expect(improver.execute({ app: 'order-service', workDirs: [] }, exec)).rejects.toThrow('workDirs 给出时不能为空')
     await expect(improver.execute({ app: 'missing', feedback: 'x' }, exec)).rejects.toThrow('missing')
     await expect(improver.execute({ app: 'order-service', feedback: 'x', logs: [{ path: '/nonexistent.log' }] }, exec)).rejects.toThrow('日志路径不可读')
-    await expect(improver.execute(args, { ...exec, agent: { id: 'other', session: { header: { id: 'other' } } } })).rejects.toThrow('不是当前会话派发的任务')
+    await expect(improver.execute({ ...args, workDirs: [task.workDir] }, { ...exec, agent: { id: 'other', session: { header: { id: 'other' } } } })).rejects.toThrow('不是当前会话派发的任务')
     await expect(improver.execute(args, { ...exec, agent: { id: 'child', session: { header: { id: 'parent', delegationDepth: 1 } } } })).rejects.toThrow('不能在子 Agent 中调用')
     await expect(improver.execute({ ...args, extra: 1 }, exec)).rejects.toThrow('参数不合法')
     settings.skillUpdates = { ...settings.skillUpdates, enabled: false }
     await expect(improver.execute(args, exec)).rejects.toThrow('未开启')
     settings.skillUpdates = { ...settings.skillUpdates, enabled: true }
 
-    const approval = { request: vi.fn(async () => 'allowed-once' as const) }
-    const deps = { registry, subagents: fakeSubagents().service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined }
-    const withoutApproval = new SkillImprover({ ...deps, approval: () => undefined, repos: () => repos.service })
-    await withoutApproval.inspect(task)
-    await expect(withoutApproval.execute(args, exec)).rejects.toThrow('没有审批服务')
-    const withoutRepos = new SkillImprover({ ...deps, approval: () => approval, repos: () => undefined })
+    const other = join(dirname(task.workDir), '2-billing')
+    await mkdir(other, { recursive: true })
+    await improver.inspect({ ...task, workDir: other, app: { ...task.app, id: 'billing' } })
+    improver.turnEnded('parent')
+    await expect(improver.execute({ ...args, workDirs: [other] }, exec)).rejects.toThrow(`${other} 分析的是应用「billing」，不是「order-service」`)
+
+    const withoutRepos = new SkillImprover({ registry, subagents: fakeSubagents().service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: () => undefined })
     await withoutRepos.inspect(task)
+    withoutRepos.turnEnded('parent')
     await expect(withoutRepos.execute(args, exec)).rejects.toThrow('需要 dsh-repo 插件提供的 dshRepos 服务')
     await rm(join(task.workDir, 'skill-gap.md'))
-    await expect(improver.execute(args, exec)).rejects.toThrow('这次分析没有 skill-gap.md，需要在 feedback 中写明')
-    expect(approval.request).not.toHaveBeenCalled()
+    await expect(improver.execute(args, exec)).rejects.toThrow('本会话中应用「order-service」没有待改进的 skill-gap.md 记录，需要在 feedback 中写明')
+    await expect(improver.execute({ ...args, workDirs: [task.workDir] }, exec)).rejects.toThrow('没有待改进的 skill-gap.md 记录')
     expect(started).toHaveLength(0)
-  })
-
-  it('stops when the question is withdrawn by cancellation', async () => {
-    const { task, improver, agent, answer, started } = await setup()
-    const controller = new AbortController()
-    controller.abort(new Error('turn cancelled'))
-    answer.value = 'cancelled'
-    await expect(improver.execute({ workDir: task.workDir }, { signal: controller.signal, agent })).rejects.toThrow('turn cancelled')
-    expect(started).toHaveLength(0)
-    answer.value = 'unavailable'
-    expect((await improver.execute({ workDir: task.workDir }, { signal: new AbortController().signal, agent })).status).toBe('unavailable')
+    expect(repos.pushWorkspace).not.toHaveBeenCalled()
   })
 
   it('tells the child when the repository moved on since the analysis', async () => {
     const { task, improver, agent, started } = await setup()
-    const moved = { ...task, commit: 'a'.repeat(40) }
-    await improver.inspect(moved)
-    const running = improver.execute({ workDir: task.workDir }, { signal: new AbortController().signal, agent })
+    await improver.inspect({ ...task, commit: 'a'.repeat(40) })
+    improver.turnEnded('parent')
+    const running = improver.execute({ app: 'order-service' }, { signal: new AbortController().signal, agent })
     await waitForStarts(started, 1)
-    expect(started[0]?.spec.request.prompt[0]?.text).toContain(`分析时的提交是 \`${'a'.repeat(12)}\`，之后仓库有更新`)
+    expect(started[0]?.spec.request.prompt[0]?.text).toContain(`这次分析时的提交是 \`${'a'.repeat(12)}\`，之后仓库有更新`)
     started[0]?.settle({ stopReason: 'completed', output: [] })
     expect((await running).status).toBe('failed')
   })
 
   it('corrects a SKILL record the analysis followed when the user points out it is wrong', async () => {
-    const { task, improver, agent, approval, repos, started, skill } = await setup()
+    const { task, improver, agent, repos, started, skill } = await setup()
     await rm(join(task.workDir, 'skill-gap.md'))
     const feedback = 'SKILL 里说 503 是库存服务的问题，其实是网关限流，看 X-RateLimit 头'
-    const running = improver.execute({ workDir: task.workDir, feedback }, { signal: new AbortController().signal, agent })
+    const running = improver.execute({ app: 'order-service', workDirs: [task.workDir], feedback }, { signal: new AbortController().signal, agent })
     await waitForStarts(started, 1)
-    expect(approval.requests[0]?.displayReason?.zh).toContain(`用户要求改进「订单服务」的日志分析 SKILL：${feedback}`)
-    expect(approval.requests[0]?.displayReason?.zh).not.toContain('发现 SKILL 有不足')
     const prompt = started[0]?.spec.request.prompt[0]?.text as string
-    expect(prompt).toContain('用户指出 SKILL 的记录有问题，用户同意改进。')
+    expect(prompt).toContain('本会话的一次日志分析之后，用户指出 SKILL 的记录有问题，用户同意改进。')
     expect(prompt).toContain('分析子 Agent 当时没有发现 SKILL 的不足，是按 SKILL 现有的记录分析的；改进的依据是下面的用户反馈。')
     expect(prompt).toContain(`## 用户反馈\n\n${feedback}`)
     expect(prompt).toContain('已有案例描述的是同一个问题时更新它')
@@ -450,35 +485,33 @@ describe('logalyze_improve_skill', () => {
     // A correction after an analysis still has to record the case.
     await finishChild(started, 0, { [SKILL]: `${skill}\n503 来自网关限流。\n` })
     const value = await running
-    expect(value).toMatchObject({ status: 'failed', error: '改动中没有新增或修改案例文件 cases/<日期>-<slug>.md' })
+    expect(value).toMatchObject({ status: 'failed', workDirs: [task.workDir], error: '改动中没有新增或修改案例文件 cases/<日期>-<slug>.md' })
     expect(repos.pushWorkspace).not.toHaveBeenCalled()
   })
 
   it('improves a SKILL from user feedback alone, with sample logs and no case required', async () => {
-    const { origin, task, improver, agent, approval, repos, started, skill } = await setup()
+    const { origin, task, improver, agent, repos, started, skill } = await setup()
+    // Without a gap record the earlier analysis is not picked up.
+    await rm(join(task.workDir, 'skill-gap.md'))
     const project = agent.session.header.cwd as string
     await writeFile(join(project, 'sample.log'), 'line')
     const exec = { signal: new AbortController().signal, agent }
     const running = improver.execute({ app: 'order-service', feedback: '日志时间是 UTC，不是北京时间', logs: [{ path: 'sample.log' }] }, exec)
     await waitForStarts(started, 1)
-    expect(approval.requests[0]?.displayReason?.zh).toContain(`是否改进 SKILL？同意后，观象会按反馈修改 SKILL，然后推送到 ${origin} 的新分支`)
     const prompt = started[0]?.spec.request.prompt[0]?.text as string
     expect(prompt).toContain('用户要求改进这个 SKILL，用户的反馈见下文。')
-    expect(prompt).not.toContain('## 分析时的问题')
+    expect(prompt).not.toContain('## 分析 1')
     expect(prompt).toContain(`- \`${join(project, 'sample.log')}\``)
     expect(prompt).toContain('只是修正或补充 SKILL 的说明时，可以不写案例。')
-    const improveDir = improveDirOf(started[0]!)
-    expect(improveDir).toMatch(new RegExp(`^${join(project, '.logalyze', 'runs').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/20261031-220000-[0-9a-f]{6}/improve-[0-9a-f]{6}$`))
 
     await finishChild(started, 0, { [SKILL]: `${skill}\n时间是 UTC。\n` }, 'fix(skill)!: 修正日志时区说明\n\n- SKILL.md：时间是 UTC')
     const value = await running
     expect(value).toMatchObject({ status: 'opened', files: [{ path: SKILL, added: 2, removed: 0 }] })
-    expect(value.workDir).toBeUndefined()
+    expect(value.workDirs).toBeUndefined()
     const [push] = repos.service.pushes
     expect(push?.message).toBe('chore: 修正日志时区说明\n\nfix(skill)!: 修正日志时区说明\n\n- SKILL.md：时间是 UTC\n\nProposed-by: 观象 Logalyze\n')
     expect(push?.session).toBe('parent')
     expect(repos.createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ title: 'chore: 修正日志时区说明', body: expect.stringMatching(/^由观象按用户反馈提出（应用 order-service，会话 parent）。请评审 SKILL 修改。/) }))
-    expect(task.workDir).not.toBe(improveDir)
   })
 })
 

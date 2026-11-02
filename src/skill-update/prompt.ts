@@ -1,9 +1,10 @@
 /**
  * SKILL 改进子 Agent 的首条消息。首行的 `/logalyze-improve` 由 DSH 的 skill
  * 手势确定性注入观象自带的改进指南（怎样写案例、怎样改 SKILL）；其余部分只
- * 给出本次运行的信息：应用、改进的依据（一次分析的问题、结论与 SKILL 不足
- * 记录，以及用户的反馈）、日志、工作区与运行目录和文件数上限。子 Agent 的工作
- * 目录是可写工作区，它直接修改其中的 SKILL 目录。
+ * 给出本次运行的信息：应用、改进的依据（本会话中该应用的若干次分析的问题、
+ * 结论与 SKILL 不足记录，以及用户的反馈）、日志、工作区与运行目录和文件数上限。
+ * 同一应用的所有改进点在这一个子 Agent 中一次完成。子 Agent 的工作目录是可写
+ * 工作区，它直接修改其中的 SKILL 目录。
  *
  * @module dsh-logalyze/skill-update/prompt
  */
@@ -17,7 +18,7 @@ import { REASON_FILE } from './workspace.ts'
 /** Directory inside a SKILL that holds case files. */
 export const CASES_DIR = 'cases'
 
-/** The analysis an improvement follows. */
+/** One analysis an improvement is based on. */
 export interface ImproveAnalysis {
   /** Commit the analysis ran against. */
   readonly commit: string
@@ -36,8 +37,8 @@ export interface ImprovePromptInput {
   readonly app: AppManifest
   /** Commit the child's workspace started from. */
   readonly commit: string
-  /** The analysis the improvement follows, when there was one. */
-  readonly analysis?: ImproveAnalysis
+  /** The analyses the improvement is based on, oldest first; empty when it rests on feedback alone. */
+  readonly analyses: readonly ImproveAnalysis[]
   /** What the user said is wrong or missing, as the parent agent relayed it. */
   readonly feedback?: string
   readonly logs: readonly ChildLog[]
@@ -51,24 +52,35 @@ export interface ImprovePromptInput {
   readonly date: string
 }
 
-function analysisSection(analysis: ImproveAnalysis, commit: string): string {
-  const version = analysis.commit === commit ? '' : `\n\n分析时的提交是 \`${analysis.commit.slice(0, 12)}\`，之后仓库有更新；以当前工作区中的 SKILL 为准修改。`
+function analysisSection(analysis: ImproveAnalysis, index: number, commit: string): string {
+  const version = analysis.commit === commit ? '' : `\n\n这次分析时的提交是 \`${analysis.commit.slice(0, 12)}\`，之后仓库有更新；以当前工作区中的 SKILL 为准修改。`
   const gap = analysis.gapPath === undefined
     ? '分析子 Agent 当时没有发现 SKILL 的不足，是按 SKILL 现有的记录分析的；改进的依据是下面的用户反馈。'
     : `分析子 Agent 认为 SKILL 没能很好地覆盖这个问题，记录写在 \`${analysis.gapPath}\`，先读它。`
   return `
-## 分析时的问题
+## 分析 ${index + 1}
+
+运行目录：\`${analysis.dir}\`（解压结果和中间文件在这里）
+
+### 问题
 
 ${analysis.question}
 
-## 分析结论
+### 结论
 
 ${analysis.conclusion.trim() === '' ? '（分析子 Agent 没有给出结论）' : analysis.conclusion}
 
-## SKILL 不足记录
+### SKILL 不足记录
 
 ${gap}${version}
 `
+}
+
+function originOf(analyses: readonly ImproveAnalysis[]): string {
+  if (analyses.length === 0) return '用户要求改进这个 SKILL，用户的反馈见下文。先读现有的 SKILL，再按反馈修改。'
+  const reason = analyses.some(analysis => analysis.gapPath !== undefined) ? '分析子 Agent 认为这个 SKILL 没能很好地覆盖遇到的问题' : '用户指出 SKILL 的记录有问题'
+  const count = analyses.length === 1 ? '一次' : ` ${analyses.length} 次`
+  return `本会话的${count}日志分析之后，${reason}，用户同意改进。下面列出的所有改进点都在这一次修改中完成。`
 }
 
 /**
@@ -77,11 +89,8 @@ ${gap}${version}
  * @returns prompt text whose first line is the `/logalyze-improve` gesture.
  */
 export function renderImprovePrompt(input: ImprovePromptInput): string {
-  const { app, commit, analysis, feedback, logs, workDir, maxFiles, caseRequired, date } = input
+  const { app, commit, analyses, feedback, logs, workDir, maxFiles, caseRequired, date } = input
   const dir = skillDir(app.skill)
-  const origin = analysis === undefined
-    ? '用户要求改进这个 SKILL，用户的反馈见下文。先读现有的 SKILL，再按反馈修改。'
-    : `刚才的一次日志分析之后，${analysis.gapPath === undefined ? '用户指出 SKILL 的记录有问题' : '分析子 Agent 认为这个 SKILL 没能很好地覆盖遇到的问题'}，用户同意改进。`
   const logSection = logs.length === 0
     ? ''
     : `
@@ -89,17 +98,17 @@ export function renderImprovePrompt(input: ImprovePromptInput): string {
 
 ${logs.map(log => `- \`${log.path}\`${log.url === undefined ? '' : `（下载自 ${log.url}）`}`).join('\n')}
 
-${analysis === undefined ? `日志可能是压缩包，需要时解压到运行目录 \`${workDir}\`。` : `分析时的解压结果和中间文件在 \`${analysis.dir}\`。`}只在需要核对日志特征时查看，不要重新做整次分析。
+日志可能是压缩包，需要时解压到运行目录 \`${workDir}\`；分析时的解压结果在各次分析的运行目录。只在需要核对日志特征时查看，不要重新做整次分析。
 `
   const caseLine = caseRequired
-    ? `- 把这次问题整理为案例：已有案例描述的是同一个问题时更新它，否则新建 \`${dir}/${CASES_DIR}/${date}-<slug>.md\`，\`<slug>\` 用小写字母、数字和短横线概括问题。`
+    ? `- 把分析中的问题整理为案例：每个不同的问题一个案例，几次分析是同一个问题时只写一个；已有案例描述的是同一个问题时更新它，否则新建 \`${dir}/${CASES_DIR}/${date}-<slug>.md\`，\`<slug>\` 用小写字母、数字和短横线概括问题。`
     : `- 反馈对应一个具体的故障时，按指南写案例 \`${dir}/${CASES_DIR}/${date}-<slug>.md\`；只是修正或补充 SKILL 的说明时，可以不写案例。`
   return `/${IMPROVE_SKILL_NAME}
 
 你是观象派发的 SKILL 改进子任务，负责应用「${app.name}」（id: \`${app.id}\`）。当前工作目录是该应用代码仓库在提交 \`${commit.slice(0, 12)}\` 的可写工作区，日志分析 SKILL 在 \`${dir}/\`。
 
-${origin}按上面加载的改进指南修改 SKILL。
-${analysis === undefined ? '' : analysisSection(analysis, commit)}
+${originOf(analyses)}按上面加载的改进指南修改 SKILL。
+${analyses.map((analysis, index) => analysisSection(analysis, index, commit)).join('')}
 ## 用户反馈
 
 ${feedback ?? '（无）'}

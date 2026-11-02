@@ -473,10 +473,10 @@ function AdvancedTab({ draft, setDraft, overridden, busy, onReset }: TabProps & 
         <div className="lz__list">
           <div className="lz__row">
             <div className="lz__rowText">
-              <div className="lz__rowLabel">询问是否改进 SKILL <Overridden keys={overridden} name="skillUpdates" /></div>
-              <div className="lz__rowSummary">子 Agent 觉得应用的日志分析 SKILL 不够用时记下不足，分析结束后询问用户是否改进；用户同意后，改进子 Agent 把问题整理为案例并修改 SKILL，观象经 dsh-repo 提交到新分支并创建合并请求（GitLab 或 GitHub，需要安装 dsh-repo 并配置该仓库主机的令牌）。</div>
+              <div className="lz__rowLabel">分析后建议改进 SKILL <Overridden keys={overridden} name="skillUpdates" /></div>
+              <div className="lz__rowSummary">子 Agent 发现应用的日志分析 SKILL 写错或缺内容时记下不足，父 Agent 在分析结论之后附上改进建议；用户在对话中同意后，每个应用由一个改进子 Agent 把所有改进点整理为案例并修改 SKILL，观象经 dsh-repo 提交到新分支并创建合并请求（GitLab 或 GitHub，需要安装 dsh-repo 并配置该仓库主机的令牌）。</div>
             </div>
-            <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="询问是否改进 SKILL" checked={draft.skillUpdatesEnabled} onChange={(event) => { setDraft({ ...draft, skillUpdatesEnabled: event.target.checked }) }} /></div>
+            <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="分析后建议改进 SKILL" checked={draft.skillUpdatesEnabled} onChange={(event) => { setDraft({ ...draft, skillUpdatesEnabled: event.target.checked }) }} /></div>
           </div>
           <NumberRow label="改进文件数上限" unit="个" value={draft.skillMaxFiles} onChange={(value) => { setDraft({ ...draft, skillMaxFiles: value }) }} />
           <NumberRow label="改进单文件大小上限" unit="KB" value={draft.skillMaxKb} onChange={(value) => { setDraft({ ...draft, skillMaxKb: value }) }} />

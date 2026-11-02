@@ -4,7 +4,7 @@
  * @module dsh-logalyze/skill-update/names
  */
 
-/** Asks whether to improve an application's SKILL, then drafts and submits the improvement. */
+/** Drafts and submits one improvement of an application's SKILL after the user agreed in conversation. */
 export const IMPROVE_TOOL_NAME = 'logalyze_improve_skill'
 
 /** Shows an application's log-analysis SKILL as of its latest synced commit. */

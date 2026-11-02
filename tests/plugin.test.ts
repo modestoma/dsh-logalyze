@@ -19,6 +19,8 @@ interface Harness {
   skills: SkillProvider[]
   base: string
   rejection: { value: 401 | 403 | undefined }
+  /** Listeners registered for `session/event`. */
+  sessionListeners: Parameters<HostContext['on']>[1][]
   dispose: () => Promise<void>
 }
 
@@ -38,6 +40,7 @@ async function harness(services: Record<string, unknown> = {}): Promise<Harness>
   const skills: SkillProvider[] = []
   const disposers: (() => void)[] = []
   const rejection: Harness['rejection'] = { value: undefined }
+  const sessionListeners: Harness['sessionListeners'] = []
   const webServer = { register: (route: { path: string; handler: Handler }) => { routes.set(route.path, route.handler); return () => { routes.delete(route.path) } } }
   const connection = { requestRejection: () => rejection.value }
   const ctx: HostContext = {
@@ -57,6 +60,10 @@ async function harness(services: Record<string, unknown> = {}): Promise<Harness>
     },
     subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('not used')) },
     get: (name: string) => ({ webServer, connection, ...services } as Record<string, unknown>)[name],
+    on: (_name, listener) => {
+      sessionListeners.push(listener)
+      return () => { sessionListeners.splice(sessionListeners.indexOf(listener), 1) }
+    },
     effect: (callback) => {
       const dispose = callback()
       const wrapped = (): void => { dispose?.() }
@@ -77,7 +84,7 @@ async function harness(services: Record<string, unknown> = {}): Promise<Harness>
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`
   return {
-    ctx, repos, tools, skills, base, rejection,
+    ctx, repos, tools, skills, base, rejection, sessionListeners,
     dispose: async () => {
       for (const dispose of disposers.reverse()) dispose()
       await new Promise(resolve => server.close(resolve))
@@ -118,6 +125,8 @@ describe('plugin', () => {
     expect(await submit!.when?.(step())).toBe(false)
     const [candidate] = await h.skills[0]!.list({})
     expect((await h.skills[0]!.get(candidate!, {}))?.content).toContain('`order-service`')
+    // The improvement tool counts finished turns from the Session event feed.
+    expect(h.sessionListeners).toHaveLength(1)
   })
 
   it('mentions SKILL improvement in /logalyze unless it is turned off', async () => {

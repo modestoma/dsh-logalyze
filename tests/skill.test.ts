@@ -19,7 +19,9 @@ describe('entry skill', () => {
     expect(body).toContain('最多 3 个')
     expect(body).not.toContain('logalyze_improve_skill')
     const improving = renderEntrySkill([order], 3, true)
-    expect(improving).toContain('派发结果中某个应用标出「SKILL 不足」时：先照常写完汇总回复')
+    expect(improving).toContain('**先给结论，改进放到下一回合。** 派发结果中某个应用标出「SKILL 不足」时，照常写完汇总回复，在末尾另起一节「SKILL 改进建议」')
+    expect(improving).toContain('这一回合不要调用工具（工具会拒绝）')
+    expect(improving).toContain('工具会自动带上本会话中该应用记录了不足、还没改进过的全部分析，所以同一应用的多个改进点只调用一次')
     expect(improving).toContain('先用 `logalyze_show_skill` 查看现有 SKILL 的相关内容')
   })
 

@@ -27,6 +27,11 @@ export interface SessionHeader {
   readonly delegationDepth?: number
 }
 
+/** An appended Session event; only the discriminator is read (`turn/end` ends a turn). */
+export interface SessionEventEnvelope {
+  readonly type: string
+}
+
 /** The calling Agent as seen by a tool execution. */
 export interface Agent {
   readonly id: string
@@ -245,6 +250,13 @@ export interface HostContext {
   readonly subagents: SubagentService
   readonly logger?: HostLogger
   get?(name: string): unknown
+  /**
+   * Listen to the post-commit append feed of every Session (`session/event`).
+   * @param name - the event name.
+   * @param listener - receives the Session and the appended event.
+   * @returns the disposer.
+   */
+  on(name: 'session/event', listener: (session: { readonly header: SessionHeader }, event: SessionEventEnvelope) => void): () => unknown
   effect(callback: () => (() => void) | void, label?: string): () => unknown
   inject?(dependencies: string[], callback: (child: HostContext) => void): unknown
 }
