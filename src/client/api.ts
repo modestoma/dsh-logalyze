@@ -4,7 +4,7 @@
  * @module dsh-logalyze/client/api
  */
 
-import { SETTINGS_ROUTE, STATE_ROUTE, SYNC_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
+import { REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
 import type { EditableSettings, MutationError, MutationOk, StateWire } from '../settings/contract.ts'
 
 /**
@@ -93,4 +93,13 @@ export async function saveToken(tokenEnv: string, value: string): Promise<StateW
  */
 export async function clearToken(tokenEnv: string): Promise<StateWire> {
   return (await request<MutationOk>(TOKEN_ROUTE, { method: 'DELETE', body: JSON.stringify({ tokenEnv }) })).state
+}
+
+/**
+ * Upload one analysis report again now.
+ * @param id - report id.
+ * @returns the new state.
+ */
+export async function retryReport(id: string): Promise<StateWire> {
+  return (await request<MutationOk>(REPORT_UPLOAD_ROUTE, { method: 'POST', body: JSON.stringify({ id }) })).state
 }

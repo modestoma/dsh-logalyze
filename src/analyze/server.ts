@@ -6,7 +6,8 @@
  * 中或版本不兼容时不注册。
  * 本模块按顺序做传输层检查：路径、开关、方法、Bearer 令牌、
  * `Idempotency-Key`、媒体类型、请求体大小和 JSON 校验；通过后交给
- * `feishuTopics`。请求体、令牌和提示词都不写日志。
+ * `feishuTopics`。带 `logId` 的请求被接受（包括重放）后交给报告回传记录。
+ * 请求体、令牌和提示词都不写日志。
  *
  * @module dsh-logalyze/analyze/server
  */
@@ -35,6 +36,9 @@ export interface AnalyzeGate {
 
 /** Everything after transport checks: start the analysis of one validated request. */
 export type AnalyzeLaunch = (request: AnalyzeRequest, idempotencyKey: string) => Promise<AnalyzeResponse>
+
+/** Receives every accepted (or replayed) request that carries `logId`. */
+export type AnalyzeAccepted = (request: AnalyzeRequest & { readonly logId: string }, idempotencyKey: string) => Promise<void>
 
 class HttpError extends Error {
   constructor(readonly status: number, message: string) {
@@ -160,8 +164,9 @@ export async function handleAnalyzeHttp(
  * login gate on purpose: the bearer token is this API's only credential.
  * @param ctx - the plugin context.
  * @param gate - switch and token.
+ * @param accepted - starts report tracking of an accepted request with `logId`; its failure is logged and does not change the answer.
  */
-export function mountAnalyzeRoute(ctx: HostContext, gate: AnalyzeGate): void {
+export function mountAnalyzeRoute(ctx: HostContext, gate: AnalyzeGate, accepted: AnalyzeAccepted): void {
   const attach = (scope: HostContext): void => {
     const server = scope.get?.('webServer') as HostWebServer | undefined
     if (server === undefined) return
@@ -171,7 +176,16 @@ export function mountAnalyzeRoute(ctx: HostContext, gate: AnalyzeGate): void {
       return
     }
     const { service } = topics
-    const launch: AnalyzeLaunch = (request, key) => launchAnalysis(service, request, key)
+    const launch: AnalyzeLaunch = async (request, key) => {
+      const response = await launchAnalysis(service, request, key)
+      const { logId } = request
+      if (response.status === 202 && logId !== undefined) {
+        await accepted({ ...request, logId }, key).catch((error: unknown) => {
+          ctx.logger?.warn?.('logalyze: 记录分析报告回传失败：%s', String(error))
+        })
+      }
+      return response
+    }
     scope.effect(() => server.register({
       kind: 'exact',
       path: ANALYZE_ROUTE,

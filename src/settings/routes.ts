@@ -10,7 +10,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
 import { SettingsError } from '../service.ts'
 import type { LogalyzeService } from '../service.ts'
-import { SETTINGS_ROUTE, STATE_ROUTE, SYNC_ROUTE, TOKEN_ROUTE } from './contract.ts'
+import { REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_ROUTE, TOKEN_ROUTE } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
@@ -149,6 +149,13 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
         const body = await readJsonBody(req, false)
         const state = req.method?.toUpperCase() === 'DELETE' ? await service.clearToken(body) : await service.setToken(body)
         sendJson(res, 200, { ok: true, state })
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: REPORT_UPLOAD_ROUTE,
+      handler: guarded(gate, ['POST'], async (req, res) => {
+        sendJson(res, 200, { ok: true, state: await service.retryReport(await readJsonBody(req, false)) })
       }),
     }),
   ]

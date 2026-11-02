@@ -11,6 +11,8 @@ export const STATE_ROUTE = '/logalyze/state'
 export const SETTINGS_ROUTE = '/logalyze/settings'
 /** POST：立即重新拉取全部仓库，或 body `{ url }` 指定的一个仓库。 */
 export const SYNC_ROUTE = '/logalyze/sync'
+/** POST：body `{ id }` 立即重新上传一份分析报告，不论上次是否成功。 */
+export const REPORT_UPLOAD_ROUTE = '/logalyze/reports/upload'
 /** PUT：body `{ tokenEnv, value }` 把分析接口令牌存入 DSH 凭据库；DELETE：body `{ tokenEnv }` 删除已存的值。只接受分析接口令牌的名称。 */
 export const TOKEN_ROUTE = '/logalyze/token'
 
@@ -51,10 +53,41 @@ export interface SkillUpdateSettings {
   maxFileBytes: number
 }
 
+/** Report directory below the topic's working directory, uploaded as a whole. */
+export const REPORT_DIR = 'report'
+
+/** Report entry file inside {@link REPORT_DIR}; written only by this plugin. */
+export const REPORT_ENTRY = 'report.md'
+
+/** Placeholders the upload command's arguments may contain. */
+export const UPLOAD_PLACEHOLDERS = ['{logId}', '{dir}', '{entry}'] as const
+
+/** How reports of requests with `logId` are uploaded to the caller. */
+export interface UploadSettings {
+  /**
+   * Upload command as an argument vector, run without a shell after every
+   * turn of the analysis topic. `{logId}` is the request's `logId`, `{dir}`
+   * the absolute report directory, `{entry}` the entry file name relative to it.
+   */
+  command: string[]
+  /** Per-run timeout in milliseconds; a run still going then is killed and counts as failed. */
+  timeoutMs: number
+  /** Further attempts after a failed run. */
+  retries: number
+  /** Wait before the first retry in milliseconds; it doubles for each further retry. */
+  retryDelayMs: number
+  /** Most files the report directory may hold. */
+  maxFiles: number
+  /** Largest total size of the report directory, in bytes. */
+  maxBytes: number
+}
+
 /** The log-platform analyze API ({@link ANALYZE_ROUTE}). */
 export interface AnalyzeSettings {
   /** Whether the API accepts requests; switched off it answers 404. */
   enabled: boolean
+  /** Report upload. */
+  upload: UploadSettings
 }
 
 /** The settings the Web panel can override; every field is required on the wire. */
@@ -159,6 +192,39 @@ export interface ReposWire {
  */
 export type TopicsAvailability = 'ready' | 'missing' | 'incompatible'
 
+/** How the first turn of an analysis ended, or how the analysis failed to start. */
+export type ReportStatus = 'done' | 'stopped' | 'error' | 'failed' | 'interrupted'
+
+/** Upload progress of one report. */
+export type UploadPhase = 'pending' | 'running' | 'waiting' | 'done' | 'failed'
+
+/** One tracked report as the panel shows it. */
+export interface ReportWire {
+  /** Stable id of the report (derived from the request's `Idempotency-Key`). */
+  id: string
+  logId: string
+  app: string
+  errorCode: string
+  triggeredAt: string
+  /** Epoch ms when the request was accepted. */
+  acceptedAt: number
+  /** First-turn outcome; absent while the first turn is running. */
+  status?: ReportStatus
+  /** Follow-up turns recorded after the first one. */
+  followups: number
+  /** Absolute report directory; absent until the topic's working directory is known. */
+  dir?: string
+  phase: UploadPhase
+  /** Epoch ms of the last finished upload attempt. */
+  lastAttemptAt?: number
+  /** Epoch ms of the last successful upload. */
+  uploadedAt?: number
+  /** Why the last attempt failed. */
+  error?: string
+  /** Links in the recorded replies the caller cannot open. */
+  warnings: string[]
+}
+
 /** Analyze API view of the panel. */
 export interface AnalyzeWire {
   /** Route the log platform posts to. */
@@ -168,6 +234,10 @@ export interface AnalyzeWire {
   /** Token status; absent while the DSH composition has no credential store. */
   token?: TokenStatusWire
   topics: TopicsAvailability
+  /** Whether the loaded dsh-channels reports launch states, which report upload needs. */
+  reportsSupported: boolean
+  /** Most recently accepted reports, newest first. */
+  reports: ReportWire[]
 }
 
 /** `GET /logalyze/state` response. */

@@ -2,15 +2,17 @@
  * 分析请求到 dsh-channels `feishuTopics` 服务的转换：根卡片内容、工作区
  * `analyze/<app>/<errorCode>`、幂等键与指纹，以及服务结果到 HTTP 响应的映射。
  *
- * 只从 `@modesto_ma/dsh-channels/topics` 引入类型；服务在运行时经
- * `ctx.get('feishuTopics')` 取得，版本不符时不调用。
+ * 服务接口在 `./feishu-topics.ts` 本地声明；服务在运行时经
+ * `ctx.get('feishuTopics')` 取得，版本不符时不调用。带 `logId` 的请求在
+ * 提示词后追加「报告文件」一节，说明报告目录的写法。
  *
  * @module dsh-logalyze/analyze/topics
  */
 
 import type {
   FeishuTopicService, FeishuTopicsVersion, TopicLaunchResult, TopicLaunchSpec,
-} from '@modesto_ma/dsh-channels/topics'
+} from './feishu-topics.ts'
+import { REPORT_DIR, REPORT_ENTRY } from '../settings/contract.ts'
 import type { TopicsAvailability } from '../settings/contract.ts'
 import { analyzeRequestHash } from './contract.ts'
 import type { AnalyzeRequest, AnalyzeResponse } from './contract.ts'
@@ -37,6 +39,22 @@ export function lookupTopics(value: unknown): TopicsLookup {
   if ((value as { version?: unknown }).version !== FEISHU_TOPICS_VERSION) return { availability: 'incompatible' }
   return { availability: 'ready', service: value as FeishuTopicService }
 }
+
+/**
+ * Section appended to the prompt of a request with `logId`, telling the
+ * analysis how to add files to the uploaded report.
+ */
+export const REPORT_PROMPT_SECTION = `
+
+## 报告文件
+
+本次分析的结论会以 markdown 报告回传给调用方系统，调用方网页端会渲染报告入口和其中引用的文件。
+
+- 每一轮的最终回复都会写入报告入口 \`${REPORT_ENTRY}\`，它由观象生成，不要自己创建或修改。
+- 需要附带的其他文件（图片、关键日志片段、较长的分析过程等）写到当前工作目录下的 \`${REPORT_DIR}/\` 目录，可以建子目录，不要用符号链接。
+- 在最终回复中用以 \`${REPORT_DIR}/\` 开头的相对路径引用这些文件：图片写成 \`![说明](${REPORT_DIR}/xxx.png)\`，文档写成 \`[说明](${REPORT_DIR}/xxx.md)\`。不要写本机绝对路径或 \`${REPORT_DIR}/\` 以外的路径，调用方打不开。子文档引用同目录下的其他文件时，用相对于该文档的路径。
+- 报告会发到外部系统：令牌、密码、密钥等敏感信息要打码。
+`
 
 /**
  * The topic one analyze request starts.
@@ -66,7 +84,7 @@ export function analyzeTopicSpec(request: AnalyzeRequest, idempotencyKey: string
       segments: ['analyze', request.app, request.errorCode],
       title: `日志分析 · ${request.app} · ${request.errorCode}`,
     },
-    prompt: request.prompt,
+    prompt: request.logId === undefined ? request.prompt : `${request.prompt}${REPORT_PROMPT_SECTION}`,
   }
 }
 

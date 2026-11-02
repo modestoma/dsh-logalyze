@@ -10,6 +10,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { FEISHU_TOPICS_STATUS_EVENT, TopicLaunchState } from './analyze/feishu-topics.ts'
 
 /** One model-facing content block (text is the only kind this plugin produces). */
 export interface ContentBlock {
@@ -27,9 +28,14 @@ export interface SessionHeader {
   readonly delegationDepth?: number
 }
 
-/** An appended Session event; only the discriminator is read (`turn/end` ends a turn). */
+/**
+ * An appended Session event: `type` is the discriminator, `data` the payload
+ * of DSH's `SessionEventMap` entry. Report tracking reads `turn/start`,
+ * `user/message`, `assistant/message`, and `turn/end`; other readers only the type.
+ */
 export interface SessionEventEnvelope {
   readonly type: string
+  readonly data?: unknown
 }
 
 /** The calling Agent as seen by a tool execution. */
@@ -257,6 +263,13 @@ export interface HostContext {
    * @returns the disposer.
    */
   on(name: 'session/event', listener: (session: { readonly header: SessionHeader }, event: SessionEventEnvelope) => void): () => unknown
+  /**
+   * Listen to dsh-channels' launch status event; it never fires without dsh-channels.
+   * @param name - the event name.
+   * @param listener - receives the new launch state.
+   * @returns the disposer.
+   */
+  on(name: typeof FEISHU_TOPICS_STATUS_EVENT, listener: (state: TopicLaunchState) => void): () => unknown
   effect(callback: () => (() => void) | void, label?: string): () => unknown
   inject?(dependencies: string[], callback: (child: HostContext) => void): unknown
 }
