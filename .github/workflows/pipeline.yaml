@@ -26,26 +26,57 @@ permissions:
   contents: read
 
 jobs:
-  # A manual dispatch on main releases the current dev commit. Resolving it once
-  # gives check and release the same commit even if dev moves meanwhile. Other
-  # events leave `ref` empty, so checkout uses the event's commit.
-  target:
+  # A manual dispatch on main releases the current dev commit. When main is
+  # behind dev, a real release fast-forwards main and dispatches a new run on
+  # main, which publishes at the promoted commit: npm provenance records the
+  # triggering commit, and only a run started after the move has the promoted
+  # one. A dry run skips the move and previews the dev commit. Every other run
+  # keeps the event's commit (`ref` empty) and proceeds (`release` true).
+  promote:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
     outputs:
-      ref: ${{ steps.dev.outputs.sha }}
+      ref: ${{ steps.promote.outputs.ref }}
+      release: ${{ steps.promote.outputs.release }}
     steps:
-      - id: dev
-        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+      - id: promote
         env:
           GH_TOKEN: ${{ github.token }}
-        # A separate assignment makes a failed lookup fail the step.
+          MAIN_DISPATCH: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/dev" --jq .sha)
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          # A run dispatched by this job after the move publishes main as is.
+          if [ "$MAIN_DISPATCH" != true ] || [ "$GITHUB_ACTOR" = 'github-actions[bot]' ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          dev=$(gh api "repos/$GITHUB_REPOSITORY/commits/dev" --jq .sha)
+          if [ "$dev" = "$GITHUB_SHA" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...$dev" --jq .status)
+          if [ "$status" != ahead ]; then
+            echo "::error::main has commits that dev does not contain (dev is $status). Merge main into dev, then release again."
+            exit 1
+          fi
+          if [ "$DRY_RUN" = true ]; then
+            { echo "ref=$dev"; echo "release=true"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Without force, GitHub rejects an update that is not a fast-forward.
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/main" -f sha="$dev" -F force=false --silent
+          workflow=${GITHUB_WORKFLOW_REF%@*}
+          gh workflow run "${workflow##*/}" --repo "$GITHUB_REPOSITORY" --ref main -f dry_run=false
+          echo "::notice::main fast-forwarded to $dev; the stable release continues in a new pipeline run on main."
+          echo "release=false" >> "$GITHUB_OUTPUT"
 
   check:
-    needs: target
+    needs: promote
+    if: needs.promote.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -55,7 +86,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.target.outputs.ref }}
+          ref: ${{ needs.promote.outputs.ref }}
           persist-credentials: false
       - uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2.0.2
         with:
@@ -73,16 +104,16 @@ jobs:
         run: pnpm check
 
   # A push to dev publishes a beta prerelease once checks pass; a push to main
-  # only runs checks. A manual dispatch on main fast-forwards main to the dev
-  # commit resolved by `target` and publishes it as a stable version, so the
-  # stable tag is on a dev commit and dev never needs main merged back. On dev
-  # a manual dispatch previews or publishes a beta.
+  # only runs checks. A manual dispatch on main publishes a stable version once
+  # `promote` has main at the dev commit, so the stable tag is on a dev commit
+  # and dev never needs main merged back. On dev a manual dispatch previews or
+  # publishes a beta.
   release:
     if: >-
       (github.event_name == 'push' && github.ref == 'refs/heads/dev') ||
       (github.event_name == 'workflow_dispatch' &&
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'))
-    needs: [target, check]
+    needs: [promote, check]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -96,7 +127,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.target.outputs.ref }}
+          ref: ${{ needs.promote.outputs.ref }}
           fetch-depth: 0
           persist-credentials: false
       - uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2.0.2
@@ -115,20 +146,6 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Verify package contents
         run: pnpm pack --dry-run
-      # A plain push rejects a non-fast-forward update, so main only ever moves
-      # to a commit that already contains it.
-      - name: Verify main fast-forwards to dev
-        if: needs.target.outputs.ref != ''
-        run: |
-          if ! git merge-base --is-ancestor origin/main HEAD; then
-            echo "::error::main has commits that dev does not contain. Merge main into dev, then release again."
-            exit 1
-          fi
-      - name: Fast-forward main to dev
-        if: needs.target.outputs.ref != '' && !inputs.dry_run
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/main
       - name: Preview release
         if: github.event_name == 'workflow_dispatch' && inputs.dry_run
         env:

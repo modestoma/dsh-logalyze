@@ -297,7 +297,7 @@ pnpm check        # 类型检查（Host 与 Client）+ 单元测试 + 构建 + �
 | `main` | 手动 | 正式版，如 `0.1.0` | `latest` |
 | `dev` | 推送自动 | 预发布版，如 `0.1.0-beta.1` | `beta` |
 
-发布正式版：在 GitHub Actions 的 `pipeline` workflow 点击 **Run workflow** 并选择 `main`。workflow 取 `dev` 当前的提交，把 `main` 快进到这个提交后发布正式版，所以正式版的 tag 打在 `dev` 的提交上：不用再提 `dev` → `main` 的 PR，发版后也不用把 `main` 合回 `dev`，`dev` 的下一个 beta 自动从新版本往上算。`main` 有 `dev` 没有的提交时无法快进，workflow 报错停止。`dry_run` 默认勾选，只预览下一个版本号，不移动 `main`；取消勾选才真正快进 `main`、发布 npm 包、打 tag 并创建 GitHub Release。在 `dev` 上手动触发同样可用，用来预览或补发 beta。安装 beta 版用 `dsh-logalyze@beta`。
+发布正式版：在 GitHub Actions 的 `pipeline` workflow 点击 **Run workflow** 并选择 `main`。workflow 取 `dev` 当前的提交，把 `main` 快进到这个提交，再自动触发一次新的 `pipeline` 运行，在 `main` 的新提交上发布正式版（npm 来源证明记录的是触发运行的提交，所以发布要放在快进之后新开的运行里；Actions 里会看到两次运行）。正式版的 tag 因此打在 `dev` 的提交上：不用再提 `dev` → `main` 的 PR，发版后也不用把 `main` 合回 `dev`，`dev` 的下一个 beta 自动从新版本往上算。`main` 有 `dev` 没有的提交时无法快进，workflow 报错停止。`dry_run` 默认勾选，只预览 `dev` 当前提交的下一个版本号，不移动 `main`；取消勾选才真正快进 `main`、发布 npm 包、打 tag 并创建 GitHub Release。在 `dev` 上手动触发同样可用，用来预览或补发 beta。安装 beta 版用 `dsh-logalyze@beta`。
 
 | 路径 | 内容 |
 |---|---|
