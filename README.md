@@ -206,7 +206,7 @@ skill: log-analysis             # 对应 .agents/skills/log-analysis/SKILL.md
 
 **前提**：
 
-- dsh_channels 已加载并提供 `feishuTopics` 服务（版本 1）。没有这个服务时观象不注册接口；服务版本不兼容时观象记一条警告，也不注册。设置面板「分析接口」分页显示飞书渠道是否就绪。
+- dsh_channels 已加载并提供 `feishuTopics` 服务（版本 2）。没有这个服务时观象不注册接口；服务版本不兼容时观象记一条警告，也不注册。设置面板「分析接口」分页显示飞书渠道是否就绪。
 - 只有带 Web 的 profile（web、desktop）有这个接口，headless 没有。
 
 **开启**：在设置面板「分析接口」打开开关（`analyze.enabled`，默认关，保存后立即生效），并在同一页保存访问令牌（建议 32 位以上随机串）。令牌存入 DSH 凭据库的 `LOGALYZE_ANALYZE_TOKEN`（名称可用 `analyzeTokenRef` 修改），也可以设置同名环境变量或写进 `.env`。接口挂在 DSH Web 服务上（与 Web 界面同一端口），路径 `/open-api/logalyze` 放在 DSH 的 `/api` 之外，网关可以把它与需要登录的 DSH 接口分开放行；DSH 通过反向代理挂在前缀下时，地址随之带上前缀（如 `https://<域名>/dsh/open-api/logalyze`）。该路由不走 DSH 登录 cookie，访问令牌是唯一凭据。开关关闭时所有请求返回 404；令牌每次请求都重新读取，轮换后下一次请求生效；令牌未设置时所有请求返回 503。
@@ -234,11 +234,11 @@ Content-Type: application/json
 }
 ```
 
-- `requesterUserId`：平台发起人的飞书 user_id，分析卡 @ 此人；路由记录里也以此人作为发起人。
+- `requesterUserId`：平台发起人的飞书 user_id，分析卡 @ 此人，首轮以此人的身份提交，所以此人要在 dsh_channels 里有对话权限；话题归群，群里有对话权限的成员都能追问。
 - `triggeredAt`：平台上发起分析的时间，1–64 字符，原样显示在分析卡上（时区和格式由平台决定）。
-- `app` / `errorCode`：只允许 `A-Z a-z 0-9 . _ -`（1–128 字符），决定工作区 `<dsh_channels baseDir>/analyze/<app>/<errorCode>/`；同一应用同一错误码的所有分析都在这个工作区里，每次分析各有一个话题目录。
+- `app` / `errorCode`：只允许 `A-Z a-z 0-9 . _ -`（1–128 字符），显示在分析卡上并参与请求指纹。每次分析的话题目录由 dsh_channels 按群和话题决定（`<baseDir>/groups/<chat_id>/<话题 id>/`），观象不再指定工作区。
 - `logDetails`：触发分析的日志在日志平台上的详情页，1–50 条，每条 `name`（1–200 字符）+ `url`（http/https）。只在分析卡的表格里列出，观象不会访问这些地址。
-- `chatId`：目标群，必须是 dsh_channels 已授权的群（`/auth group add` 或其面板「访问与授权」），机器人需在群内；dsh_channels `accessMode: open` 时不校验。
+- `chatId`：目标群，机器人需在群内；群本身不需要授权，群话题的知识库与代码改动权限在 dsh_channels 面板「群权限」里按群配置。
 - `prompt`：1–100000 字符，原样作为首条用户消息；带 `logId` 时最多 98000 字符，观象在后面追加一节「报告文件」，说明报告目录的写法（见[报告回传](#报告回传)），不带时不追加任何内容。
 - `logId`：可选，日志平台上这次分析的 id，1–128 个 `A-Z a-z 0-9 . _ -`，不能以 `-` 或 `.` 开头。带上后观象在每一轮结束时把报告回传给平台；它计入幂等指纹。
 - 只接受以上 8 个字段，多余字段返回 400。
