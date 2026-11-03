@@ -1,7 +1,0 @@
-# 观象应用描述：观象拉取本仓库后读取此文件，把应用加入 /guanxiang 的应用目录。
-id: order-service
-name: 订单服务
-description: 下单、库存扣减与支付回调
-aliases: [订单, 下单, order]
-logHints: [order-service, OrderController, OrderService]
-skill: log-analysis            # 对应 .dsh/skills/log-analysis/SKILL.md

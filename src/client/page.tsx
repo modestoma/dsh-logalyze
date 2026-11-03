@@ -1,14 +1,15 @@
 /**
- * 左侧栏「观象」主区页面：应用仓库、访问令牌、日志下载、高级（含 SKILL 改进）四个分页，共用
- * 一份草稿和底部保存条；令牌值不进草稿，单独存入 DSH 凭据库。仓库拉取中时
- * 每 2 秒刷新状态。
+ * 左侧栏「观象」主区页面：应用仓库、日志下载、分析接口、高级（含 SKILL 改进）四个
+ * 分页，共用一份草稿和底部保存条。拉取仓库用的主机与令牌在「插件 → dsh-repo」
+ * 页面管理，应用仓库分页提供跳转。
+ * 仓库拉取中时每 2 秒刷新状态；打开「分析接口」分页时每 5 秒刷新回传记录。
  *
- * @module dsh-guanxiang/client/page
+ * @module dsh-logalyze/client/page
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { EditableKey, EditableSettings, GitCredentialSpec, RepoSpec, RepoStatusWire, StateWire, TokenStatusWire } from '../settings/contract.ts'
-import { clearToken, fetchState, messageOf, resetSettings, saveSettings, saveToken, syncRepos } from './api.ts'
+import type { AnalyzeWire, EditableKey, EditableSettings, ReportStatus, ReportWire, RepoSpec, RepoStatusWire, StateWire, TokenStatusWire, UploadPhase } from '../settings/contract.ts'
+import { clearToken, fetchState, messageOf, resetSettings, retryReport, saveSettings, saveToken, syncRepos } from './api.ts'
 
 /** Sidebar label and page title. */
 export const PANEL_TITLE = '观象'
@@ -17,20 +18,18 @@ const KB = 1024
 const MB = 1024 * 1024
 const MINUTE = 60 * 1000
 
-type TabId = 'repos' | 'tokens' | 'download' | 'advanced'
+type TabId = 'repos' | 'download' | 'analyze' | 'advanced'
 
 const TABS: readonly { id: TabId; label: string }[] = [
   { id: 'repos', label: '应用仓库' },
-  { id: 'tokens', label: '访问令牌' },
   { id: 'download', label: '日志下载' },
+  { id: 'analyze', label: '分析接口' },
   { id: 'advanced', label: '高级' },
 ]
 
 /** Editable text form of the settings. */
 interface Draft {
-  reposDir: string
   repos: RepoSpec[]
-  gitCredentials: GitCredentialSpec[]
   fetchIntervalMin: string
   maxAppsPerRequest: string
   dispatchTimeoutMin: string
@@ -40,6 +39,14 @@ interface Draft {
   skillUpdatesEnabled: boolean
   skillMaxFiles: string
   skillMaxKb: string
+  analyzeEnabled: boolean
+  /** Upload command, one argument per line. */
+  uploadCommand: string
+  uploadTimeoutSec: string
+  uploadRetries: string
+  uploadRetryDelaySec: string
+  uploadMaxFiles: string
+  uploadMaxMb: string
 }
 
 function trimNumber(value: number): string {
@@ -48,9 +55,7 @@ function trimNumber(value: number): string {
 
 function toDraft(settings: EditableSettings): Draft {
   return {
-    reposDir: settings.reposDir,
     repos: settings.repos.map(repo => ({ ...repo })),
-    gitCredentials: settings.gitCredentials.map(credential => ({ ...credential })),
     fetchIntervalMin: trimNumber(settings.fetchIntervalMs / MINUTE),
     maxAppsPerRequest: String(settings.maxAppsPerRequest),
     dispatchTimeoutMin: trimNumber(settings.dispatchTimeoutMs / MINUTE),
@@ -60,7 +65,20 @@ function toDraft(settings: EditableSettings): Draft {
     skillUpdatesEnabled: settings.skillUpdates.enabled,
     skillMaxFiles: String(settings.skillUpdates.maxFiles),
     skillMaxKb: trimNumber(settings.skillUpdates.maxFileBytes / KB),
+    analyzeEnabled: settings.analyze.enabled,
+    uploadCommand: settings.analyze.upload.command.join('\n'),
+    uploadTimeoutSec: trimNumber(settings.analyze.upload.timeoutMs / 1000),
+    uploadRetries: String(settings.analyze.upload.retries),
+    uploadRetryDelaySec: trimNumber(settings.analyze.upload.retryDelayMs / 1000),
+    uploadMaxFiles: String(settings.analyze.upload.maxFiles),
+    uploadMaxMb: trimNumber(settings.analyze.upload.maxBytes / MB),
   }
+}
+
+function integer(text: string, label: string, allowZero = false): number {
+  const value = positive(text, label, allowZero)
+  if (!Number.isInteger(value)) throw new Error(`${label}必须是整数`)
+  return value
 }
 
 function positive(text: string, label: string, allowZero = false): number {
@@ -72,12 +90,10 @@ function positive(text: string, label: string, allowZero = false): number {
 function fromDraft(draft: Draft): EditableSettings {
   const maxApps = positive(draft.maxAppsPerRequest, '单次应用数上限')
   if (!Number.isInteger(maxApps)) throw new Error('单次应用数上限必须是整数')
-  const maxFiles = positive(draft.skillMaxFiles, '提议文件数上限')
-  if (!Number.isInteger(maxFiles)) throw new Error('提议文件数上限必须是整数')
+  const maxFiles = positive(draft.skillMaxFiles, '改进文件数上限')
+  if (!Number.isInteger(maxFiles)) throw new Error('改进文件数上限必须是整数')
   return {
-    reposDir: draft.reposDir.trim(),
     repos: draft.repos.map(repo => repo.branch === undefined || repo.branch.trim() === '' ? { url: repo.url.trim() } : { url: repo.url.trim(), branch: repo.branch.trim() }),
-    gitCredentials: draft.gitCredentials.map(credential => ({ url: credential.url.trim(), username: credential.username.trim(), tokenEnv: credential.tokenEnv.trim() })),
     fetchIntervalMs: Math.round(positive(draft.fetchIntervalMin, '更新间隔', true) * MINUTE),
     maxAppsPerRequest: maxApps,
     dispatchTimeoutMs: Math.round(positive(draft.dispatchTimeoutMin, '派发超时') * MINUTE),
@@ -89,7 +105,18 @@ function fromDraft(draft: Draft): EditableSettings {
     skillUpdates: {
       enabled: draft.skillUpdatesEnabled,
       maxFiles,
-      maxFileBytes: Math.round(positive(draft.skillMaxKb, '提议单文件大小上限') * KB),
+      maxFileBytes: Math.round(positive(draft.skillMaxKb, '改进单文件大小上限') * KB),
+    },
+    analyze: {
+      enabled: draft.analyzeEnabled,
+      upload: {
+        command: draft.uploadCommand.split('\n').map(arg => arg.trim()).filter(arg => arg !== ''),
+        timeoutMs: Math.round(positive(draft.uploadTimeoutSec, '回传超时') * 1000),
+        retries: integer(draft.uploadRetries, '重试次数', true),
+        retryDelayMs: Math.round(positive(draft.uploadRetryDelaySec, '重试间隔') * 1000),
+        maxFiles: integer(draft.uploadMaxFiles, '报告文件数上限'),
+        maxBytes: Math.round(positive(draft.uploadMaxMb, '报告总大小上限') * MB),
+      },
     },
   }
 }
@@ -110,38 +137,55 @@ function formatTime(iso: string | number | undefined): string {
 }
 
 function phasePill(repo: RepoStatusWire | undefined): JSX.Element {
-  if (repo === undefined) return <span className="gx__pill"><span className="gx__dot" />保存后拉取</span>
-  if (repo.phase === 'syncing') return <span className="gx__pill gx__pill--warn"><span className="gx__dot" />拉取中</span>
-  if (repo.available) return <span className="gx__pill gx__pill--ok"><span className="gx__dot" />就绪</span>
-  if (repo.phase === 'ready' || repo.phase === 'failed') return <span className="gx__pill gx__pill--bad"><span className="gx__dot" />不可用</span>
-  return <span className="gx__pill"><span className="gx__dot" />待拉取</span>
+  if (repo === undefined) return <span className="lz__pill"><span className="lz__dot" />保存后拉取</span>
+  if (repo.phase === 'syncing') return <span className="lz__pill lz__pill--warn"><span className="lz__dot" />拉取中</span>
+  if (repo.available) return <span className="lz__pill lz__pill--ok"><span className="lz__dot" />就绪</span>
+  if (repo.phase === 'ready' || repo.phase === 'failed') return <span className="lz__pill lz__pill--bad"><span className="lz__dot" />不可用</span>
+  return <span className="lz__pill"><span className="lz__dot" />待拉取</span>
 }
 
 function Overridden({ keys, name }: { keys: readonly EditableKey[]; name: EditableKey }): JSX.Element | null {
-  return keys.includes(name) ? <span className="gx__tag gx__tag--accent">面板设置</span> : null
+  return keys.includes(name) ? <span className="lz__tag lz__tag--accent">面板设置</span> : null
+}
+
+/** Page props supplied by the client entry. */
+export interface LogalyzePageProps {
+  /** Opens dsh-repo's page on the Plugins panel; absent hides the link. */
+  readonly openRepoSettings?: (() => void) | undefined
 }
 
 /**
  * Main-column page for the `main` slot.
+ * @param props - navigation supplied by the client entry.
  * @returns the page.
  */
-export function GuanxiangPage(): JSX.Element {
+export function LogalyzePage({ openRepoSettings }: LogalyzePageProps): JSX.Element {
   return (
-    <section className="gx-page" aria-label={PANEL_TITLE}>
-      <div className="gx-page__content">
-        <GuanxiangPanel />
+    <section className="lz-page" aria-label={PANEL_TITLE}>
+      <div className="lz-page__content">
+        <LogalyzePanel openRepoSettings={openRepoSettings} />
       </div>
     </section>
   )
+}
+
+/**
+ * The `main` slot component, bound to a way of opening dsh-repo's settings.
+ * @param openRepoSettings - opens dsh-repo's page on the Plugins panel, or undefined while that panel is unavailable.
+ * @returns component rendering {@link LogalyzePage}.
+ */
+export function boundLogalyzePage(openRepoSettings: () => (() => void) | undefined): () => JSX.Element {
+  return () => <LogalyzePage openRepoSettings={openRepoSettings()} />
 }
 
 type Notice = { kind: 'ok' | 'error'; text: string } | undefined
 
 /**
  * Panel body: loads state, edits a draft, saves.
+ * @param props - navigation supplied by the client entry.
  * @returns the panel.
  */
-export function GuanxiangPanel(): JSX.Element {
+export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Element {
   const [state, setState] = useState<StateWire | undefined>()
   const [loadError, setLoadError] = useState<string | undefined>()
   const [draft, setDraft] = useState<Draft | undefined>()
@@ -172,18 +216,25 @@ export function GuanxiangPanel(): JSX.Element {
     return () => { clearInterval(timer) }
   }, [syncing, reload])
 
+  useEffect(() => {
+    if (tab !== 'analyze') return
+    const timer = setInterval(() => { void reload(false) }, 5000)
+    return () => { clearInterval(timer) }
+  }, [tab, reload])
+
   const dirty = state !== undefined && draft !== undefined && !sameSettings(draft, state.settings)
 
-  const run = async (action: () => Promise<StateWire>, success: string, resetDraft: boolean): Promise<boolean> => {
+  const run = async (action: () => Promise<StateWire>, success: string, resetDraft: boolean): Promise<StateWire | undefined> => {
     setBusy(true)
     setNotice(undefined)
     try {
-      adopt(await action(), resetDraft)
+      const next = await action()
+      adopt(next, resetDraft)
       setNotice({ kind: 'ok', text: success })
-      return true
+      return next
     } catch (error) {
       setNotice({ kind: 'error', text: messageOf(error) })
-      return false
+      return undefined
     } finally {
       setBusy(false)
     }
@@ -203,51 +254,54 @@ export function GuanxiangPanel(): JSX.Element {
 
   if (state === undefined || draft === undefined) {
     return (
-      <div className="gx">
+      <div className="lz">
         {loadError === undefined
-          ? <div className="gx__loading">加载中…</div>
-          : <div className="gx__notice gx__notice--error">{loadError} <button type="button" className="gx__btn gx__btn--ghost" onClick={() => { void reload(true) }}>重试</button></div>}
+          ? <div className="lz__loading">加载中…</div>
+          : <div className="lz__notice lz__notice--error">{loadError} <button type="button" className="lz__btn lz__btn--ghost" onClick={() => { void reload(true) }}>重试</button></div>}
       </div>
     )
   }
 
   const available = state.repos.filter(repo => repo.available).length
   return (
-    <div className="gx">
-      <header className="gx__head">
-        <div className="gx__headRow">
-          <h1 className="gx__title">{PANEL_TITLE}</h1>
-          <span className={`gx__pill ${available > 0 ? 'gx__pill--ok' : 'gx__pill--warn'}`}><span className="gx__dot" />{available} 个应用可用</span>
-          {syncing ? <span className="gx__pill gx__pill--warn"><span className="gx__dot" />拉取中</span> : null}
+    <div className="lz">
+      <header className="lz__head">
+        <div className="lz__headRow">
+          <h1 className="lz__title">{PANEL_TITLE}</h1>
+          <span className={`lz__pill ${available > 0 ? 'lz__pill--ok' : 'lz__pill--warn'}`}><span className="lz__dot" />{available} 个应用可用</span>
+          {syncing ? <span className="lz__pill lz__pill--warn"><span className="lz__dot" />拉取中</span> : null}
         </div>
-        <div className="gx__meta">观其象，知其因。在对话中输入 /guanxiang 描述问题并附上日志，观象会按应用派发分析。</div>
-        <div className="gx__tabs" role="tablist">
+        <div className="lz__meta">观其象，知其因。在对话中输入 /logalyze 描述问题并附上日志，观象会按应用派发分析。</div>
+        <div className="lz__tabs" role="tablist">
           {TABS.map(item => (
-            <button key={item.id} type="button" role="tab" className="gx__tab" aria-selected={tab === item.id} onClick={() => { setTab(item.id) }}>{item.label}</button>
+            <button key={item.id} type="button" role="tab" className="lz__tab" aria-selected={tab === item.id} onClick={() => { setTab(item.id) }}>{item.label}</button>
           ))}
         </div>
       </header>
-      {state.overlayError === undefined ? null : <div className="gx__notice gx__notice--error">面板设置文件未生效：{state.overlayError}。保存一次会用当前内容覆盖它。</div>}
-      <div className="gx__body" role="tabpanel">
-        {tab === 'repos' ? <ReposTab draft={draft} setDraft={setDraft} state={state} busy={busy || dirty} onSync={(url) => { void run(() => syncRepos(url), url === undefined ? '已开始重新拉取全部仓库' : '已开始重新拉取', false) }} /> : null}
-        {tab === 'tokens'
-          ? <TokensTab
+      {state.overlayError === undefined ? null : <div className="lz__notice lz__notice--error">面板设置文件未生效：{state.overlayError}。保存一次会用当前内容覆盖它。</div>}
+      <div className="lz__body" role="tabpanel">
+        {tab === 'repos' ? <ReposTab draft={draft} setDraft={setDraft} state={state} busy={busy || dirty} openRepoSettings={openRepoSettings} onSync={(url) => { void run(() => syncRepos(url), url === undefined ? '已开始重新拉取全部仓库' : '已开始重新拉取', false) }} /> : null}
+        {tab === 'download' ? <DownloadTab draft={draft} setDraft={setDraft} overridden={state.overridden} /> : null}
+        {tab === 'analyze'
+          ? <AnalyzeTab
               draft={draft}
               setDraft={setDraft}
-              state={state}
+              analyze={state.analyze}
+              credentialsAvailable={state.credentialsAvailable}
+              overridden={state.overridden}
               busy={busy}
-              onSave={(tokenEnv, value) => run(() => saveToken(tokenEnv, value), `已保存 ${tokenEnv}，使用它的仓库会重新拉取`, false)}
-              onClear={(tokenEnv) => run(() => clearToken(tokenEnv), `已清除面板保存的 ${tokenEnv}`, false)}
+              onSave={async value => await run(() => saveToken(state.analyze.tokenEnv, value), '已保存分析接口令牌，下一个请求起生效', false) !== undefined}
+              onClear={() => { void run(() => clearToken(state.analyze.tokenEnv), '已清除面板保存的分析接口令牌', false) }}
+              onRetry={(id) => { void run(() => retryReport(id), '已开始重新上传', false) }}
             />
           : null}
-        {tab === 'download' ? <DownloadTab draft={draft} setDraft={setDraft} overridden={state.overridden} /> : null}
         {tab === 'advanced' ? <AdvancedTab draft={draft} setDraft={setDraft} overridden={state.overridden} busy={busy} onReset={() => { void run(resetSettings, '已恢复为 cordis.yml 中的配置', true) }} /> : null}
       </div>
-      {notice === undefined ? null : <div className={`gx__notice gx__notice--${notice.kind}`}>{notice.text}</div>}
-      <div className="gx__saveBar">
-        <span className="gx__saveMsg">{dirty ? '有未保存的修改' : '设置已保存'}</span>
-        <button type="button" className="gx__btn gx__btn--ghost" disabled={!dirty || busy} onClick={() => { setDraft(toDraft(state.settings)); setNotice(undefined) }}>放弃修改</button>
-        <button type="button" className="gx__btn gx__btn--primary" disabled={!dirty || busy} onClick={save}>保存</button>
+      {notice === undefined ? null : <div className={`lz__notice lz__notice--${notice.kind}`}>{notice.text}</div>}
+      <div className="lz__saveBar">
+        <span className="lz__saveMsg">{dirty ? '有未保存的修改' : '设置已保存'}</span>
+        <button type="button" className="lz__btn lz__btn--ghost" disabled={!dirty || busy} onClick={() => { setDraft(toDraft(state.settings)); setNotice(undefined) }}>放弃修改</button>
+        <button type="button" className="lz__btn lz__btn--primary" disabled={!dirty || busy} onClick={save}>保存</button>
       </div>
     </div>
   )
@@ -258,7 +312,7 @@ interface TabProps {
   setDraft: (next: Draft) => void
 }
 
-function ReposTab({ draft, setDraft, state, busy, onSync }: TabProps & { state: StateWire; busy: boolean; onSync: (url?: string) => void }): JSX.Element {
+function ReposTab({ draft, setDraft, state, busy, openRepoSettings, onSync }: TabProps & LogalyzePageProps & { state: StateWire; busy: boolean; onSync: (url?: string) => void }): JSX.Element {
   const [url, setUrl] = useState('')
   const [branch, setBranch] = useState('')
   const status = useMemo(() => new Map(state.repos.map(repo => [repo.url, repo])), [state.repos])
@@ -270,131 +324,62 @@ function ReposTab({ draft, setDraft, state, busy, onSync }: TabProps & { state: 
     setBranch('')
   }
   return (
-    <section className="gx__sec">
-      <h2 className="gx__secTitle">应用仓库 <Overridden keys={state.overridden} name="repos" /></h2>
-      <div className="gx__list">
-        {draft.repos.length === 0 ? <div className="gx__emptyRow">还没有应用仓库。添加 git 地址后保存，观象会把仓库拉取到本机。</div> : null}
+    <section className="lz__sec">
+      <h2 className="lz__secTitle">应用仓库 <Overridden keys={state.overridden} name="repos" /></h2>
+      <div className="lz__list">
+        {draft.repos.length === 0 ? <div className="lz__emptyRow">还没有应用仓库。添加仓库的 https 地址后保存，观象会把仓库拉取到本机。</div> : null}
         {draft.repos.map((repo, index) => {
           const current = status.get(repo.url)
           const saved = current !== undefined && current.branch === repo.branch
           return (
-            <div key={repo.url} className="gx__row gx__row--top">
-              <div className="gx__rowText">
-                <div className="gx__rowLabel">
-                  <span className="gx__mono">{repo.url}</span>
-                  {repo.branch === undefined ? null : <span className="gx__tag">{repo.branch}</span>}
+            <div key={repo.url} className="lz__row lz__row--top">
+              <div className="lz__rowText">
+                <div className="lz__rowLabel">
+                  <span className="lz__mono">{repo.url}</span>
+                  {repo.branch === undefined ? null : <span className="lz__tag">{repo.branch}</span>}
                   {phasePill(saved ? current : undefined)}
                 </div>
                 {saved && current.app !== undefined
-                  ? <div className="gx__rowSummary">{current.app.name}（<span className="gx__mono">{current.app.id}</span>）· SKILL <span className="gx__mono">/{current.app.skill}</span>{current.activeRuns > 0 ? ` · ${current.activeRuns} 个分析进行中` : ''}</div>
+                  ? <div className="lz__rowSummary">{current.app.name}（<span className="lz__mono">{current.app.id}</span>）· SKILL <span className="lz__mono">/{current.app.skill}</span>{current.activeRuns > 0 ? ` · ${current.activeRuns} 个分析进行中` : ''}</div>
                   : null}
-                {saved && current.app !== undefined ? <div className="gx__rowSummary">{current.app.description}</div> : null}
+                {saved && current.app !== undefined ? <div className="lz__rowSummary">{current.app.description}</div> : null}
                 {saved && current.commit !== undefined
-                  ? <div className="gx__rowSummary">提交 <span className="gx__mono">{current.commit.slice(0, 8)}</span>（{formatTime(current.commitTime)}）· 拉取于 {formatTime(current.syncedAt)} · <span className="gx__mono">{current.dir}</span></div>
+                  ? <div className="lz__rowSummary">提交 <span className="lz__mono">{current.commit.slice(0, 8)}</span>（{formatTime(current.commitTime)}）· 拉取于 {formatTime(current.syncedAt)}{current.dir === undefined ? null : <> · <span className="lz__mono">{current.dir}</span></>}</div>
                   : null}
-                {saved && current.error !== undefined ? <div className="gx__rowError">{current.error}</div> : null}
+                {saved && current.error !== undefined ? <div className="lz__rowError">{current.error}</div> : null}
               </div>
-              <div className="gx__rowCtl">
-                {saved ? <button type="button" className="gx__btn" disabled={busy || current.phase === 'syncing'} onClick={() => { onSync(repo.url) }}>重新拉取</button> : null}
-                <button type="button" className="gx__btn gx__btn--danger" onClick={() => { setDraft({ ...draft, repos: draft.repos.filter((_, position) => position !== index) }) }}>删除</button>
+              <div className="lz__rowCtl">
+                {saved ? <button type="button" className="lz__btn" disabled={busy || current.phase === 'syncing'} onClick={() => { onSync(repo.url) }}>重新拉取</button> : null}
+                <button type="button" className="lz__btn lz__btn--danger" onClick={() => { setDraft({ ...draft, repos: draft.repos.filter((_, position) => position !== index) }) }}>删除</button>
               </div>
             </div>
           )
         })}
-        <div className="gx__addRow">
-          <input className="gx__input" placeholder="git 地址，例如 git@github.com:example/order-service.git" value={url} onChange={(event) => { setUrl(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') add() }} />
-          <input className="gx__input gx__input--branch" placeholder="分支（可选）" value={branch} onChange={(event) => { setBranch(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') add() }} />
-          <button type="button" className="gx__btn" disabled={url.trim() === ''} onClick={add}>添加</button>
+        <div className="lz__addRow">
+          <input className="lz__input" placeholder="仓库 https 地址，例如 https://github.com/example/order-service.git" value={url} onChange={(event) => { setUrl(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') add() }} />
+          <input className="lz__input lz__input--branch" placeholder="分支（可选）" value={branch} onChange={(event) => { setBranch(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') add() }} />
+          <button type="button" className="lz__btn" disabled={url.trim() === ''} onClick={add}>添加</button>
         </div>
       </div>
-      <p className="gx__secFoot">使用本机已有的 git 凭据（SSH key 或 credential helper）拉取；https 地址可在「访问令牌」中配置个人访问令牌。不留分支时跟随远端默认分支。每个仓库需包含 <span className="gx__mono">.dsh/guanxiang.yaml</span> 与其中声明的日志分析 SKILL。删除地址不会删除本地目录。</p>
-      {state.repos.length > 0 ? <div><button type="button" className="gx__btn" disabled={busy} onClick={() => { onSync() }}>重新拉取全部</button></div> : null}
+      {state.dshRepo.availability === 'ready' ? null : <div className="lz__notice lz__notice--error">{state.dshRepo.availability === 'missing' ? '没有加载 dsh-repo 插件，仓库无法拉取。请安装 dsh-repo。' : 'dsh-repo 版本与观象不兼容，仓库无法拉取。'}</div>}
+      <p className="lz__secFoot">由 dsh-repo 拉取到它的镜像目录{state.dshRepo.mirrorDir === undefined ? '' : `（${state.dshRepo.mirrorDir}）`}。只支持 https 地址（也可以是 file URL 或本机绝对路径），不支持 ssh 地址；主机或令牌变更后会自动重新拉取。不留分支时跟随远端默认分支。每个仓库需包含 <span className="lz__mono">.agents/logalyze.yaml</span> 与其中声明的日志分析 SKILL。删除地址不会删除本地镜像。</p>
+      <div className="lz__headRow">
+        {state.repos.length > 0 ? <button type="button" className="lz__btn" disabled={busy} onClick={() => { onSync() }}>重新拉取全部</button> : null}
+        {openRepoSettings === undefined || state.dshRepo.availability === 'missing' ? null : <button type="button" className="lz__btn lz__btn--ghost" onClick={openRepoSettings}>管理主机与令牌</button>}
+      </div>
     </section>
   )
 }
-
-const DEFAULT_USERNAME = 'oauth2'
-const DEFAULT_TOKEN_ENV = 'GITLAB_TOKEN'
 
 /** Credential store layers of `@deepseek-ai/dsh-credentials-local` other than its own file. */
 const TOKEN_SOURCES: Readonly<Record<string, string>> = { 'env': '启动环境变量', 'project-env': '项目 .env', 'user-env': '$DSH_HOME/.env' }
 
 function tokenPill(token: TokenStatusWire | undefined): JSX.Element {
-  if (token === undefined) return <span className="gx__pill"><span className="gx__dot" />保存后设置令牌</span>
-  if (token.error !== undefined) return <span className="gx__pill gx__pill--bad"><span className="gx__dot" />无法读取</span>
-  if (!token.configured) return <span className="gx__pill gx__pill--warn"><span className="gx__dot" />未设置令牌</span>
+  if (token === undefined) return <span className="lz__pill"><span className="lz__dot" />保存后设置令牌</span>
+  if (token.error !== undefined) return <span className="lz__pill lz__pill--bad"><span className="lz__dot" />无法读取</span>
+  if (!token.configured) return <span className="lz__pill lz__pill--warn"><span className="lz__dot" />未设置令牌</span>
   const source = token.source === undefined || token.source === 'file' ? undefined : TOKEN_SOURCES[token.source] ?? token.source
-  return <span className="gx__pill gx__pill--ok"><span className="gx__dot" />已设置{source === undefined ? '' : `（来自${source}）`}</span>
-}
-
-function TokensTab({ draft, setDraft, state, busy, onSave, onClear }: TabProps & {
-  state: StateWire
-  busy: boolean
-  onSave: (tokenEnv: string, value: string) => Promise<boolean>
-  onClear: (tokenEnv: string) => Promise<boolean>
-}): JSX.Element {
-  const [url, setUrl] = useState('')
-  const [username, setUsername] = useState(DEFAULT_USERNAME)
-  const [tokenEnv, setTokenEnv] = useState(DEFAULT_TOKEN_ENV)
-  const [values, setValues] = useState<Record<string, string>>({})
-  const tokens = useMemo(() => new Map(state.credentials.tokens.map(token => [token.tokenEnv, token])), [state.credentials.tokens])
-  const saved = useMemo(() => new Set(state.settings.gitCredentials.map(credential => credential.tokenEnv)), [state.settings.gitCredentials])
-  const add = (): void => {
-    const trimmed = url.trim()
-    if (trimmed === '' || draft.gitCredentials.some(credential => credential.url === trimmed)) return
-    setDraft({ ...draft, gitCredentials: [...draft.gitCredentials, { url: trimmed, username: username.trim() === '' ? DEFAULT_USERNAME : username.trim(), tokenEnv: tokenEnv.trim() === '' ? DEFAULT_TOKEN_ENV : tokenEnv.trim() }] })
-    setUrl('')
-  }
-  const save = (name: string): void => {
-    const value = values[name]?.trim() ?? ''
-    if (value === '') return
-    void onSave(name, value).then((ok) => { if (ok) setValues(current => ({ ...current, [name]: '' })) })
-  }
-  return (
-    <section className="gx__sec">
-      <h2 className="gx__secTitle">HTTPS 访问令牌 <Overridden keys={state.overridden} name="gitCredentials" /></h2>
-      {state.credentials.available ? null : <div className="gx__notice gx__notice--error">当前 DSH 组合没有加载凭据服务（@deepseek-ai/dsh-credentials-local），无法保存或读取令牌。</div>}
-      <div className="gx__list">
-        {draft.gitCredentials.length === 0 ? <div className="gx__emptyRow">还没有访问令牌。用 https 地址拉取 GitLab 等私有仓库时，添加服务器地址后保存，再填入个人访问令牌。</div> : null}
-        {draft.gitCredentials.map((credential, index) => {
-          const token = saved.has(credential.tokenEnv) ? tokens.get(credential.tokenEnv) : undefined
-          const value = values[credential.tokenEnv] ?? ''
-          return (
-            <div key={credential.url} className="gx__row gx__row--top">
-              <div className="gx__rowText">
-                <div className="gx__rowLabel">
-                  <span className="gx__mono">{credential.url}</span>
-                  <span className="gx__tag">用户名 {credential.username}</span>
-                  {tokenPill(token)}
-                </div>
-                <div className="gx__rowSummary">令牌名称 <span className="gx__mono">{credential.tokenEnv}</span></div>
-                {token?.error === undefined ? null : <div className="gx__rowError">{token.error}</div>}
-                {token !== undefined && token.writable
-                  ? (
-                      <div className="gx__addRow gx__addRow--flush">
-                        <input className="gx__input gx__mono" type="password" autoComplete="new-password" spellCheck={false} placeholder={token.configured ? '输入新令牌以替换' : '粘贴个人访问令牌，例如 glpat-…'} value={value} onChange={(event) => { setValues({ ...values, [credential.tokenEnv]: event.target.value }) }} onKeyDown={(event) => { if (event.key === 'Enter') save(credential.tokenEnv) }} />
-                        <button type="button" className="gx__btn" disabled={busy || value.trim() === ''} onClick={() => { save(credential.tokenEnv) }}>保存令牌</button>
-                        {token.configured && token.source === 'file' ? <button type="button" className="gx__btn gx__btn--ghost" disabled={busy} onClick={() => { void onClear(credential.tokenEnv) }}>清除</button> : null}
-                      </div>
-                    )
-                  : null}
-              </div>
-              <div className="gx__rowCtl">
-                <button type="button" className="gx__btn gx__btn--danger" onClick={() => { setDraft({ ...draft, gitCredentials: draft.gitCredentials.filter((_, position) => position !== index) }) }}>删除</button>
-              </div>
-            </div>
-          )
-        })}
-        <div className="gx__addRow">
-          <input className="gx__input" placeholder="服务器地址，例如 https://gitlab.example.com" value={url} onChange={(event) => { setUrl(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') add() }} />
-          <input className="gx__input gx__input--branch" placeholder={`用户名（默认 ${DEFAULT_USERNAME}）`} value={username} onChange={(event) => { setUsername(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') add() }} />
-          <input className="gx__input gx__input--branch gx__mono" placeholder="令牌名称" value={tokenEnv} onChange={(event) => { setTokenEnv(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') add() }} />
-          <button type="button" className="gx__btn" disabled={url.trim() === ''} onClick={add}>添加</button>
-        </div>
-      </div>
-      <p className="gx__secFoot">地址在这个前缀下的 https 仓库使用对应令牌拉取（多个匹配时取路径最长的），ssh 地址不受影响。GitLab 个人访问令牌需要 read_repository 权限，用户名填 oauth2 即可。令牌保存在 DSH 凭据库（默认 $DSH_HOME/.credentials.yaml，仅本机用户可读），面板只显示是否已设置；也可以设置与令牌名称同名的环境变量。拉取时令牌只经环境变量交给 git，不写入仓库配置、日志或模型上下文。</p>
-    </section>
-  )
+  return <span className="lz__pill lz__pill--ok"><span className="lz__dot" />已设置{source === undefined ? '' : `（来自${source}）`}</span>
 }
 
 function DownloadTab({ draft, setDraft, overridden }: TabProps & { overridden: readonly EditableKey[] }): JSX.Element {
@@ -407,28 +392,160 @@ function DownloadTab({ draft, setDraft, overridden }: TabProps & { overridden: r
   }
   return (
     <>
-      <section className="gx__sec">
-        <h2 className="gx__secTitle">允许下载的域名 <Overridden keys={overridden} name="download" /></h2>
-        <div className="gx__list">
-          {draft.allowedHosts.length === 0 ? <div className="gx__emptyRow">未配置域名，消息中的日志下载链接不会被下载。</div> : null}
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">允许下载的域名 <Overridden keys={overridden} name="download" /></h2>
+        <div className="lz__list">
+          {draft.allowedHosts.length === 0 ? <div className="lz__emptyRow">未配置域名，消息中的日志下载链接不会被下载。</div> : null}
           {draft.allowedHosts.map(item => (
-            <div key={item} className="gx__row">
-              <div className="gx__rowText"><span className="gx__mono">{item}</span></div>
-              <div className="gx__rowCtl"><button type="button" className="gx__btn gx__btn--danger" onClick={() => { setDraft({ ...draft, allowedHosts: draft.allowedHosts.filter(entry => entry !== item) }) }}>删除</button></div>
+            <div key={item} className="lz__row">
+              <div className="lz__rowText"><span className="lz__mono">{item}</span></div>
+              <div className="lz__rowCtl"><button type="button" className="lz__btn lz__btn--danger" onClick={() => { setDraft({ ...draft, allowedHosts: draft.allowedHosts.filter(entry => entry !== item) }) }}>删除</button></div>
             </div>
           ))}
-          <div className="gx__addRow">
-            <input className="gx__input" placeholder="主机名，例如 oss.example.com" value={host} onChange={(event) => { setHost(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') add() }} />
-            <button type="button" className="gx__btn" disabled={host.trim() === ''} onClick={add}>添加</button>
+          <div className="lz__addRow">
+            <input className="lz__input" placeholder="主机名，例如 oss.example.com" value={host} onChange={(event) => { setHost(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') add() }} />
+            <button type="button" className="lz__btn" disabled={host.trim() === ''} onClick={add}>添加</button>
           </div>
         </div>
-        <p className="gx__secFoot">只填主机名，同时允许它的子域名。下载不携带任何鉴权信息，每次重定向都会重新校验域名。</p>
+        <p className="lz__secFoot">只填主机名，同时允许它的子域名。下载不携带任何鉴权信息，每次重定向都会重新校验域名。</p>
       </section>
-      <section className="gx__sec">
-        <h2 className="gx__secTitle">限制</h2>
-        <div className="gx__list">
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">限制</h2>
+        <div className="lz__list">
           <NumberRow label="单文件大小上限" unit="MB" value={draft.maxMb} onChange={(value) => { setDraft({ ...draft, maxMb: value }) }} />
           <NumberRow label="单文件下载超时" unit="秒" value={draft.timeoutSec} onChange={(value) => { setDraft({ ...draft, timeoutSec: value }) }} />
+        </div>
+      </section>
+    </>
+  )
+}
+
+const TOPICS_STATUS: Readonly<Record<AnalyzeWire['topics'], { pill: string; text: string }>> = {
+  ready: { pill: 'lz__pill--ok', text: '飞书渠道就绪' },
+  missing: { pill: 'lz__pill--bad', text: '未找到飞书渠道' },
+  incompatible: { pill: 'lz__pill--bad', text: '飞书渠道版本不兼容' },
+}
+
+const REPORT_STATUS: Readonly<Record<ReportStatus, { pill: string; text: string }>> = {
+  done: { pill: 'lz__pill--ok', text: '已完成' },
+  stopped: { pill: '', text: '已停止' },
+  error: { pill: 'lz__pill--bad', text: '失败' },
+  failed: { pill: 'lz__pill--bad', text: '未能开始' },
+  interrupted: { pill: 'lz__pill--warn', text: '已中断' },
+}
+
+const UPLOAD_PHASE: Readonly<Record<UploadPhase, { pill: string; text: string }>> = {
+  pending: { pill: '', text: '等待上传' },
+  running: { pill: 'lz__pill--warn', text: '上传中' },
+  waiting: { pill: 'lz__pill--warn', text: '等待重试' },
+  done: { pill: 'lz__pill--ok', text: '已上传' },
+  failed: { pill: 'lz__pill--bad', text: '上传失败' },
+}
+
+function ReportRow({ report, busy, onRetry }: { report: ReportWire; busy: boolean; onRetry: (id: string) => void }): JSX.Element {
+  const status = report.status === undefined ? { pill: 'lz__pill--warn', text: '分析中' } : REPORT_STATUS[report.status]
+  const phase = report.status === undefined && report.phase === 'pending' ? undefined : UPLOAD_PHASE[report.phase]
+  return (
+    <div className="lz__row lz__row--top">
+      <div className="lz__rowText">
+        <div className="lz__rowLabel">
+          <span className="lz__mono">{report.logId}</span>
+          <span className="lz__tag">{report.app} · {report.errorCode}</span>
+          <span className={`lz__pill ${status.pill}`}><span className="lz__dot" />{status.text}</span>
+          {report.followups > 0 ? <span className="lz__tag">追问 {report.followups}</span> : null}
+          {phase === undefined ? null : <span className={`lz__pill ${phase.pill}`}><span className="lz__dot" />{phase.text}</span>}
+          <span className="lz__rowSummary">{formatTime(report.uploadedAt ?? report.acceptedAt)}</span>
+        </div>
+        {report.error === undefined || report.phase === 'done' ? null : <div className="lz__rowError">{report.error}</div>}
+        {report.warnings.length === 0 ? null : <div className="lz__rowSummary">链接提示：{report.warnings.join('；')}</div>}
+      </div>
+      <div className="lz__rowCtl"><button type="button" className="lz__btn" disabled={busy || report.phase === 'running'} title={report.dir} onClick={() => { onRetry(report.id) }}>重新上传</button></div>
+    </div>
+  )
+}
+
+function AnalyzeTab({ draft, setDraft, analyze, credentialsAvailable, overridden, busy, onSave, onClear, onRetry }: TabProps & {
+  analyze: AnalyzeWire
+  credentialsAvailable: boolean
+  overridden: readonly EditableKey[]
+  busy: boolean
+  onSave: (value: string) => Promise<boolean>
+  onClear: () => void
+  onRetry: (id: string) => void
+}): JSX.Element {
+  const [value, setValue] = useState('')
+  const token = analyze.token
+  const save = (): void => {
+    const trimmed = value.trim()
+    if (trimmed === '' || busy) return
+    void onSave(trimmed).then((ok) => { if (ok) setValue('') })
+  }
+  const topics = TOPICS_STATUS[analyze.topics]
+  const endpoint = new URL(analyze.route.slice(1), document.baseURI).href
+  return (
+    <>
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">日志平台分析接口</h2>
+        <div className="lz__list">
+          <div className="lz__row">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">开启接口 <Overridden keys={overridden} name="analyze" /><span className={`lz__pill ${topics.pill}`}><span className="lz__dot" />{topics.text}</span></div>
+              <div className="lz__rowSummary">日志平台调用接口后，观象经飞书渠道（dsh-channels）在目标群发出分析卡片，并在卡片下的话题里开始分析；群内成员都可以在话题里继续追问。关闭时接口回复 404。</div>
+              {analyze.topics === 'ready' ? null : <div className="lz__rowError">{analyze.topics === 'missing' ? '接口需要加载 dsh-channels。' : '请把观象与 dsh-channels 升级到相互兼容的版本。'}</div>}
+            </div>
+            <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="开启分析接口" checked={draft.analyzeEnabled} onChange={(event) => { setDraft({ ...draft, analyzeEnabled: event.target.checked }) }} /></div>
+          </div>
+          <div className="lz__row lz__row--top">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">访问令牌 <span className="lz__tag lz__mono">{analyze.tokenEnv}</span>{credentialsAvailable ? tokenPill(token) : null}</div>
+              <div className="lz__rowSummary">日志平台以 <span className="lz__mono">Authorization: Bearer &lt;令牌&gt;</span> 调用接口。令牌未设置时接口回复 503。</div>
+              {credentialsAvailable ? null : <div className="lz__rowError">当前 DSH 组合没有加载凭据服务（@deepseek-ai/dsh-credentials-local），无法保存或读取令牌。</div>}
+              {token?.error === undefined ? null : <div className="lz__rowError">{token.error}</div>}
+              {token !== undefined && token.writable
+                ? (
+                    <div className="lz__addRow lz__addRow--flush">
+                      <input className="lz__input lz__mono" type="password" autoComplete="new-password" spellCheck={false} placeholder={token.configured ? '输入新令牌以替换' : '粘贴令牌'} value={value} onChange={(event) => { setValue(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') save() }} />
+                      <button type="button" className="lz__btn" disabled={busy || value.trim() === ''} onClick={save}>保存令牌</button>
+                      {token.configured && token.source === 'file' ? <button type="button" className="lz__btn lz__btn--ghost" disabled={busy} onClick={onClear}>清除</button> : null}
+                    </div>
+                  )
+                : null}
+            </div>
+          </div>
+        </div>
+      </section>
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">报告回传</h2>
+        <div className="lz__list">
+          <div className="lz__row lz__row--top">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">回传命令 <Overridden keys={overridden} name="analyze" /></div>
+              <div className="lz__rowSummary">请求带 <span className="lz__mono">logId</span> 时，分析话题每一轮结束后，观象更新话题工作目录下的 <span className="lz__mono">report/</span>（入口 <span className="lz__mono">report.md</span> 记录首轮结论和每轮追问），再执行这条命令上传整个目录。每行一个参数，不经过 shell；可用占位符 <span className="lz__mono">{'{logId}'}</span>、<span className="lz__mono">{'{dir}'}</span>（报告目录绝对路径）、<span className="lz__mono">{'{entry}'}</span>（report.md）。</div>
+              {analyze.reportsSupported || analyze.topics !== 'ready' ? null : <div className="lz__rowError">当前 dsh-channels 版本不提供话题状态查询，报告不会回传；请升级 dsh-channels。</div>}
+              <textarea className="lz__input lz__mono lz__textarea" rows={Math.max(3, draft.uploadCommand.split('\n').length)} spellCheck={false} aria-label="回传命令" value={draft.uploadCommand} onChange={(event) => { setDraft({ ...draft, uploadCommand: event.target.value }) }} />
+            </div>
+          </div>
+          <NumberRow label="单次上传超时" unit="秒" value={draft.uploadTimeoutSec} onChange={(value) => { setDraft({ ...draft, uploadTimeoutSec: value }) }} />
+          <NumberRow label="失败重试次数" summary="命令失败后再试的次数；第一次重试前等待下面的间隔，之后每次加倍。" unit="次" value={draft.uploadRetries} onChange={(value) => { setDraft({ ...draft, uploadRetries: value }) }} />
+          <NumberRow label="重试间隔" unit="秒" value={draft.uploadRetryDelaySec} onChange={(value) => { setDraft({ ...draft, uploadRetryDelaySec: value }) }} />
+          <NumberRow label="报告文件数上限" summary="报告目录里有符号链接、文件数或总大小超过上限时不上传。" unit="个" value={draft.uploadMaxFiles} onChange={(value) => { setDraft({ ...draft, uploadMaxFiles: value }) }} />
+          <NumberRow label="报告总大小上限" unit="MB" value={draft.uploadMaxMb} onChange={(value) => { setDraft({ ...draft, uploadMaxMb: value }) }} />
+        </div>
+      </section>
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">回传记录</h2>
+        <div className="lz__list">
+          {analyze.reports.length === 0 ? <div className="lz__emptyRow">还没有带 logId 的分析请求。</div> : null}
+          {analyze.reports.map(report => <ReportRow key={report.id} report={report} busy={busy} onRetry={onRetry} />)}
+        </div>
+      </section>
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">调用方式</h2>
+        <div className="lz__list">
+          <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">地址</div><div className="lz__rowSummary lz__mono">POST {endpoint}</div></div></div>
+          <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">请求头</div><div className="lz__rowSummary lz__mono">Authorization: Bearer &lt;令牌&gt; · Idempotency-Key: &lt;1-200 个可见 ASCII 字符&gt; · Content-Type: application/json</div></div></div>
+          <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">请求体</div><div className="lz__rowSummary lz__mono">requesterUserId, triggeredAt, app, errorCode, logDetails[{'{'}name, url{'}'}], chatId, prompt, logId（可选，带上即回传报告）</div></div></div>
+          <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">响应</div><div className="lz__rowSummary">202 已发出分析卡片（同一 Idempotency-Key 重试返回同一张卡片）；400/401/404/405/409/413/415 请求问题；403 目标群未授权；502 卡片发送失败；503 飞书未连接或令牌未设置。字段说明见观象 README。</div></div></div>
         </div>
       </section>
     </>
@@ -438,49 +555,42 @@ function DownloadTab({ draft, setDraft, overridden }: TabProps & { overridden: r
 function AdvancedTab({ draft, setDraft, overridden, busy, onReset }: TabProps & { overridden: readonly EditableKey[]; busy: boolean; onReset: () => void }): JSX.Element {
   return (
     <>
-      <section className="gx__sec">
-        <h2 className="gx__secTitle">仓库</h2>
-        <div className="gx__list">
-          <div className="gx__row">
-            <div className="gx__rowText">
-              <div className="gx__rowLabel">拉取目录 <Overridden keys={overridden} name="reposDir" /></div>
-              <div className="gx__rowSummary">每个仓库拉取到该目录下的同名子目录，观象只读使用。</div>
-            </div>
-            <div className="gx__rowCtl"><input className="gx__input gx__input--wide gx__mono" value={draft.reposDir} onChange={(event) => { setDraft({ ...draft, reposDir: event.target.value }) }} /></div>
-          </div>
-          <NumberRow label="更新间隔" summary="输入 /guanxiang 时，距上次拉取超过该时间的仓库会先更新；0 表示每次都更新。" unit="分钟" value={draft.fetchIntervalMin} overridden={overridden.includes('fetchIntervalMs')} onChange={(value) => { setDraft({ ...draft, fetchIntervalMin: value }) }} />
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">仓库</h2>
+        <div className="lz__list">
+          <NumberRow label="更新间隔" summary="输入 /logalyze 时，距上次拉取超过该时间的仓库会先更新；0 表示每次都更新。" unit="分钟" value={draft.fetchIntervalMin} overridden={overridden.includes('fetchIntervalMs')} onChange={(value) => { setDraft({ ...draft, fetchIntervalMin: value }) }} />
         </div>
       </section>
-      <section className="gx__sec">
-        <h2 className="gx__secTitle">派发</h2>
-        <div className="gx__list">
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">派发</h2>
+        <div className="lz__list">
           <NumberRow label="单次应用数上限" summary="一次派发最多同时分析的应用数，不应超过 DSH 的活动子 Agent 上限（默认 8）。" unit="个" value={draft.maxAppsPerRequest} overridden={overridden.includes('maxAppsPerRequest')} onChange={(value) => { setDraft({ ...draft, maxAppsPerRequest: value }) }} />
           <NumberRow label="派发超时" summary="等待全部子 Agent 的最长时间，超时后停止仍在运行的子 Agent。" unit="分钟" value={draft.dispatchTimeoutMin} overridden={overridden.includes('dispatchTimeoutMs')} onChange={(value) => { setDraft({ ...draft, dispatchTimeoutMin: value }) }} />
         </div>
       </section>
-      <section className="gx__sec">
-        <h2 className="gx__secTitle">SKILL 改进</h2>
-        <div className="gx__list">
-          <div className="gx__row">
-            <div className="gx__rowText">
-              <div className="gx__rowLabel">允许提出 SKILL 修改 <Overridden keys={overridden} name="skillUpdates" /></div>
-              <div className="gx__rowSummary">子 Agent 发现应用的日志分析 SKILL 有欠缺时可以写出修改提议；经用户授权后，观象用访问令牌把它推送到新分支并创建合并请求（GitLab，令牌需要 write_repository 权限）。</div>
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">SKILL 改进</h2>
+        <div className="lz__list">
+          <div className="lz__row">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">分析后建议改进 SKILL <Overridden keys={overridden} name="skillUpdates" /></div>
+              <div className="lz__rowSummary">子 Agent 发现应用的日志分析 SKILL 写错或缺内容时记下不足，父 Agent 在分析结论之后附上改进建议；用户在对话中同意后，每个应用由一个改进子 Agent 把所有改进点整理为案例并修改 SKILL，观象经 dsh-repo 提交到新分支并创建合并请求（GitLab 或 GitHub，需要安装 dsh-repo 并配置该仓库主机的令牌）。</div>
             </div>
-            <div className="gx__rowCtl"><input type="checkbox" className="gx__check" aria-label="允许提出 SKILL 修改" checked={draft.skillUpdatesEnabled} onChange={(event) => { setDraft({ ...draft, skillUpdatesEnabled: event.target.checked }) }} /></div>
+            <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="分析后建议改进 SKILL" checked={draft.skillUpdatesEnabled} onChange={(event) => { setDraft({ ...draft, skillUpdatesEnabled: event.target.checked }) }} /></div>
           </div>
-          <NumberRow label="提议文件数上限" unit="个" value={draft.skillMaxFiles} onChange={(value) => { setDraft({ ...draft, skillMaxFiles: value }) }} />
-          <NumberRow label="提议单文件大小上限" unit="KB" value={draft.skillMaxKb} onChange={(value) => { setDraft({ ...draft, skillMaxKb: value }) }} />
+          <NumberRow label="改进文件数上限" unit="个" value={draft.skillMaxFiles} onChange={(value) => { setDraft({ ...draft, skillMaxFiles: value }) }} />
+          <NumberRow label="改进单文件大小上限" unit="KB" value={draft.skillMaxKb} onChange={(value) => { setDraft({ ...draft, skillMaxKb: value }) }} />
         </div>
       </section>
-      <section className="gx__sec">
-        <h2 className="gx__secTitle">面板设置</h2>
-        <div className="gx__list">
-          <div className="gx__row">
-            <div className="gx__rowText">
-              <div className="gx__rowLabel">恢复 cordis.yml 配置</div>
-              <div className="gx__rowSummary">删除面板保存的全部设置（$DSH_HOME/guanxiang/settings.json 中的覆盖值）。</div>
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">面板设置</h2>
+        <div className="lz__list">
+          <div className="lz__row">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">恢复 cordis.yml 配置</div>
+              <div className="lz__rowSummary">删除面板保存的全部设置（$DSH_HOME/logalyze/settings.json 中的覆盖值）。</div>
             </div>
-            <div className="gx__rowCtl"><button type="button" className="gx__btn gx__btn--danger" disabled={busy || overridden.length === 0} onClick={onReset}>恢复</button></div>
+            <div className="lz__rowCtl"><button type="button" className="lz__btn lz__btn--danger" disabled={busy || overridden.length === 0} onClick={onReset}>恢复</button></div>
           </div>
         </div>
       </section>
@@ -490,14 +600,14 @@ function AdvancedTab({ draft, setDraft, overridden, busy, onReset }: TabProps & 
 
 function NumberRow({ label, summary, unit, value, overridden = false, onChange }: { label: string; summary?: string; unit: string; value: string; overridden?: boolean; onChange: (value: string) => void }): JSX.Element {
   return (
-    <div className="gx__row">
-      <div className="gx__rowText">
-        <div className="gx__rowLabel">{label}{overridden ? <span className="gx__tag gx__tag--accent">面板设置</span> : null}</div>
-        {summary === undefined ? null : <div className="gx__rowSummary">{summary}</div>}
+    <div className="lz__row">
+      <div className="lz__rowText">
+        <div className="lz__rowLabel">{label}{overridden ? <span className="lz__tag lz__tag--accent">面板设置</span> : null}</div>
+        {summary === undefined ? null : <div className="lz__rowSummary">{summary}</div>}
       </div>
-      <div className="gx__rowCtl">
-        <input className="gx__input gx__input--num" inputMode="decimal" value={value} onChange={(event) => { onChange(event.target.value) }} />
-        <span className="gx__unit">{unit}</span>
+      <div className="lz__rowCtl">
+        <input className="lz__input lz__input--num" inputMode="decimal" value={value} onChange={(event) => { onChange(event.target.value) }} />
+        <span className="lz__unit">{unit}</span>
       </div>
     </div>
   )

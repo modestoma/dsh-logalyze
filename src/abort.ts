@@ -1,7 +1,7 @@
 /**
  * Cancellation helpers shared by the entry skill and the dispatch tool.
  *
- * @module dsh-guanxiang/abort
+ * @module dsh-logalyze/abort
  */
 
 /**

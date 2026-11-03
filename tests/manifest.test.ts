@@ -24,7 +24,7 @@ describe('application manifest', () => {
   })
 
   it('reports invalid ids and missing fields', () => {
-    expect(parseManifest('id: Order_Service\nname: x\ndescription: y\nskill: a')).toMatchObject({ ok: false, error: expect.stringMatching(/^\.dsh\/guanxiang\.yaml 不合法：id/) })
+    expect(parseManifest('id: Order_Service\nname: x\ndescription: y\nskill: a')).toMatchObject({ ok: false, error: expect.stringMatching(/^\.agents\/logalyze\.yaml 不合法：id/) })
     expect(parseManifest('id: a\nskill: b')).toMatchObject({ ok: false })
     expect(parseManifest(': : :')).toMatchObject({ ok: false, error: expect.stringContaining('不是合法 YAML') })
   })
@@ -32,11 +32,11 @@ describe('application manifest', () => {
   it('reports a missing manifest and a missing or non-invocable skill', async () => {
     const { dir, cleanup } = await tempDir()
     cleanups.push(cleanup)
-    expect(await readAppManifest(dir)).toEqual({ ok: false, error: '仓库缺少应用描述 .dsh/guanxiang.yaml' })
-    await mkdir(join(dir, '.dsh/skills/log-analysis'), { recursive: true })
-    await writeFile(join(dir, '.dsh/guanxiang.yaml'), 'id: a\nname: A\ndescription: d\nskill: log-analysis\n')
-    expect(await readAppManifest(dir)).toEqual({ ok: false, error: '仓库缺少日志分析 SKILL .dsh/skills/log-analysis/SKILL.md' })
-    await writeFile(join(dir, '.dsh/skills/log-analysis/SKILL.md'), '---\nname: log-analysis\nuser-invocable: false\n---\nbody')
+    expect(await readAppManifest(dir)).toEqual({ ok: false, error: '仓库缺少应用描述 .agents/logalyze.yaml' })
+    await mkdir(join(dir, '.agents/skills/log-analysis'), { recursive: true })
+    await writeFile(join(dir, '.agents/logalyze.yaml'), 'id: a\nname: A\ndescription: d\nskill: log-analysis\n')
+    expect(await readAppManifest(dir)).toEqual({ ok: false, error: '仓库缺少日志分析 SKILL .agents/skills/log-analysis/SKILL.md' })
+    await writeFile(join(dir, '.agents/skills/log-analysis/SKILL.md'), '---\nname: log-analysis\nuser-invocable: false\n---\nbody')
     expect(await readAppManifest(dir)).toMatchObject({ ok: false, error: expect.stringContaining('user-invocable: false') })
   })
 

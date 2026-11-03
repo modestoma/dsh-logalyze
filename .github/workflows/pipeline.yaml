@@ -66,7 +66,7 @@ jobs:
       contents: write
       id-token: write
     concurrency:
-      group: dsh-guanxiang-release
+      group: dsh-logalyze-release
       cancel-in-progress: false
       # Queued runs can differ in dry_run, so none may replace another.
       queue: max

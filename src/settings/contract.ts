@@ -2,35 +2,36 @@
  * 设置面板与 Host 路由共用的路由常量和 JSON 结构。浏览器端 bundle 也会
  * 编译本文件，因此这里只放类型和常量，不 import 任何 Node 模块。
  *
- * @module dsh-guanxiang/settings/contract
+ * @module dsh-logalyze/settings/contract
  */
 
 /** GET：面板所需的全部状态（生效设置、默认值、仓库与应用）。 */
-export const STATE_ROUTE = '/guanxiang/state'
+export const STATE_ROUTE = '/logalyze/state'
 /** PUT：保存可编辑设置；DELETE：清除面板覆盖、恢复 cordis.yml 默认值。 */
-export const SETTINGS_ROUTE = '/guanxiang/settings'
+export const SETTINGS_ROUTE = '/logalyze/settings'
 /** POST：立即重新拉取全部仓库，或 body `{ url }` 指定的一个仓库。 */
-export const SYNC_ROUTE = '/guanxiang/sync'
-/** PUT：body `{ tokenEnv, value }` 把令牌存入 DSH 凭据库；DELETE：body `{ tokenEnv }` 删除已存的值。只接受已保存的访问令牌配置引用的名称。 */
-export const TOKEN_ROUTE = '/guanxiang/token'
+export const SYNC_ROUTE = '/logalyze/sync'
+/** POST：body `{ id }` 立即重新上传一份分析报告，不论上次是否成功。 */
+export const REPORT_UPLOAD_ROUTE = '/logalyze/reports/upload'
+/** PUT：body `{ tokenEnv, value }` 把分析接口令牌存入 DSH 凭据库；DELETE：body `{ tokenEnv }` 删除已存的值。只接受分析接口令牌的名称。 */
+export const TOKEN_ROUTE = '/logalyze/token'
+
+/**
+ * POST：日志平台分析接口（Bearer 令牌鉴权，不走 DSH 登录）。它在 DSH 的
+ * `/api` 命名空间之外，网关可以把它和需要登录的 DSH 接口分开暴露。
+ */
+export const ANALYZE_ROUTE = '/open-api/logalyze'
 
 /** One configured application repository. */
 export interface RepoSpec {
-  /** Git remote address, cloned with the host machine's existing git credentials or a matching {@link GitCredentialSpec}. */
+  /** Git remote address, mirrored by dsh-repo with the token of its host or the machine's existing git credentials. */
   url: string
   /** Remote branch to follow; omitted follows the remote's default branch. */
   branch?: string
 }
 
-/** HTTPS access token used for the repositories under one address prefix. */
-export interface GitCredentialSpec {
-  /** `https://host[:port][/path]` (or `http://`) prefix; repository addresses under it use this token. */
-  url: string
-  /** HTTP username sent with the token; GitLab personal access tokens accept `oauth2`. */
-  username: string
-  /** Credential reference (environment-variable name) whose value in DSH's credential store is the token. */
-  tokenEnv: string
-}
+/** Credential reference grammar of `@deepseek-ai/dsh-credentials` (a POSIX shell identifier). */
+export const TOKEN_ENV_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 /** Log URL download policy. */
 export interface DownloadSettings {
@@ -42,25 +43,58 @@ export interface DownloadSettings {
   timeoutMs: number
 }
 
-/** Application SKILL improvement proposals that children may write and the top-level agent may submit as merge requests. */
+/** Application SKILL improvement: children record SKILL gaps, and after the user agrees an improvement child drafts a case and SKILL changes that are submitted as a merge request. */
 export interface SkillUpdateSettings {
-  /** Whether children are told how to propose SKILL changes and top-level agents are offered `guanxiang_propose_skill`. */
+  /** Whether children are told to record SKILL gaps and top-level agents are offered `logalyze_improve_skill`. */
   enabled: boolean
-  /** Most files one proposal may add or change. */
+  /** Most files one improvement may add or change. */
   maxFiles: number
-  /** Largest proposed file, in bytes. */
+  /** Largest file of an improvement or gap record, in bytes. */
   maxFileBytes: number
+}
+
+/** Report directory below the topic's working directory, uploaded as a whole. */
+export const REPORT_DIR = 'report'
+
+/** Report entry file inside {@link REPORT_DIR}; written only by this plugin. */
+export const REPORT_ENTRY = 'report.md'
+
+/** Placeholders the upload command's arguments may contain. */
+export const UPLOAD_PLACEHOLDERS = ['{logId}', '{dir}', '{entry}'] as const
+
+/** How reports of requests with `logId` are uploaded to the caller. */
+export interface UploadSettings {
+  /**
+   * Upload command as an argument vector, run without a shell after every
+   * turn of the analysis topic. `{logId}` is the request's `logId`, `{dir}`
+   * the absolute report directory, `{entry}` the entry file name relative to it.
+   */
+  command: string[]
+  /** Per-run timeout in milliseconds; a run still going then is killed and counts as failed. */
+  timeoutMs: number
+  /** Further attempts after a failed run. */
+  retries: number
+  /** Wait before the first retry in milliseconds; it doubles for each further retry. */
+  retryDelayMs: number
+  /** Most files the report directory may hold. */
+  maxFiles: number
+  /** Largest total size of the report directory, in bytes. */
+  maxBytes: number
+}
+
+/** The log-platform analyze API ({@link ANALYZE_ROUTE}). */
+export interface AnalyzeSettings {
+  /** Whether the API accepts requests; switched off it answers 404. */
+  enabled: boolean
+  /** Report upload. */
+  upload: UploadSettings
 }
 
 /** The settings the Web panel can override; every field is required on the wire. */
 export interface EditableSettings {
-  /** Absolute directory holding the cloned repositories (`~` expands to the home directory). */
-  reposDir: string
-  /** Application repositories to clone and keep updated. */
+  /** Application repositories to mirror and keep updated. */
   repos: RepoSpec[]
-  /** HTTPS access tokens by address prefix; the token values stay in DSH's credential store. */
-  gitCredentials: GitCredentialSpec[]
-  /** Minimum age of a repository's last sync before loading `/guanxiang` syncs it again, in milliseconds; 0 syncs on every load. */
+  /** Minimum age of a repository's last sync before loading `/logalyze` syncs it again, in milliseconds; 0 syncs on every load. */
   fetchIntervalMs: number
   /** Maximum number of child analyses one dispatch may start. */
   maxAppsPerRequest: number
@@ -68,17 +102,19 @@ export interface EditableSettings {
   dispatchTimeoutMs: number
   /** URL download policy. */
   download: DownloadSettings
-  /** SKILL improvement proposals. */
+  /** SKILL improvement. */
   skillUpdates: SkillUpdateSettings
+  /** Log-platform analyze API. */
+  analyze: AnalyzeSettings
 }
 
 /** Keys of {@link EditableSettings}, in panel order. */
-export const EDITABLE_KEYS = ['reposDir', 'repos', 'gitCredentials', 'fetchIntervalMs', 'maxAppsPerRequest', 'dispatchTimeoutMs', 'download', 'skillUpdates'] as const satisfies readonly (keyof EditableSettings)[]
+export const EDITABLE_KEYS = ['repos', 'fetchIntervalMs', 'maxAppsPerRequest', 'dispatchTimeoutMs', 'download', 'skillUpdates', 'analyze'] as const satisfies readonly (keyof EditableSettings)[]
 
 /** One editable key. */
 export type EditableKey = (typeof EDITABLE_KEYS)[number]
 
-/** Application description read from `<repo>/.dsh/guanxiang.yaml`. */
+/** Application description read from `<repo>/.agents/logalyze.yaml`. */
 export interface AppManifest {
   /** Registry id the dispatch tool and analysis requests address. */
   id: string
@@ -90,7 +126,7 @@ export interface AppManifest {
   aliases: string[]
   /** Strings that identify this application's log lines (tags, process names, class names). */
   logHints: string[]
-  /** Project skill name under `.dsh/skills/<skill>/SKILL.md` that analyzes this application's logs. */
+  /** Project skill name under `.agents/skills/<skill>/SKILL.md` that analyzes this application's logs. */
   skill: string
 }
 
@@ -101,8 +137,8 @@ export type RepoPhase = 'pending' | 'syncing' | 'ready' | 'failed'
 export interface RepoStatusWire {
   url: string
   branch?: string
-  /** Absolute directory of the fetch-only clone; children work in commit snapshots under `<reposDir>/.snapshots/`. */
-  dir: string
+  /** Absolute directory of dsh-repo's fetch-only mirror, once a sync succeeded; children work in commit snapshots dsh-repo creates. */
+  dir?: string
   phase: RepoPhase
   /** Latest synced commit, the one the catalog describes and new dispatches use. */
   commit?: string
@@ -133,15 +169,78 @@ export interface TokenStatusWire {
   error?: string
 }
 
-/** Credential store view of the panel. */
-export interface CredentialsWire {
-  /** Whether the DSH composition provides `ctx.credentials`; without it tokens cannot be stored or read. */
-  available: boolean
-  /** One entry per distinct `tokenEnv` of the effective settings; empty while unavailable. */
-  tokens: TokenStatusWire[]
+/**
+ * Whether dsh-repo provides the `dshRepos` service this plugin mirrors
+ * repositories and submits SKILL improvements and setup drafts through: `missing` while it is not
+ * loaded, `incompatible` when its contract version is not the one this
+ * plugin speaks.
+ */
+export type ReposAvailability = 'ready' | 'missing' | 'incompatible'
+
+/** dsh-repo view of the panel. */
+export interface ReposWire {
+  availability: ReposAvailability
+  /** Mirror directory; absent unless `ready`. */
+  mirrorDir?: string
 }
 
-/** `GET /guanxiang/state` response. */
+/**
+ * Whether dsh-channels provides the `feishuTopics` service the analyze API
+ * posts through: `missing` while it is not loaded, `incompatible` when its
+ * contract version is not
+ * the one this plugin speaks.
+ */
+export type TopicsAvailability = 'ready' | 'missing' | 'incompatible'
+
+/** How the first turn of an analysis ended, or how the analysis failed to start. */
+export type ReportStatus = 'done' | 'stopped' | 'error' | 'failed' | 'interrupted'
+
+/** Upload progress of one report. */
+export type UploadPhase = 'pending' | 'running' | 'waiting' | 'done' | 'failed'
+
+/** One tracked report as the panel shows it. */
+export interface ReportWire {
+  /** Stable id of the report (derived from the request's `Idempotency-Key`). */
+  id: string
+  logId: string
+  app: string
+  errorCode: string
+  triggeredAt: string
+  /** Epoch ms when the request was accepted. */
+  acceptedAt: number
+  /** First-turn outcome; absent while the first turn is running. */
+  status?: ReportStatus
+  /** Follow-up turns recorded after the first one. */
+  followups: number
+  /** Absolute report directory; absent until the topic's working directory is known. */
+  dir?: string
+  phase: UploadPhase
+  /** Epoch ms of the last finished upload attempt. */
+  lastAttemptAt?: number
+  /** Epoch ms of the last successful upload. */
+  uploadedAt?: number
+  /** Why the last attempt failed. */
+  error?: string
+  /** Links in the recorded replies the caller cannot open. */
+  warnings: string[]
+}
+
+/** Analyze API view of the panel. */
+export interface AnalyzeWire {
+  /** Route the log platform posts to. */
+  route: string
+  /** Credential reference (`analyzeTokenRef`) holding the bearer token. */
+  tokenEnv: string
+  /** Token status; absent while the DSH composition has no credential store. */
+  token?: TokenStatusWire
+  topics: TopicsAvailability
+  /** Whether the loaded dsh-channels reports launch states, which report upload needs. */
+  reportsSupported: boolean
+  /** Most recently accepted reports, newest first. */
+  reports: ReportWire[]
+}
+
+/** `GET /logalyze/state` response. */
 export interface StateWire {
   /** Effective settings: cordis.yml values with panel overrides applied. */
   settings: EditableSettings
@@ -152,7 +251,10 @@ export interface StateWire {
   /** Why the overlay file was ignored (unreadable or invalid); panel saves replace it. */
   overlayError?: string
   repos: RepoStatusWire[]
-  credentials: CredentialsWire
+  dshRepo: ReposWire
+  /** Whether the DSH composition provides `ctx.credentials`; without it the analyze token cannot be stored or read. */
+  credentialsAvailable: boolean
+  analyze: AnalyzeWire
 }
 
 /** Successful mutation response. */

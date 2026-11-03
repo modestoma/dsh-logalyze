@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 
 const plugin = await import('../lib/index.js')
 
-assert.equal(plugin.name, 'guanxiang', 'host bundle must export the Cordis plugin name')
+assert.equal(plugin.name, 'logalyze', 'host bundle must export the Cordis plugin name')
 assert.equal(typeof plugin.apply, 'function', 'host bundle must export apply()')
 assert.deepEqual([...plugin.inject], ['tools', 'skills', 'subagents'], 'unexpected inject list')
 assert.ok(plugin.Config !== undefined, 'host bundle must export the Config schema')
@@ -19,7 +19,7 @@ assert.ok(plugin.Config !== undefined, 'host bundle must export the Config schem
 const empty = await plugin.Config['~standard'].validate(undefined)
 assert.equal(empty.issues, undefined, 'an omitted config should validate')
 const configured = await plugin.Config['~standard'].validate({
-  repos: [{ url: 'git@github.com:example/order-service.git' }],
+  repos: [{ url: 'https://github.com/example/order-service.git' }],
   download: { allowedHosts: ['oss.example.com'] },
 })
 assert.equal(configured.issues, undefined, 'a typical config should validate')

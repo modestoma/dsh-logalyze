@@ -1,15 +1,15 @@
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { readFile, stat, writeFile } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { resolveConfig, defaultsOf } from '../src/config.ts'
 import { Dispatcher, renderDispatchValue } from '../src/dispatch/tool.ts'
 import type { Agent, SubagentActivation, SubagentResult, SubagentService } from '../src/host.ts'
-import { runGit } from '../src/repos/git.ts'
 import { RepoRegistry } from '../src/repos/registry.ts'
 import type { EditableSettings } from '../src/settings/contract.ts'
-import { SkillUpdater } from '../src/skill-update/tool.ts'
+import { SkillImprover } from '../src/skill-update/tool.ts'
+import { FakeRepos } from './fake-repos.ts'
 import { createAppRepo, tempDir } from './helpers.ts'
 
 let server: Server
@@ -50,26 +50,27 @@ function fakeSubagents(): { service: SubagentService; started: Started[] } {
   return { service, started }
 }
 
-async function setup(overrides: Partial<EditableSettings> = {}, proposals = false) {
+async function setup(overrides: Partial<EditableSettings> = {}, gaps = false) {
   const { dir, cleanup } = await tempDir()
   cleanups.push(cleanup)
   const origin = await createAppRepo(join(dir, 'order-service'))
   const project = join(dir, 'project')
   await createAppRepo(project)
-  const registry = new RepoRegistry({ git: runGit, gitTimeoutMs: 30_000, onChange: () => {} })
+  const repos = new FakeRepos(join(dir, 'mirrors'))
+  const registry = new RepoRegistry({ repos: () => repos, onChange: () => {} })
   const settings: EditableSettings = {
-    ...defaultsOf(resolveConfig({}), { DSH_HOME: dir }),
+    ...defaultsOf(resolveConfig({})),
     repos: [{ url: origin }],
     download: { allowedHosts: ['127.0.0.1'], maxBytes: 1024, timeoutMs: 5000 },
     ...overrides,
   }
-  registry.configure(settings.reposDir, settings.repos)
+  registry.configure(settings.repos)
   await registry.syncAll()
   const { service, started } = fakeSubagents()
-  const updater = new SkillUpdater({ registry, settings: () => settings, git: runGit, gitTimeoutMs: 30_000, approval: () => undefined })
+  const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: () => repos })
   const dispatcher = new Dispatcher({
     registry,
-    ...proposals ? { proposals: updater } : {},
+    ...gaps ? { gaps: improver } : {},
     subagents: service,
     settings: () => settings,
     provider: 'spawn',
@@ -77,7 +78,7 @@ async function setup(overrides: Partial<EditableSettings> = {}, proposals = fals
     now: () => new Date(2026, 9, 25, 9, 30, 0),
   })
   const parent: Agent = { id: 'parent', session: { header: { id: 'parent', cwd: project } } }
-  return { dir, project, registry, dispatcher, started, parent, settings }
+  return { dir, project, registry, dispatcher, started, parent, settings, repos }
 }
 
 async function waitForStarts(started: Started[], count: number): Promise<void> {
@@ -85,9 +86,10 @@ async function waitForStarts(started: Started[], count: number): Promise<void> {
   expect(started).toHaveLength(count)
 }
 
-describe('guanxiang_dispatch', () => {
+describe('logalyze_dispatch', () => {
   it('starts one child per task in the app repository and returns every result', async () => {
-    const { project, dispatcher, started, parent, registry } = await setup()
+    const { project, dispatcher, started, parent, registry, repos } = await setup()
+    const { url, commit } = registry.status()[0]!
     const log = join(project, 'sample-logs', 'order-service.log')
     const running = dispatcher.execute({
       tasks: [{
@@ -100,14 +102,14 @@ describe('guanxiang_dispatch', () => {
     const [child] = started
     expect(registry.status()[0]?.activeRuns).toBe(1)
     expect(child?.spec).toMatchObject({ provider: 'spawn', label: '订单服务分析', delivery: 'caller', request: { parent, maxDepth: 1 } })
-    expect(child?.spec.request.cwd).toMatch(new RegExp(`^${join(dirname(registry.status()[0]!.dir), '.snapshots', 'order-service')}/[0-9a-f]{12}-[0-9a-f]{6}$`))
+    expect(child?.spec.request.cwd).toBe(join(repos.root, '.snapshots', basename(repos.mirrorDir(registry.status()[0]!.url)), registry.status()[0]!.commit!.slice(0, 12)))
     const prompt = child?.spec.request.prompt[0]?.text as string
     expect(prompt.split('\n')[0]).toBe('/log-analysis')
-    const workDir = join(project, 'sample-logs', '.guanxiang', 'runs')
+    const workDir = join(project, 'sample-logs', '.logalyze', 'runs')
     expect(prompt).toContain(`- \`${log}\``)
     expect(prompt).toContain(`（下载自 http://127.0.0.1:${port}/bucket/app.tar.gz?sig=x）；只看本应用相关部分：tag=order`)
     expect(prompt).toContain(workDir)
-    expect(prompt).not.toContain('SKILL 改进')
+    expect(prompt).not.toContain('skill-gap.md')
     child?.settle({ stopReason: 'completed', output: [{ type: 'text', text: '根因：促销商品没有 SKU' }] })
     const value = await running
     expect(value.runId).toMatch(/^20261025-093000-[0-9a-f]{6}$/)
@@ -115,6 +117,8 @@ describe('guanxiang_dispatch', () => {
     expect(value.results).toEqual([{
       app: 'order-service',
       name: '订单服务',
+      url,
+      commit,
       status: 'completed',
       childId: 'child-1',
       output: '根因：促销商品没有 SKU',
@@ -124,29 +128,43 @@ describe('guanxiang_dispatch', () => {
     expect(await readFile(join(value.runDir, '1-order-service', '2-app.tar.gz'), 'utf8')).toBe('packed-log')
     expect(child?.dispose).toHaveBeenCalledTimes(1)
     expect(registry.status()[0]?.activeRuns).toBe(0)
-    expect(renderDispatchValue(value)[0]?.text).toContain('### 订单服务（order-service）— 完成')
+    expect(renderDispatchValue(value)[0]?.text).toContain(`### 订单服务（order-service）— 完成\n\n仓库 ${url}，提交 ${commit!.slice(0, 12)}\n\n根因：促销商品没有 SKU`)
   })
 
-  it('tells children how to propose SKILL changes and reports the proposals of completed tasks', async () => {
+  it('tells children to record SKILL gaps and marks the completed tasks that recorded one', async () => {
     const { project, dispatcher, started, parent } = await setup({ skillUpdates: { enabled: true, maxFiles: 4, maxFileBytes: 65536 } }, true)
     const path = join(project, 'sample-logs', 'order-service.log')
     const running = dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ path }] }, { app: 'order-service', question: 'q2', logs: [{ path }] }] }, { signal: new AbortController().signal, agent: parent })
     await waitForStarts(started, 2)
     const prompt = started[0]?.spec.request.prompt[0]?.text as string
-    expect(prompt).toContain('## SKILL 改进（可选）')
-    const workDir = /`([^`]+)\/skill-proposal\/reason\.md`/.exec(prompt)?.[1] as string
-    expect(prompt).toContain(`复制到 \`${workDir}/skill-proposal/files/\``)
-    await mkdir(join(workDir, 'skill-proposal', 'files'), { recursive: true })
-    await writeFile(join(workDir, 'skill-proposal', 'reason.md'), '缺少 traceId 说明')
-    await writeFile(join(workDir, 'skill-proposal', 'files', 'SKILL.md'), '# 新版\n')
+    expect(prompt).toContain('## SKILL 不足时')
+    expect(prompt).toContain('只是多查了几步，或者缺的是只在这一次出现、以后用不上的细节，都不算不足，不要记录。')
+    expect(prompt).toContain('仓库中的 `.agents/skills/log-analysis/`')
+    expect(prompt).toContain('不要修改 SKILL，是否改进由用户决定。')
+    const workDir = /`([^`]+)\/skill-gap\.md`/.exec(prompt)?.[1] as string
+    const second = /`([^`]+)\/skill-gap\.md`/.exec(started[1]?.spec.request.prompt[0]?.text as string)?.[1] as string
+    await writeFile(join(workDir, 'skill-gap.md'), '  SKILL 没写   traceId 字段\n\n靠 grep 找到的\n')
+    await writeFile(join(second, 'skill-gap.md'), '失败的任务不检查')
     started[0]?.settle({ stopReason: 'completed', output: [{ type: 'text', text: '结论' }] })
     started[1]?.settle({ stopReason: 'error', output: [] })
     const value = await running
-    expect(value.results[0]?.skillProposal).toEqual({ ok: true, files: [{ path: '.dsh/skills/log-analysis/SKILL.md', added: 1, removed: expect.any(Number) }], diffPath: join(workDir, 'skill-proposal.diff') })
-    expect(value.results[1]?.skillProposal).toBeUndefined()
+    expect(value.results[0]?.skillGap).toEqual({ ok: true, path: join(workDir, 'skill-gap.md'), preview: 'SKILL 没写 traceId 字段 靠 grep 找到的' })
+    expect(value.results[1]?.skillGap).toBeUndefined()
     const text = renderDispatchValue(value)[0]?.text
-    expect(text).toContain('SKILL 修改提议：.dsh/skills/log-analysis/SKILL.md（+1 −')
-    expect(text).toContain(`提交时调用 guanxiang_propose_skill，workDir 为 ${workDir}。`)
+    expect(text).toContain(`SKILL 不足（记录在 ${join(workDir, 'skill-gap.md')}）：SKILL 没写 traceId 字段 靠 grep 找到的`)
+    expect(text).toContain('在汇总回复末尾的「SKILL 改进建议」中用一两句说明，并问用户是否改进。本回合不要调用 logalyze_improve_skill（工具会拒绝）；用户同意后再调用，app 为 order-service。')
+  })
+
+  it('reports a gap record that cannot be read instead of offering it', async () => {
+    const { project, dispatcher, started, parent } = await setup({ skillUpdates: { enabled: true, maxFiles: 4, maxFileBytes: 8 } }, true)
+    const running = dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ path: join(project, 'sample-logs', 'order-service.log') }] }] }, { signal: new AbortController().signal, agent: parent })
+    await waitForStarts(started, 1)
+    const workDir = /`([^`]+)\/skill-gap\.md`/.exec(started[0]?.spec.request.prompt[0]?.text as string)?.[1] as string
+    await writeFile(join(workDir, 'skill-gap.md'), 'x'.repeat(20))
+    started[0]?.settle({ stopReason: 'completed', output: [] })
+    const value = await running
+    expect(value.results[0]?.skillGap).toEqual({ ok: false, error: 'skill-gap.md 有 20 字节，超过上限 8' })
+    expect(renderDispatchValue(value)[0]?.text).toContain('SKILL 不足记录不可用：skill-gap.md 有 20 字节，超过上限 8')
   })
 
   it('rejects unknown apps, unreadable paths, disallowed URLs, and too many tasks before starting anything', async () => {

@@ -1,10 +1,10 @@
 {
-  "name": "@modesto_ma/dsh-guanxiang",
+  "name": "dsh-logalyze",
   "version": "0.0.0",
-  "description": "观象 GuanXiang：DeepSeek Harness (DSH) 日志分析插件。/guanxiang 识别日志所属应用，把分析派发给工作目录为该应用代码仓库的子 Agent；Web 左侧栏提供「观象」设置面板",
+  "description": "观象（dsh-logalyze）：DeepSeek Harness (DSH) 日志分析插件。/logalyze 识别日志所属应用，把分析派发给工作目录为该应用代码仓库的子 Agent；Web 左侧栏提供「观象」设置面板",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/modestoma/dsh-guanxiang.git"
+    "url": "git+https://github.com/modestoma/dsh-logalyze.git"
   },
   "packageManager": "pnpm@12.15.0",
   "type": "module",
@@ -25,6 +25,8 @@
     "src",
     "lib",
     "examples",
+    "docs",
+    "skills",
     "README.md",
     "cordis.patch.yml"
   ],

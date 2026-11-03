@@ -6,7 +6,7 @@ import { defineConfig } from 'tsdown'
  * through the package's own `node_modules`.
  */
 export default defineConfig({
-  name: 'dsh-guanxiang/host',
+  name: 'dsh-logalyze/host',
   entry: { index: 'src/index.ts' },
   tsconfig: 'tsconfig.json',
   outDir: 'lib',
@@ -18,6 +18,7 @@ export default defineConfig({
   clean: false,
   sourcemap: true,
   external: [
+    'diff',
     'yaml',
     'zod',
   ],

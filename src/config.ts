@@ -2,32 +2,30 @@
  * 插件配置：cordis.yml 中的 `config`（经 Standard Schema 在加载时校验）与
  * Web 面板覆盖共用同一套字段校验。
  *
- * @module dsh-guanxiang/config
+ * @module dsh-logalyze/config
  */
 
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import { z } from 'zod'
-import { normalizeCredentialUrl, TOKEN_ENV_PATTERN } from './repos/credentials.ts'
-import type { EditableSettings, GitCredentialSpec, RepoSpec } from './settings/contract.ts'
+import { TOKEN_ENV_PATTERN, UPLOAD_PLACEHOLDERS } from './settings/contract.ts'
+import type { EditableSettings, RepoSpec } from './settings/contract.ts'
 
 /** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
 
-const SCP_LIKE = /^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^\s]+$/
-const URL_SCHEMES = new Set(['https:', 'http:', 'ssh:', 'git:', 'file:'])
+const URL_SCHEMES = new Set(['https:', 'file:'])
 const HOST_NAME = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]*[a-z0-9])?$/
 
 /**
- * Whether a string is a git remote this plugin hands to `git clone`: an
- * `https`/`http`/`ssh`/`git`/`file` URL, an scp-like `user@host:path`, or an
- * absolute local path. Other transports (notably `ext::`) are refused.
- * @param value - candidate remote address.
+ * Whether a string is a repository address the `dshRepos` service mirrors: an
+ * `https` or `file` URL, or an absolute local path. SSH, scp-like
+ * `user@host:path`, `git://`, and other transports are refused.
+ * @param value - candidate repository address.
  * @returns whether it is accepted.
  */
 export function isAcceptedGitUrl(value: string): boolean {
   if (value.startsWith('-') || /\s/.test(value)) return false
-  if (SCP_LIKE.test(value)) return true
   if (isAbsolute(value)) return true
   try {
     return URL_SCHEMES.has(new URL(value).protocol)
@@ -51,18 +49,11 @@ export function isAcceptedBranch(value: string): boolean {
     && !value.endsWith('.lock')
 }
 
-const repoSchema = z.object({
-  url: z.string().trim().min(1, 'git 地址不能为空').refine(isAcceptedGitUrl, '不支持的 git 地址（支持 https/ssh/git/file URL、user@host:path 或绝对路径）'),
+/** One application repository: git address and optional branch. */
+export const repoSchema = z.object({
+  url: z.string().trim().min(1, 'git 地址不能为空').refine(isAcceptedGitUrl, '不支持的 git 地址（支持 https URL、file URL 或本机绝对路径，不支持 ssh 和 user@host:path）'),
   branch: z.string().trim().optional().transform(value => value === '' ? undefined : value)
     .refine(value => value === undefined || isAcceptedBranch(value), '分支名不合法'),
-}).strict()
-
-const credentialSchema = z.object({
-  url: z.string().trim()
-    .refine(value => normalizeCredentialUrl(value) !== undefined, '令牌地址不合法：填 https://主机[:端口][/路径]，不含用户名、查询参数或片段')
-    .transform(value => normalizeCredentialUrl(value) as string),
-  username: z.string().trim().regex(/^\S+$/, '用户名不能为空或包含空白').default('oauth2'),
-  tokenEnv: z.string().trim().regex(TOKEN_ENV_PATTERN, '令牌名称只能包含字母、数字和下划线，且不能以数字开头'),
 }).strict()
 
 const hostSchema = z.string().trim().toLowerCase()
@@ -78,9 +69,42 @@ const downloadSchema = z.object({
 }).strict()
 
 const skillUpdatesSchema = z.object({
-  enabled: z.boolean().default(false),
+  enabled: z.boolean().default(true),
   maxFiles: z.number().int().min(1).max(256).default(16),
   maxFileBytes: z.number().int().min(1).max(16 * 1024 * 1024).default(256 * 1024),
+}).strict()
+
+/** Default upload command: the log platform's CLI. */
+export const DEFAULT_UPLOAD_COMMAND: readonly string[] = ['cli', 'log-analysis', 'upload', '--log-id', '{logId}', '--dir', '{dir}', '--entry', '{entry}']
+
+const PLACEHOLDER = /\{[^{}]*\}/g
+
+const uploadCommandSchema = z.array(z.string().min(1, '回传命令的参数不能为空').max(4096))
+  .min(1, '回传命令不能为空').max(64, '回传命令最多 64 个参数')
+  .superRefine((argv, issues) => {
+    for (const [index, arg] of argv.entries()) {
+      for (const token of arg.match(PLACEHOLDER) ?? []) {
+        if (!(UPLOAD_PLACEHOLDERS as readonly string[]).includes(token)) issues.addIssue({ code: 'custom', path: [index], message: `未知占位符 ${token}（可用 ${UPLOAD_PLACEHOLDERS.join(' ')}）` })
+      }
+    }
+    if ((argv[0] ?? '').match(PLACEHOLDER) !== null) issues.addIssue({ code: 'custom', path: [0], message: '可执行文件不能包含占位符' })
+    for (const required of ['{logId}', '{dir}']) {
+      if (!argv.some(arg => arg.includes(required))) issues.addIssue({ code: 'custom', message: `回传命令必须包含 ${required}` })
+    }
+  })
+
+const uploadSchema = z.object({
+  command: uploadCommandSchema.default([...DEFAULT_UPLOAD_COMMAND]),
+  timeoutMs: durationMs(1000).default(5 * 60 * 1000),
+  retries: z.number().int().min(0).max(20).default(3),
+  retryDelayMs: durationMs(1000).default(60 * 1000),
+  maxFiles: z.number().int().min(1).max(10_000).default(200),
+  maxBytes: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(200 * 1024 * 1024),
+}).strict()
+
+const analyzeSchema = z.object({
+  enabled: z.boolean().default(false),
+  upload: uploadSchema.prefault({}),
 }).strict()
 
 const authorSchema = z.object({
@@ -90,7 +114,6 @@ const authorSchema = z.object({
 
 /** Field validators shared by the cordis config and the panel overlay. */
 export const editableFields = {
-  reposDir: z.string().trim().min(1, '拉取目录不能为空'),
   repos: z.array(repoSchema).superRefine((repos, issues) => {
     const seen = new Set<string>()
     for (const [index, repo] of repos.entries()) {
@@ -98,68 +121,62 @@ export const editableFields = {
       seen.add(repo.url)
     }
   }),
-  gitCredentials: z.array(credentialSchema).superRefine((credentials, issues) => {
-    const seen = new Set<string>()
-    for (const [index, credential] of credentials.entries()) {
-      if (seen.has(credential.url)) issues.addIssue({ code: 'custom', path: [index, 'url'], message: `重复的令牌地址：${credential.url}` })
-      seen.add(credential.url)
-    }
-  }),
   fetchIntervalMs: durationMs(0),
   maxAppsPerRequest: z.number().int().min(1).max(32),
   dispatchTimeoutMs: durationMs(1000),
   download: downloadSchema,
   skillUpdates: skillUpdatesSchema,
+  analyze: analyzeSchema,
 }
 
 const configSchema = z.object({
-  reposDir: editableFields.reposDir.optional(),
   repos: editableFields.repos.default([]),
-  /** HTTPS access tokens by address prefix; each names a credential reference, never a token value. */
-  gitCredentials: editableFields.gitCredentials.default([]),
   fetchIntervalMs: editableFields.fetchIntervalMs.default(0),
   maxAppsPerRequest: editableFields.maxAppsPerRequest.default(4),
   dispatchTimeoutMs: editableFields.dispatchTimeoutMs.default(30 * 60 * 1000),
   download: downloadSchema.prefault({}),
   skillUpdates: skillUpdatesSchema.prefault({}),
+  analyze: analyzeSchema.prefault({}),
   /**
-   * Author and committer of SKILL improvement commits; omitted uses the git
-   * identity configured on the host (`user.name` / `user.email`).
+   * Credential reference (environment-variable name) whose value is the
+   * analyze API's bearer token.
+   */
+  analyzeTokenRef: z.string().trim().regex(TOKEN_ENV_PATTERN, '令牌名称只能包含字母、数字和下划线，且不能以数字开头').default('LOGALYZE_ANALYZE_TOKEN'),
+  /**
+   * Author and committer of SKILL improvement and onboarding commits;
+   * default: the account that owns the host token.
    */
   skillUpdateAuthor: authorSchema.optional(),
   /** Registered `ctx.subagents` provider the children start on. */
   subagentProvider: z.string().trim().min(1).default('spawn'),
-  /** Timeout of one git command (clone, fetch, worktree), in milliseconds. */
-  gitTimeoutMs: durationMs(1000).default(10 * 60 * 1000),
   /**
-   * How long loading `/guanxiang` waits for the repository refresh before it
+   * How long loading `/logalyze` waits for the repository refresh before it
    * renders the catalog it already has, in milliseconds; the refresh keeps
    * running. 0 never waits.
    */
   refreshWaitMs: durationMs(0).default(15 * 1000),
   /**
-   * Whether top-level agents may load the entry skill without `/guanxiang`
+   * Whether top-level agents may load the entry skill without `/logalyze`
    * when a task matches the usable applications its description lists.
    */
   autoInvoke: z.boolean().default(true),
 }).strict()
 
 /** Validated plugin configuration. */
-export type GuanxiangConfig = z.output<typeof configSchema>
+export type LogalyzeConfig = z.output<typeof configSchema>
 
 /** Standard Schema the Cordis loader validates `config` with before `apply()`. */
 export const pluginConfigSchema = configSchema.prefault({})
 
 /** Panel overlay: any subset of the editable settings. */
 export const overlaySchema = z.object({
-  reposDir: editableFields.reposDir.optional(),
   repos: editableFields.repos.optional(),
-  gitCredentials: editableFields.gitCredentials.optional(),
   fetchIntervalMs: editableFields.fetchIntervalMs.optional(),
   maxAppsPerRequest: editableFields.maxAppsPerRequest.optional(),
   dispatchTimeoutMs: editableFields.dispatchTimeoutMs.optional(),
   download: downloadSchema.optional(),
   skillUpdates: skillUpdatesSchema.optional(),
+  analyze: analyzeSchema.optional(),
 }).strict()
 
 /** Validated panel overlay. */
@@ -187,9 +204,9 @@ export function describeIssue(error: z.ZodError): string {
  * @returns validated configuration.
  * @throws when the configuration is invalid.
  */
-export function resolveConfig(raw: unknown): GuanxiangConfig {
+export function resolveConfig(raw: unknown): LogalyzeConfig {
   const parsed = pluginConfigSchema.safeParse(raw ?? {})
-  if (!parsed.success) throw new Error(`guanxiang: 配置不合法：${describeIssue(parsed.error)}`)
+  if (!parsed.success) throw new Error(`logalyze: 配置不合法：${describeIssue(parsed.error)}`)
   return parsed.data
 }
 
@@ -218,27 +235,20 @@ function copyRepos(repos: readonly RepoSpec[]): RepoSpec[] {
   return repos.map(repo => repo.branch === undefined ? { url: repo.url } : { url: repo.url, branch: repo.branch })
 }
 
-function copyCredentials(credentials: readonly GitCredentialSpec[]): GitCredentialSpec[] {
-  return credentials.map(credential => ({ url: credential.url, username: credential.username, tokenEnv: credential.tokenEnv }))
-}
-
 /**
- * The editable settings a configuration implies, with `reposDir` defaulted to
- * `$DSH_HOME/guanxiang/repos`.
+ * The editable settings a configuration implies.
  * @param config - validated plugin configuration.
- * @param env - process environment.
  * @returns complete editable settings.
  */
-export function defaultsOf(config: GuanxiangConfig, env: NodeJS.ProcessEnv = process.env): EditableSettings {
+export function defaultsOf(config: LogalyzeConfig): EditableSettings {
   return {
-    reposDir: config.reposDir ?? join(resolveDshHome(env), 'guanxiang', 'repos'),
     repos: copyRepos(config.repos),
-    gitCredentials: copyCredentials(config.gitCredentials),
     fetchIntervalMs: config.fetchIntervalMs,
     maxAppsPerRequest: config.maxAppsPerRequest,
     dispatchTimeoutMs: config.dispatchTimeoutMs,
     download: { ...config.download, allowedHosts: [...config.download.allowedHosts] },
     skillUpdates: { ...config.skillUpdates },
+    analyze: { ...config.analyze, upload: { ...config.analyze.upload, command: [...config.analyze.upload.command] } },
   }
 }
 
@@ -251,13 +261,12 @@ export function defaultsOf(config: GuanxiangConfig, env: NodeJS.ProcessEnv = pro
  */
 export function applyOverlay(defaults: EditableSettings, overlay: SettingsOverlay): EditableSettings {
   return {
-    reposDir: overlay.reposDir ?? defaults.reposDir,
     repos: overlay.repos === undefined ? defaults.repos : copyRepos(overlay.repos),
-    gitCredentials: overlay.gitCredentials === undefined ? defaults.gitCredentials : copyCredentials(overlay.gitCredentials),
     fetchIntervalMs: overlay.fetchIntervalMs ?? defaults.fetchIntervalMs,
     maxAppsPerRequest: overlay.maxAppsPerRequest ?? defaults.maxAppsPerRequest,
     dispatchTimeoutMs: overlay.dispatchTimeoutMs ?? defaults.dispatchTimeoutMs,
     download: overlay.download ?? defaults.download,
     skillUpdates: overlay.skillUpdates ?? defaults.skillUpdates,
+    analyze: overlay.analyze ?? defaults.analyze,
   }
 }

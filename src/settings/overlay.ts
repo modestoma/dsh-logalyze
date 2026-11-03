@@ -1,9 +1,9 @@
 /**
- * 面板覆盖文件 `$DSH_HOME/guanxiang/settings.json` 的读写。文件只保存与
+ * 面板覆盖文件 `$DSH_HOME/logalyze/settings.json` 的读写。文件只保存与
  * cordis.yml 默认值不同的字段；写入先落临时文件再改名，读到的内容按与
  * 配置相同的规则校验。
  *
- * @module dsh-guanxiang/settings/overlay
+ * @module dsh-logalyze/settings/overlay
  */
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
@@ -16,10 +16,10 @@ import type { EditableKey, EditableSettings } from './contract.ts'
 /**
  * Default overlay path.
  * @param env - process environment.
- * @returns `$DSH_HOME/guanxiang/settings.json`.
+ * @returns `$DSH_HOME/logalyze/settings.json`.
  */
 export function defaultOverlayPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(resolveDshHome(env), 'guanxiang', 'settings.json')
+  return join(resolveDshHome(env), 'logalyze', 'settings.json')
 }
 
 /** Result of reading the overlay file. */

@@ -4,16 +4,25 @@ import { diffOverlay } from '../src/settings/overlay.ts'
 
 describe('git address policy', () => {
   it.each([
-    'git@github.com:example/order-service.git',
     'https://github.com/example/pay-service.git',
-    'ssh://git@git.example.com:2222/team/app.git',
+    'https://gitlab.example.com:8443/team/app.git',
     'file:///srv/git/app.git',
     '/srv/git/app',
   ])('accepts %s', (url) => {
     expect(isAcceptedGitUrl(url)).toBe(true)
   })
 
-  it.each(['ext::sh -c id', '--upload-pack=touch /tmp/x', 'relative/path', 'ftp://example.com/a.git', ''])('refuses %s', (url) => {
+  it.each([
+    'git@github.com:example/order-service.git',
+    'ssh://git@git.example.com:2222/team/app.git',
+    'git://example.com/a.git',
+    'http://example.com/a.git',
+    'ext::sh -c id',
+    '--upload-pack=touch /tmp/x',
+    'relative/path',
+    'ftp://example.com/a.git',
+    '',
+  ])('refuses %s', (url) => {
     expect(isAcceptedGitUrl(url)).toBe(false)
   })
 
@@ -26,15 +35,14 @@ describe('git address policy', () => {
 })
 
 describe('configuration', () => {
-  it('defaults every field and places checkouts under $DSH_HOME', () => {
+  it('defaults every field', () => {
     const config = resolveConfig(undefined)
     expect(config).toMatchObject({ repos: [], fetchIntervalMs: 0, maxAppsPerRequest: 4, subagentProvider: 'spawn', refreshWaitMs: 15000 })
-    expect(defaultsOf(config, { DSH_HOME: '/home/u/.dsh' }).reposDir).toBe('/home/u/.dsh/guanxiang/repos')
-    expect(defaultsOf(config).skillUpdates).toEqual({ enabled: false, maxFiles: 16, maxFileBytes: 262144 })
+    expect(defaultsOf(config).skillUpdates).toEqual({ enabled: true, maxFiles: 16, maxFileBytes: 262144 })
     expect(config.skillUpdateAuthor).toBeUndefined()
   })
 
-  it('validates the SKILL proposal author', () => {
+  it('validates the SKILL improvement author', () => {
     expect(resolveConfig({ skillUpdateAuthor: { name: ' 观象 ', email: 'gx@example.com' } }).skillUpdateAuthor).toEqual({ name: '观象', email: 'gx@example.com' })
     expect(() => resolveConfig({ skillUpdateAuthor: { name: 'a <b>', email: 'gx@example.com' } })).toThrow(/作者名/)
     expect(() => resolveConfig({ skillUpdateAuthor: { name: 'a', email: 'g x' } })).toThrow(/作者邮箱/)
@@ -49,10 +57,11 @@ describe('configuration', () => {
   it('rejects duplicate repositories and unknown keys', () => {
     expect(() => resolveConfig({ repos: [{ url: '/srv/a' }, { url: '/srv/a' }] })).toThrow(/重复的 git 地址/)
     expect(() => resolveConfig({ repo: [] })).toThrow()
+    expect(() => resolveConfig({ gitCredentials: [] })).toThrow()
   })
 
   it('stores only the fields that differ from the defaults', () => {
-    const defaults = defaultsOf(resolveConfig({ repos: [{ url: '/srv/a' }] }), { DSH_HOME: '/d' })
+    const defaults = defaultsOf(resolveConfig({ repos: [{ url: '/srv/a' }] }))
     const overlay = diffOverlay(defaults, { ...defaults, maxAppsPerRequest: 2 })
     expect(overlay).toEqual({ maxAppsPerRequest: 2 })
     expect(applyOverlay(defaults, overlay)).toEqual({ ...defaults, maxAppsPerRequest: 2 })

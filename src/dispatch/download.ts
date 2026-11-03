@@ -3,7 +3,7 @@
  * 每次重定向都重新校验域名，并限制单文件大小与耗时。下载的文件原样保存
  * （压缩包由应用的日志分析 SKILL 解压）。
  *
- * @module dsh-guanxiang/dispatch/download
+ * @module dsh-logalyze/dispatch/download
  */
 
 import { createWriteStream } from 'node:fs'

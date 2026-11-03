@@ -1,92 +1,149 @@
 /**
  * 观象运行时：持有生效设置（cordis.yml + 面板覆盖）、应用注册表、入口
- * SKILL、派发工具与 SKILL 提议工具的注册，并为设置面板提供状态与写入口。
+ * SKILL、派发工具、SKILL 查看与改进工具、仓库接入工具的注册和分析报告回传，并为设置面板提供状态与写入口。
  *
- * @module dsh-guanxiang/service
+ * @module dsh-logalyze/service
  */
 
+import type { DshRepos } from './repos/contract.ts'
 import { z } from 'zod'
-import { applyOverlay, defaultsOf, describeIssue, editableSettingsSchema, expandHome } from './config.ts'
-import type { GuanxiangConfig, SettingsOverlay } from './config.ts'
+import { applyOverlay, defaultsOf, describeIssue, editableSettingsSchema } from './config.ts'
+import type { LogalyzeConfig, SettingsOverlay } from './config.ts'
 import { abortable } from './abort.ts'
-import { Dispatcher, isDelegatedAgent, isInside } from './dispatch/tool.ts'
+import type { AnalyzeRequest } from './analyze/contract.ts'
+import { FEISHU_TOPICS_STATUS_EVENT } from './analyze/feishu-topics.ts'
+import type { AnalyzeGate } from './analyze/server.ts'
+import { FEISHU_TOPICS_SERVICE, lookupTopics } from './analyze/topics.ts'
+import type { CommandRunner } from './report/command.ts'
+import { defaultReportsDir, ReportStore } from './report/store.ts'
+import { ReportTracker } from './report/tracker.ts'
+import type { ReportTopics } from './report/tracker.ts'
+import { Dispatcher, inRunDirectory, isDelegatedAgent, isInside } from './dispatch/tool.ts'
 import type { HostApproval, HostContext, HostCredentials, ToolActivationContext, WorkingDirectoryService } from './host.ts'
-import { credentialEnvironment, credentialFor, isAcceptedToken, MAX_TOKEN_LENGTH } from './repos/credentials.ts'
-import { runGit } from './repos/git.ts'
-import type { GitRunner } from './repos/git.ts'
+import { DSH_REPOS_SERVICE, lookupRepos, messageOf } from './repos/lookup.ts'
 import { RepoRegistry } from './repos/registry.ts'
-import type { CredentialsWire, EditableSettings, StateWire, TokenStatusWire } from './settings/contract.ts'
+import { ANALYZE_ROUTE } from './settings/contract.ts'
+import type { AnalyzeWire, EditableSettings, RepoSpec, ReposWire, StateWire, TokenStatusWire } from './settings/contract.ts'
 import { diffOverlay, overriddenKeys } from './settings/overlay.ts'
 import type { OverlayStore } from './settings/overlay.ts'
 import { createEntrySkillProvider } from './skill/entry.ts'
-import { SkillUpdater } from './skill-update/tool.ts'
+import type { BundledSkill } from './skill/bundled.ts'
+import { SkillViewer } from './skill-update/show.ts'
+import { SkillImprover } from './skill-update/tool.ts'
+import { RepoAdder } from './onboard/add.ts'
+import { RepoInitializer } from './onboard/init.ts'
 
 /** A settings write the panel reports as a field error. */
 export class SettingsError extends Error {}
 
+/** Longest accepted token; personal access tokens are far shorter. */
+const MAX_TOKEN_LENGTH = 4096
+
+const tokenValue = z.string().trim()
+  .refine(value => value.length > 0 && value.length <= MAX_TOKEN_LENGTH && !/[\u0000-\u001f\u007f]/.test(value), `令牌不能为空、超过 ${MAX_TOKEN_LENGTH} 个字符或包含换行等控制字符`)
 const tokenClearSchema = z.object({ tokenEnv: z.string() }).strict()
-const tokenSetSchema = tokenClearSchema.extend({
-  value: z.string().trim().refine(isAcceptedToken, `令牌不能为空、超过 ${MAX_TOKEN_LENGTH} 个字符或包含换行等控制字符`),
-}).strict()
+const tokenSetSchema = tokenClearSchema.extend({ value: tokenValue }).strict()
+const reportRetrySchema = z.object({ id: z.string().regex(/^[0-9a-f]{24}$/u, '报告 id 不合法') }).strict()
 
 /** Optional seams for tests. */
 export interface ServiceOptions {
-  readonly git?: GitRunner
   readonly fetch?: typeof fetch
+  /** Report record directory; defaults to `$DSH_HOME/logalyze/reports`. */
+  readonly reportsDir?: string
+  /** Runs the upload command. */
+  readonly runCommand?: CommandRunner
+}
+
+/** Package files the service serves. */
+export interface ServiceAssets {
+  /** Bundled guide skills (`/logalyze-kit`, `/logalyze-improve`). */
+  readonly bundled: readonly BundledSkill[]
 }
 
 /** The plugin's long-lived state. */
-export class GuanxiangService {
+export class LogalyzeService {
   readonly registry: RepoRegistry
   private readonly defaults: EditableSettings
   private overlay: SettingsOverlay = {}
   private overlayError: string | undefined
   private current: EditableSettings
   private readonly dispatcher: Dispatcher
-  private readonly updater: SkillUpdater
+  private readonly improver: SkillImprover
+  private readonly viewer: SkillViewer
+  private readonly adder: RepoAdder
+  private readonly initializer: RepoInitializer
   private readonly skill: ReturnType<typeof createEntrySkillProvider>
+  private readonly reports: ReportTracker
   private active = true
   private readonly refreshWaitMs: number
+  private readonly analyzeTokenRef: string
   private readonly booted = Promise.withResolvers<void>()
+  private additions: Promise<void> = Promise.resolve()
 
   /**
    * @param ctx - plugin context.
    * @param config - validated plugin configuration.
    * @param store - panel overlay file.
+   * @param assets - package files the service serves.
    * @param options - test seams.
    */
   constructor(
     private readonly ctx: HostContext,
-    config: GuanxiangConfig,
+    config: LogalyzeConfig,
     private readonly store: OverlayStore,
+    assets: ServiceAssets,
     options: ServiceOptions = {},
   ) {
     this.defaults = defaultsOf(config)
     this.refreshWaitMs = config.refreshWaitMs
+    this.analyzeTokenRef = config.analyzeTokenRef
     this.current = this.defaults
-    const git = options.git ?? runGit
     this.registry = new RepoRegistry({
-      git,
-      gitTimeoutMs: config.gitTimeoutMs,
-      auth: url => this.gitAuth(url),
+      repos: () => ctx.get?.(DSH_REPOS_SERVICE),
       onChange: () => { this.onRegistryChange() },
     })
-    this.updater = new SkillUpdater({
+    this.improver = new SkillImprover({
       registry: this.registry,
+      subagents: ctx.subagents,
+      provider: config.subagentProvider,
       settings: () => this.current,
-      git,
-      gitTimeoutMs: config.gitTimeoutMs,
+      workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
       ...config.skillUpdateAuthor === undefined ? {} : { author: config.skillUpdateAuthor },
-      approval: () => ctx.get?.('approval') as HostApproval | undefined,
+      repos: () => ctx.get?.(DSH_REPOS_SERVICE),
+      ...options.fetch === undefined ? {} : { fetch: options.fetch },
     })
+    this.viewer = new SkillViewer({ registry: this.registry, repos: () => ctx.get?.(DSH_REPOS_SERVICE) })
     this.dispatcher = new Dispatcher({
       registry: this.registry,
-      proposals: this.updater,
+      gaps: this.improver,
       subagents: ctx.subagents,
       settings: () => this.current,
       provider: config.subagentProvider,
       workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
       ...options.fetch === undefined ? {} : { fetch: options.fetch },
+    })
+    this.adder = new RepoAdder({
+      registry: this.registry,
+      approval: () => ctx.get?.('approval') as HostApproval | undefined,
+      addRepo: spec => this.addRepo(spec),
+    })
+    this.initializer = new RepoInitializer({
+      registry: this.registry,
+      subagents: ctx.subagents,
+      provider: config.subagentProvider,
+      settings: () => this.current,
+      workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
+      approval: () => ctx.get?.('approval') as HostApproval | undefined,
+      repos: () => ctx.get?.(DSH_REPOS_SERVICE),
+      ...config.skillUpdateAuthor === undefined ? {} : { author: config.skillUpdateAuthor },
+      ...options.fetch === undefined ? {} : { fetch: options.fetch },
+    })
+    this.reports = new ReportTracker({
+      store: new ReportStore(options.reportsDir ?? defaultReportsDir(), message => ctx.logger?.warn?.(message)),
+      topics: () => this.reportTopics(),
+      upload: () => this.current.analyze.upload,
+      warn: message => ctx.logger?.warn?.(message),
+      ...options.runCommand === undefined ? {} : { run: options.runCommand },
     })
     this.skill = createEntrySkillProvider({
       prepare: signal => this.prepareCatalog(signal),
@@ -94,41 +151,79 @@ export class GuanxiangService {
       maxAppsPerRequest: () => this.current.maxAppsPerRequest,
       skillUpdates: () => this.current.skillUpdates.enabled,
       autoInvoke: config.autoInvoke,
-      inRepositories: cwd => isInside(cwd, expandHome(this.current.reposDir)),
+      bundled: assets.bundled,
+      inRepositories: (cwd) => {
+        if (inRunDirectory(cwd)) return true
+        const lookup = lookupRepos(ctx.get?.(DSH_REPOS_SERVICE))
+        return lookup.availability === 'ready' && isInside(cwd, lookup.service.mirrorSettings().dir)
+      },
     })
   }
 
   /** Register the entry skill provider; called once from `apply()`. */
   registerSkill(): void {
-    this.ctx.effect(() => this.ctx.skills.registerProvider(this.skill.factory), 'guanxiang: entry skill')
+    this.ctx.effect(() => this.ctx.skills.registerProvider(this.skill.factory), 'logalyze: entry skill')
   }
 
   /**
-   * Register the dispatch and SKILL proposal tools; called once from
-   * `apply()`. The definitions stay fixed because a step drops a tool whose
-   * registration changed after the step resolved its tools.
+   * Register the dispatch, SKILL improvement and view, and repository onboarding tools;
+   * called once from `apply()`. The definitions stay fixed because a step
+   * drops a tool whose registration changed after the step resolved its tools.
+   * The improvement tool counts finished turns from `turn/end` Session events.
    */
   registerTool(): void {
+    this.ctx.on('session/event', (session, event) => {
+      if (event.type === 'turn/end') this.improver.turnEnded(session.header.id)
+      this.reports.sessionEvent(session, event)
+    })
+    this.ctx.on(FEISHU_TOPICS_STATUS_EVENT, (state) => { this.reports.statusChanged(state) })
     this.ctx.effect(
       () => this.ctx.tools.register(this.dispatcher.definition(), { when: context => this.offersTool(context) }),
-      'guanxiang: dispatch tool',
+      'logalyze: dispatch tool',
     )
     this.ctx.effect(
-      () => this.ctx.tools.register(this.updater.definition(), { when: async context => this.current.skillUpdates.enabled && await this.offersTool(context) }),
-      'guanxiang: skill proposal tool',
+      () => this.ctx.tools.register(this.improver.definition(), { when: async context => this.current.skillUpdates.enabled && await this.offersTool(context) }),
+      'logalyze: skill improvement tool',
+    )
+    this.ctx.effect(
+      () => this.ctx.tools.register(this.viewer.definition(), { when: context => this.offersTool(context) }),
+      'logalyze: skill view tool',
+    )
+    this.ctx.effect(
+      () => this.ctx.tools.register(this.adder.definition(), { when: context => this.offersTopLevel(context, () => true) }),
+      'logalyze: add repository tool',
+    )
+    this.ctx.effect(
+      () => this.ctx.tools.register(this.initializer.initDefinition(), { when: context => this.offersTopLevel(context, () => this.registry.setupPending().length > 0) }),
+      'logalyze: draft repository setup tool',
+    )
+    this.ctx.effect(
+      () => this.ctx.tools.register(this.initializer.submitDefinition(), { when: context => this.offersTopLevel(context, () => this.initializer.hasDraft(context.agent.session.header.id)) }),
+      'logalyze: submit repository setup tool',
     )
   }
 
   /**
-   * Offer the tool to top-level agents once the first sync settled and at
-   * least one application is usable.
+   * Offer a tool to top-level agents once the first sync settled and the
+   * tool's own condition holds.
+   * @param context - the preparing step.
+   * @param condition - the tool's condition, read after the first sync.
+   * @returns whether the step may call the tool.
+   */
+  private async offersTopLevel({ agent, signal }: ToolActivationContext, condition: () => boolean): Promise<boolean> {
+    if (isDelegatedAgent(agent)) return false
+    await abortable(this.booted.promise, signal)
+    return this.active && condition()
+  }
+
+  /**
+   * Offer the dispatch and SKILL tools to top-level agents once the first
+   * sync settled and at least one application is usable.
    * @param context - the preparing step.
    * @returns whether the step may call the tool.
    */
-  private async offersTool({ agent, signal }: ToolActivationContext): Promise<boolean> {
-    if (isDelegatedAgent(agent)) return false
-    await abortable(this.booted.promise, signal)
-    return this.active && this.registry.readyApps().length > 0
+  private async offersTool(context: ToolActivationContext): Promise<boolean> {
+    return await this.offersTopLevel(context, () => this.registry.readyApps().length > 0)
   }
 
   /**
@@ -168,17 +263,90 @@ export class GuanxiangService {
       this.overlay = read.overlay
     } else {
       this.overlayError = read.error
-      this.ctx.logger?.warn?.('guanxiang: 忽略面板设置：%s', read.error)
+      this.ctx.logger?.warn?.('logalyze: 忽略面板设置：%s', read.error)
     }
     this.current = applyOverlay(this.defaults, this.overlay)
-    this.registry.configure(this.current.reposDir, this.current.repos)
+    await this.reports.boot().catch((error: unknown) => {
+      this.ctx.logger?.error?.('logalyze: 读取回传记录失败：%s', messageOf(error))
+    })
+    this.registry.configure(this.current.repos)
     await this.registry.syncAll()
   }
 
-  /** Stop registering tools; in-flight syncs finish without side effects on the host. */
+  /**
+   * React to dsh-repo becoming available (or reloading): sync every
+   * repository again.
+   * @returns when the syncs settled.
+   */
+  async reposAvailable(): Promise<void> {
+    await this.booted.promise
+    if (!this.active) return
+    await this.registry.resyncAll()
+  }
+
+  /**
+   * Re-sync every repository after each host or token change in dsh-repo, so a
+   * new token reaches the mirrors without a manual sync.
+   * @param repos - the `dshRepos` service.
+   * @returns disposer that stops watching.
+   */
+  watchHosts(repos: DshRepos): () => void {
+    return repos.onHostsChange(() => {
+      if (!this.active) return
+      void this.registry.resyncAll().catch((error: unknown) => {
+        this.ctx.logger?.error?.('logalyze: 主机变更后同步仓库失败：%s', messageOf(error))
+      })
+    })
+  }
+
+  /** Stop registering tools and retrying uploads; in-flight syncs and uploads finish without side effects on the host. */
   shutdown(): void {
     this.active = false
+    this.reports.shutdown()
     this.booted.resolve()
+  }
+
+  /**
+   * Check reports waiting for their first turn against `feishuTopics`; called
+   * whenever the service appears.
+   * @returns when the check settled.
+   */
+  async topicsAvailable(): Promise<void> {
+    await this.booted.promise
+    if (!this.active) return
+    await this.reports.reconcile()
+  }
+
+  /**
+   * Start tracking the report of an accepted analyze request with `logId`.
+   * @param request - the validated request.
+   * @param key - its `Idempotency-Key`.
+   */
+  async trackReport(request: AnalyzeRequest & { readonly logId: string }, key: string): Promise<void> {
+    await this.booted.promise
+    await this.reports.track(request, key)
+  }
+
+  /**
+   * Upload one report again now.
+   * @param raw - request body `{ id }`.
+   * @returns the new panel state.
+   * @throws SettingsError when the body is invalid or the report is unknown.
+   */
+  async retryReport(raw: unknown): Promise<StateWire> {
+    const parsed = reportRetrySchema.safeParse(raw)
+    if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
+    if (!this.reports.retry(parsed.data.id)) throw new SettingsError(`没有这份报告：${parsed.data.id}`)
+    return await this.state()
+  }
+
+  /** The launch-state methods of the loaded `feishuTopics`, when it has them. */
+  private reportTopics(): ReportTopics | undefined {
+    const lookup = lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE))
+    if (lookup.availability !== 'ready') return undefined
+    const { service } = lookup
+    if (typeof service.state !== 'function' || typeof service.launchKeyOf !== 'function') return undefined
+    return { state: key => service.state?.(key), launchKeyOf: sessionId => service.launchKeyOf?.(sessionId) }
   }
 
   /** @returns current effective settings. */
@@ -194,7 +362,37 @@ export class GuanxiangService {
       overridden: overriddenKeys(this.overlay),
       ...this.overlayError === undefined ? {} : { overlayError: this.overlayError },
       repos: this.registry.status(),
-      credentials: await this.credentialsState(),
+      dshRepo: this.reposState(),
+      credentialsAvailable: this.credentialStore() !== undefined,
+      analyze: await this.analyzeState(),
+    }
+  }
+
+  /** @returns the analyze route's switch and bearer token, read per request. */
+  analyzeGate(): AnalyzeGate {
+    return {
+      enabled: () => this.current.analyze.enabled,
+      tokenEnv: () => this.analyzeTokenRef,
+      token: async () => {
+        try {
+          return (await this.credentialStore()?.resolve(this.analyzeTokenRef))?.value
+        } catch (error) {
+          this.ctx.logger?.warn?.('logalyze: 读取分析接口令牌 %s 失败：%s', this.analyzeTokenRef, error instanceof Error ? error.message : String(error))
+          return undefined
+        }
+      },
+    }
+  }
+
+  private async analyzeState(): Promise<AnalyzeWire> {
+    const store = this.credentialStore()
+    return {
+      route: ANALYZE_ROUTE,
+      tokenEnv: this.analyzeTokenRef,
+      ...store === undefined ? {} : { token: await describeToken(store, this.analyzeTokenRef) },
+      topics: lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE)).availability,
+      reportsSupported: this.reportTopics() !== undefined,
+      reports: this.reports.list(),
     }
   }
 
@@ -202,45 +400,18 @@ export class GuanxiangService {
     return this.ctx.get?.('credentials') as HostCredentials | undefined
   }
 
-  private async credentialsState(): Promise<CredentialsWire> {
-    const store = this.credentialStore()
-    if (store === undefined) return { available: false, tokens: [] }
-    const names = [...new Set(this.current.gitCredentials.map(credential => credential.tokenEnv))]
-    const tokens = await Promise.all(names.map(async (tokenEnv): Promise<TokenStatusWire> => {
-      try {
-        const info = await store.describe(tokenEnv)
-        return { tokenEnv, configured: info.configured, ...info.source === undefined ? {} : { source: info.source }, writable: info.writable }
-      } catch (error) {
-        return { tokenEnv, configured: false, writable: false, error: error instanceof Error ? error.message : String(error) }
-      }
-    }))
-    return { available: true, tokens }
+  private reposState(): ReposWire {
+    const lookup = lookupRepos(this.ctx.get?.(DSH_REPOS_SERVICE))
+    if (lookup.availability !== 'ready') return { availability: lookup.availability }
+    return { availability: 'ready', mirrorDir: lookup.service.mirrorSettings().dir }
   }
 
   /**
-   * Environment carrying the access token for one repository address; empty
-   * when no access-token configuration matches it.
-   * @param url - repository address.
-   * @returns variables for its network git commands.
-   * @throws when a configuration matches but its token cannot be read.
-   */
-  private async gitAuth(url: string): Promise<Record<string, string>> {
-    const spec = credentialFor(url, this.current.gitCredentials)
-    if (spec === undefined) return {}
-    const store = this.credentialStore()
-    if (store === undefined) throw new Error(`地址匹配访问令牌 ${spec.url}，但当前 DSH 组合没有凭据服务，无法读取 ${spec.tokenEnv}`)
-    const token = await store.resolve(spec.tokenEnv)
-    if (token === undefined) throw new Error(`地址匹配访问令牌 ${spec.url}，但 ${spec.tokenEnv} 未设置：请在观象面板「访问令牌」中保存令牌，或设置同名环境变量`)
-    if (!isAcceptedToken(token.value)) throw new Error(`${spec.tokenEnv} 的值不能用作令牌：不能超过 ${MAX_TOKEN_LENGTH} 个字符或包含换行等控制字符`)
-    return credentialEnvironment(spec, token.value)
-  }
-
-  /**
-   * Store the token of one access-token configuration in DSH's credential
-   * store, then re-sync the repositories that use it.
+   * Store the analyze API's bearer token (`analyzeTokenRef`) in DSH's
+   * credential store; it applies from the next request.
    * @param raw - request body `{ tokenEnv, value }`.
    * @returns the new panel state.
-   * @throws SettingsError when the body is invalid, the name is not referenced by the saved settings, or no credential store is loaded.
+   * @throws SettingsError when the body is invalid, the name is not `analyzeTokenRef`, or no credential store is loaded.
    */
   async setToken(raw: unknown): Promise<StateWire> {
     const parsed = tokenSetSchema.safeParse(raw)
@@ -249,8 +420,8 @@ export class GuanxiangService {
   }
 
   /**
-   * Remove the stored token of one access-token configuration; an environment
-   * variable of the same name applies again afterwards.
+   * Remove the stored analyze token; an environment variable of the same name
+   * applies again afterwards.
    * @param raw - request body `{ tokenEnv }`.
    * @returns the new panel state.
    * @throws SettingsError on the same conditions as {@link setToken}.
@@ -262,18 +433,17 @@ export class GuanxiangService {
   }
 
   private async writeToken(tokenEnv: string, value: string | undefined): Promise<StateWire> {
-    if (!this.current.gitCredentials.some(credential => credential.tokenEnv === tokenEnv)) throw new SettingsError(`${tokenEnv} 不是已保存的访问令牌配置引用的名称`)
+    if (tokenEnv !== this.analyzeTokenRef) throw new SettingsError(`${tokenEnv} 不是分析接口令牌的名称`)
     const store = this.credentialStore()
     if (store === undefined) throw new SettingsError('当前 DSH 组合没有凭据服务（@deepseek-ai/dsh-credentials-local），无法保存令牌')
     if (value === undefined) await store.unset(tokenEnv)
     else await store.set(tokenEnv, value)
-    void this.registry.resyncUrls(this.current.repos.map(repo => repo.url).filter(url => credentialFor(url, this.current.gitCredentials)?.tokenEnv === tokenEnv))
     return await this.state()
   }
 
   /**
    * Validate and persist a complete settings payload from the panel, then
-   * sync repositories whose address, branch, or directory changed.
+   * sync repositories whose address or branch changed.
    * @param raw - request body.
    * @returns the new panel state.
    * @throws SettingsError when the payload is invalid.
@@ -285,6 +455,24 @@ export class GuanxiangService {
     await this.store.write(overlay)
     this.apply(overlay)
     return await this.state()
+  }
+
+  /**
+   * Append one repository to the panel settings, as a panel save would, and
+   * start syncing it. Concurrent additions are applied in call order.
+   * @param spec - validated repository.
+   * @returns `exists` without writing when the address is already configured.
+   * @throws SettingsError when the resulting settings are invalid.
+   */
+  async addRepo(spec: RepoSpec): Promise<'added' | 'exists'> {
+    // Additions run one at a time so each one reads the settings the previous one saved.
+    const added = this.additions.then(async () => {
+      if (this.registry.has(spec.url)) return 'exists' as const
+      await this.save({ ...this.current, repos: [...this.current.repos, spec] })
+      return 'added' as const
+    })
+    this.additions = added.then(() => undefined, () => undefined)
+    return await added
   }
 
   /**
@@ -307,25 +495,25 @@ export class GuanxiangService {
     void (url === undefined ? this.registry.syncAll() : this.registry.syncUrls([url]))
   }
 
-  /**
-   * Make an overlay effective and sync the repositories whose address, branch,
-   * directory, or matching access-token configuration changed.
-   */
+  /** Make an overlay effective and sync the repositories whose address or branch changed. */
   private apply(overlay: SettingsOverlay): void {
-    const previous = this.current.gitCredentials
     this.overlay = overlay
     this.overlayError = undefined
     this.current = applyOverlay(this.defaults, overlay)
-    const changed = this.registry.configure(this.current.reposDir, this.current.repos)
-    const next = this.current.gitCredentials
-    const reauthorized = this.current.repos.map(repo => repo.url)
-      .filter(url => JSON.stringify(credentialFor(url, previous)) !== JSON.stringify(credentialFor(url, next)))
-    void this.registry.syncUrls(changed)
-    void this.registry.resyncUrls(reauthorized.filter(url => !changed.includes(url)))
+    void this.registry.syncUrls(this.registry.configure(this.current.repos))
   }
 
   private onRegistryChange(): void {
     if (!this.active) return
     this.skill.invalidate()
+  }
+}
+
+async function describeToken(store: HostCredentials, tokenEnv: string): Promise<TokenStatusWire> {
+  try {
+    const info = await store.describe(tokenEnv)
+    return { tokenEnv, configured: info.configured, ...info.source === undefined ? {} : { source: info.source }, writable: info.writable }
+  } catch (error) {
+    return { tokenEnv, configured: false, writable: false, error: error instanceof Error ? error.message : String(error) }
   }
 }
