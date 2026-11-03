@@ -21,7 +21,7 @@ import type { AnalyzeRequest, AnalyzeResponse } from './contract.ts'
 export const FEISHU_TOPICS_SERVICE = 'feishuTopics'
 
 /** The `feishuTopics` contract version this plugin speaks. */
-export const FEISHU_TOPICS_VERSION: FeishuTopicsVersion = 1
+export const FEISHU_TOPICS_VERSION: FeishuTopicsVersion = 2
 
 /** Result of looking the service up. */
 export type TopicsLookup =
@@ -79,10 +79,6 @@ export function analyzeTopicSpec(request: AnalyzeRequest, idempotencyKey: string
         { text: ' 错误码不良日志的分析。' },
       ],
       links: { nameHeader: '日志', linkHeader: '详情页', rows: request.logDetails },
-    },
-    workspace: {
-      segments: ['analyze', request.app, request.errorCode],
-      title: `日志分析 · ${request.app} · ${request.errorCode}`,
     },
     prompt: request.logId === undefined ? request.prompt : `${request.prompt}${REPORT_PROMPT_SECTION}`,
   }

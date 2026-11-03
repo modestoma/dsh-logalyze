@@ -28,7 +28,7 @@ afterEach(async () => { await Promise.all(cleanups.splice(0).map(cleanup => clea
 
 function fakeTopics(result: TopicLaunchResult = { ok: true, replayed: false, chatId: 'oc_group1', messageId: 'om_root' }): FeishuTopicService & { specs: TopicLaunchSpec[]; next: TopicLaunchResult } {
   const service = {
-    version: 1 as const,
+    version: 2 as const,
     specs: [] as TopicLaunchSpec[],
     next: result,
     launch: async (spec: TopicLaunchSpec) => { service.specs.push(spec); return service.next },
@@ -120,7 +120,7 @@ describe('analyze contract', () => {
     for (const field of ['requesterUserId', 'app', 'logDetails', '(body)']) expect(parsed.error).toContain(field)
   })
 
-  it('builds the analysis topic with the card, workspace, and the raw key', () => {
+  it('builds the analysis topic with the card and the raw key', () => {
     expect(analyzeTopicSpec(REQUEST, 'req-1')).toEqual({
       key: 'req-1',
       fingerprint: analyzeRequestHash(REQUEST),
@@ -138,7 +138,6 @@ describe('analyze contract', () => {
         ],
         links: { nameHeader: '日志', linkHeader: '详情页', rows: REQUEST.logDetails },
       },
-      workspace: { segments: ['analyze', 'order-service', 'E1001'], title: '日志分析 · order-service · E1001' },
       prompt: REQUEST.prompt,
     })
   })
@@ -162,9 +161,9 @@ describe('analyze contract', () => {
     expect(analyzeResponseOf({ ok: false, code: 'key-conflict', message: 'x' }).body).toEqual({ ok: false, error: 'Idempotency-Key 已被内容不同的请求使用' })
   })
 
-  it('accepts only a provider of contract version 1', () => {
+  it('accepts only a provider of contract version 2', () => {
     expect(lookupTopics(undefined).availability).toBe('missing')
-    expect(lookupTopics({ version: 2, launch: () => undefined }).availability).toBe('incompatible')
+    expect(lookupTopics({ version: 1, launch: () => undefined }).availability).toBe('incompatible')
     expect(lookupTopics(fakeTopics()).availability).toBe('ready')
   })
 })
@@ -179,7 +178,7 @@ describe('analyze route', () => {
   })
 
   it('is not registered for an incompatible provider', async () => {
-    const h = await harness({ feishuTopics: { version: 2, launch: () => undefined } })
+    const h = await harness({ feishuTopics: { version: 1, launch: () => undefined } })
     expect(h.routes.has('/open-api/logalyze')).toBe(false)
     expect(h.warn).toHaveBeenCalledWith(expect.stringContaining('版本与观象不兼容'))
     const state = await (await fetch(`${h.base}/logalyze/state`)).json() as StateWire
