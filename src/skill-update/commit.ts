@@ -13,7 +13,7 @@
  */
 
 import type { Agent, ApprovalOutcome, HostApproval, ToolRunContext } from '../host.ts'
-import type { CommitAuthor, DshRepos } from '../repos/contract.ts'
+import type { DshRepos } from '../repos/contract.ts'
 import { messageOf, repoErrorCode } from '../repos/lookup.ts'
 import { ProposalError } from './files.ts'
 
@@ -53,8 +53,7 @@ export interface PushRequest {
   readonly message: string
   readonly title: string
   readonly body: string
-  readonly author?: CommitAuthor
-  /** Session recorded in the commit message by `dshRepos`. */
+  /** Session the push and the merge request are made for: `dshRepos` asks `access/authorize` for it, records it in the commit message, and lets other plugins add trailers and the author. */
   readonly session: string
 }
 
@@ -126,7 +125,6 @@ export async function pushChange(request: PushRequest): Promise<PushOutcome> {
     await repos.pushWorkspace(request.dir, {
       branch,
       message: request.message,
-      ...request.author === undefined ? {} : { author: request.author },
       session: request.session,
       signal: exec.signal,
     })
@@ -135,7 +133,7 @@ export async function pushChange(request: PushRequest): Promise<PushOutcome> {
     throw error
   }
   try {
-    const opened = await repos.createChange(url, { title: request.title, body: request.body, sourceBranch: branch, targetBranch: request.target, signal: exec.signal })
+    const opened = await repos.createChange(url, { title: request.title, body: request.body, sourceBranch: branch, targetBranch: request.target, session: request.session, signal: exec.signal })
     return { status: 'opened', mergeRequestUrl: opened.webUrl }
   } catch (error) {
     // The branch exists now; report it so the user can open the request by hand.

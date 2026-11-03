@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { defaultsOf, resolveConfig } from '../src/config.ts'
 import type { Agent, ApprovalOutcome, ApprovalRequest, SubagentActivation, SubagentResult, SubagentService } from '../src/host.ts'
+import type { AuthorizeEvent } from '../src/access.ts'
 import { renderAddRepoValue, RepoAdder } from '../src/onboard/add.ts'
 import { checkInitDraft } from '../src/onboard/draft.ts'
 import { renderInitRepoValue, renderSubmitInitValue, RepoInitializer } from '../src/onboard/init.ts'
@@ -73,9 +74,24 @@ describe('logalyze_add_repo', () => {
     })
     const answer = { value: 'allowed-once' as ApprovalOutcome }
     const approval = approvalWith(answer)
-    const adder = new RepoAdder({ registry, approval: () => approval, addRepo })
-    return { ready, bare, registry, addRepo, answer, approval, adder }
+    const authorize = vi.fn(async (_event: AuthorizeEvent) => {})
+    const adder = new RepoAdder({ registry, approval: () => approval, authorize, addRepo })
+    return { ready, bare, registry, addRepo, answer, approval, authorize, adder }
   }
+
+  it('asks the access/authorize listeners for the calling Session before the user, and refuses when they do', async () => {
+    const { ready, addRepo, approval, authorize, adder } = await setup()
+    authorize.mockRejectedValueOnce(new Error('logalyze_add_repo 未获授权，没有执行：张三 不是管理员'))
+    await expect(adder.execute({ url: ready }, run())).rejects.toThrow('张三 不是管理员')
+    expect(approval.request).not.toHaveBeenCalled()
+    expect(addRepo).not.toHaveBeenCalled()
+    await adder.execute({ url: ready }, run())
+    expect(authorize).toHaveBeenLastCalledWith({ session: 'parent', level: 'admin', action: 'logalyze_add_repo', summary: expect.stringContaining(`把 ${ready}（远端默认分支）加入应用仓库列表`) })
+    expect(approval.request).toHaveBeenCalledTimes(1)
+    // A repository already in the list is re-synced without asking anyone.
+    await adder.execute({ url: ready }, run())
+    expect(authorize).toHaveBeenCalledTimes(2)
+  })
 
   it('adds a repository only after the user allows it and reports the usable application', async () => {
     const { ready, addRepo, answer, approval, adder } = await setup()
@@ -231,7 +247,6 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
       workingDirectory: () => undefined,
       approval: () => approval,
       repos: () => repos,
-      author: { name: '观象', email: 'logalyze@example.com' },
       now: () => new Date(2026, 9, 31, 21, 0, 0),
     })
     const agent: Agent = { id: 'parent', session: { header: { id: 'parent', cwd: project } } }
@@ -281,7 +296,7 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     answer.value = 'allowed-once'
     const opened = await initializer.submit({ workDir }, exec)
     expect(opened).toMatchObject({ status: 'opened', mergeRequestUrl: MR_URL, branch: rejected.branch })
-    expect(pushWorkspace).toHaveBeenCalledWith(join(workDir, 'repo'), expect.objectContaining({ branch: opened.branch, author: { name: '观象', email: 'logalyze@example.com' }, session: 'parent' }))
+    expect(pushWorkspace).toHaveBeenCalledWith(join(workDir, 'repo'), expect.objectContaining({ branch: opened.branch, session: 'parent' }))
     const [push] = repos.pushes
     expect(push?.files).toEqual({
       '.agents/logalyze.yaml': MANIFEST,

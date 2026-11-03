@@ -19,6 +19,7 @@ import { defaultReportsDir, ReportStore } from './report/store.ts'
 import { ReportTracker } from './report/tracker.ts'
 import type { ReportTopics } from './report/tracker.ts'
 import { Dispatcher, inRunDirectory, isDelegatedAgent, isInside } from './dispatch/tool.ts'
+import { authorize } from './access.ts'
 import type { HostApproval, HostContext, HostCredentials, ToolActivationContext, WorkingDirectoryService } from './host.ts'
 import { DSH_REPOS_SERVICE, lookupRepos, messageOf } from './repos/lookup.ts'
 import { RepoRegistry } from './repos/registry.ts'
@@ -108,7 +109,6 @@ export class LogalyzeService {
       provider: config.subagentProvider,
       settings: () => this.current,
       workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
-      ...config.skillUpdateAuthor === undefined ? {} : { author: config.skillUpdateAuthor },
       repos: () => ctx.get?.(DSH_REPOS_SERVICE),
       ...options.fetch === undefined ? {} : { fetch: options.fetch },
     })
@@ -125,6 +125,7 @@ export class LogalyzeService {
     this.adder = new RepoAdder({
       registry: this.registry,
       approval: () => ctx.get?.('approval') as HostApproval | undefined,
+      authorize: event => authorize(ctx, event),
       addRepo: spec => this.addRepo(spec),
     })
     this.initializer = new RepoInitializer({
@@ -135,7 +136,6 @@ export class LogalyzeService {
       workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
       approval: () => ctx.get?.('approval') as HostApproval | undefined,
       repos: () => ctx.get?.(DSH_REPOS_SERVICE),
-      ...config.skillUpdateAuthor === undefined ? {} : { author: config.skillUpdateAuthor },
       ...options.fetch === undefined ? {} : { fetch: options.fetch },
     })
     this.reports = new ReportTracker({

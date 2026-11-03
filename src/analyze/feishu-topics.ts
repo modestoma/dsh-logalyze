@@ -1,7 +1,7 @@
 /**
- * The part of dsh-channels' `feishuTopics` service (contract version 2) this
- * plugin uses, declared here so the plugin does not depend on the dsh-channels
- * package. dsh-channels provides the service under `feishuTopics` and emits
+ * The part of the Feishu channel plugin's `feishuTopics` service (contract version 2) this
+ * plugin uses, declared here so the plugin does not depend on that plugin's
+ * package. The plugin provides the service under `feishuTopics` and emits
  * {@link FEISHU_TOPICS_STATUS_EVENT}; both are looked up at run time.
  *
  * @module dsh-logalyze/analyze/feishu-topics
@@ -92,7 +92,7 @@ export interface TopicLaunchState {
   readonly workDir?: string
 }
 
-/** Name of the event dsh-channels emits after a launch status is recorded; listeners receive the {@link TopicLaunchState}. */
+/** Name of the event the Feishu channel plugin emits after a launch status is recorded; listeners receive the {@link TopicLaunchState}. */
 export const FEISHU_TOPICS_STATUS_EVENT = 'feishu-topics/status'
 
 /**

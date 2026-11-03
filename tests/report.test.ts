@@ -55,7 +55,7 @@ describe('report rendering', () => {
     expect(renderReport(REQUEST, [])).toContain('分析进行中')
   })
 
-  it('reads follow-up questions without dsh-channels context blocks', () => {
+  it('reads follow-up questions without the Feishu channel context blocks', () => {
     expect(questionOf(['<feishu_quote>引用</feishu_quote>\n还有别的原因吗？', '<feishu_context a="1">x</feishu_context>'])).toBe('还有别的原因吗？')
     expect(statusOfTurnEnd('aborted')).toBe('stopped')
     expect(statusOfTurnEnd('something-new')).toBe('done')

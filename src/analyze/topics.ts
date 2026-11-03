@@ -1,5 +1,5 @@
 /**
- * 分析请求到 dsh-channels `feishuTopics` 服务的转换：根卡片内容、工作区
+ * 分析请求到飞书渠道插件 `feishuTopics` 服务的转换：根卡片内容、工作区
  * `analyze/<app>/<errorCode>`、幂等键与指纹，以及服务结果到 HTTP 响应的映射。
  *
  * 服务接口在 `./feishu-topics.ts` 本地声明；服务在运行时经
@@ -17,7 +17,7 @@ import type { TopicsAvailability } from '../settings/contract.ts'
 import { analyzeRequestHash } from './contract.ts'
 import type { AnalyzeRequest, AnalyzeResponse } from './contract.ts'
 
-/** Name dsh-channels provides the service under. */
+/** Name the Feishu channel plugin provides the service under. */
 export const FEISHU_TOPICS_SERVICE = 'feishuTopics'
 
 /** The `feishuTopics` contract version this plugin speaks. */

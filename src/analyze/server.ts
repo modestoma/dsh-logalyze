@@ -1,8 +1,8 @@
 /**
  * 日志平台分析接口在 DSH Web 服务器上的路由。
  *
- * 只在宿主同时提供 `webServer` 和版本兼容的 dsh-channels `feishuTopics`
- * 服务时注册精确路由 `POST /open-api/logalyze`；dsh-channels 未加载、重载
+ * 只在宿主同时提供 `webServer` 和版本兼容的飞书渠道插件 `feishuTopics`
+ * 服务时注册精确路由 `POST /open-api/logalyze`；渠道插件未加载、重载
  * 中或版本不兼容时不注册。
  * 本模块按顺序做传输层检查：路径、开关、方法、Bearer 令牌、
  * `Idempotency-Key`、媒体类型、请求体大小和 JSON 校验；通过后交给
@@ -172,7 +172,7 @@ export function mountAnalyzeRoute(ctx: HostContext, gate: AnalyzeGate, accepted:
     if (server === undefined) return
     const topics = lookupTopics(scope.get?.(FEISHU_TOPICS_SERVICE))
     if (topics.availability !== 'ready') {
-      if (topics.availability === 'incompatible') ctx.logger?.warn?.('logalyze: dsh-channels 的 feishuTopics 服务版本与观象不兼容，分析接口未注册；请把两者升级到相互兼容的版本')
+      if (topics.availability === 'incompatible') ctx.logger?.warn?.('logalyze: 飞书渠道插件的 feishuTopics 服务版本与观象不兼容，分析接口未注册；请把两者升级到相互兼容的版本')
       return
     }
     const { service } = topics
