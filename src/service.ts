@@ -155,7 +155,9 @@ export class LogalyzeService {
       inRepositories: (cwd) => {
         if (inRunDirectory(cwd)) return true
         const lookup = lookupRepos(ctx.get?.(DSH_REPOS_SERVICE))
-        return lookup.availability === 'ready' && isInside(cwd, lookup.service.mirrorSettings().dir)
+        if (lookup.availability !== 'ready') return false
+        const mirrors = lookup.service.mirrorSettings().dir
+        return mirrors !== undefined && isInside(cwd, mirrors)
       },
     })
   }
@@ -403,7 +405,8 @@ export class LogalyzeService {
   private reposState(): ReposWire {
     const lookup = lookupRepos(this.ctx.get?.(DSH_REPOS_SERVICE))
     if (lookup.availability !== 'ready') return { availability: lookup.availability }
-    return { availability: 'ready', mirrorDir: lookup.service.mirrorSettings().dir }
+    const mirror = lookup.service.mirrorSettings()
+    return { availability: 'ready', ...mirror.dir === undefined ? {} : { mirrorDir: mirror.dir }, ...mirror.problem === undefined ? {} : { mirrorProblem: mirror.problem } }
   }
 
   /**

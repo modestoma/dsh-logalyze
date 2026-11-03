@@ -180,8 +180,10 @@ export type ReposAvailability = 'ready' | 'missing' | 'incompatible'
 /** dsh-repo view of the panel. */
 export interface ReposWire {
   availability: ReposAvailability
-  /** Mirror directory; absent unless `ready`. */
+  /** Mirror directory; absent unless `ready`, and absent while the provider has none chosen (repositories cannot be fetched until it is set in the provider's settings). */
   mirrorDir?: string
+  /** The provider's reason for not using its stored mirror directory; absent otherwise. */
+  mirrorProblem?: string
 }
 
 /**

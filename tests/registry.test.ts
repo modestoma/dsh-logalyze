@@ -64,6 +64,19 @@ describe('repository registry', () => {
     expect(status?.error).toMatch(/^更新失败，继续使用已有提交 [0-9a-f]{8}：/)
   })
 
+  it('reports the provider refusal while no mirror directory is chosen, and syncs once one is', async () => {
+    const { root, registry, fake } = await setup()
+    const origin = await createAppRepo(join(root, 'origin'))
+    fake.mirrorUnset = true
+    registry.configure([{ url: origin }])
+    await registry.syncAll()
+    expect(registry.status()[0]).toMatchObject({ phase: 'failed', available: false, error: expect.stringContaining('镜像目录未设置') })
+    await expect(registry.acquire(['order-service'])).rejects.toThrow()
+    fake.mirrorUnset = false
+    await registry.syncAll()
+    expect(registry.status()[0]).toMatchObject({ phase: 'ready', available: true })
+  })
+
   it('marks a repository without a manifest as failed', async () => {
     const { root, registry } = await setup()
     const origin = join(root, 'bare-app')

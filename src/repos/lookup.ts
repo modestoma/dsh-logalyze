@@ -15,7 +15,7 @@ import type { DshRepos, DshReposVersion } from './contract.ts'
 export const DSH_REPOS_SERVICE = 'dshRepos'
 
 /** The `dshRepos` contract version this plugin speaks. */
-export const DSH_REPOS_VERSION: DshReposVersion = 2
+export const DSH_REPOS_VERSION: DshReposVersion = 3
 
 /** Result of looking the service up. */
 export type ReposLookup =

@@ -1,5 +1,5 @@
 /**
- * 观象对 `dshRepos` 服务（version 2）的需求：只声明观象调用的方法和读取的
+ * 观象对 `dshRepos` 服务（version 3）的需求：只声明观象调用的方法和读取的
  * 字段。服务在运行时经 `ctx.get('dshRepos')` 取得，由任何按这一约定提供该服务
  * 的插件实现；观象不依赖提供方的包。
  *
@@ -11,7 +11,7 @@
  */
 
 /** The `dshRepos` service version this plugin calls. */
-export type DshReposVersion = 2
+export type DshReposVersion = 3
 
 /** Options every call accepts. */
 export interface CallOptions {
@@ -19,10 +19,16 @@ export interface CallOptions {
   readonly signal?: AbortSignal
 }
 
-/** Where the provider keeps local mirrors. */
+/**
+ * Where the provider keeps local mirrors. The provider has no default
+ * directory: while `dir` is undefined every mirror call rejects with
+ * `unavailable` and a message saying where to choose one.
+ */
 export interface MirrorSettings {
-  /** Absolute directory holding the mirrors and the snapshots. */
-  readonly dir: string
+  /** Absolute directory holding the mirrors and the snapshots; undefined while none is chosen or the stored choice is unusable. */
+  readonly dir: string | undefined
+  /** Why the provider's stored directory is not in use; absent otherwise. */
+  readonly problem?: string
 }
 
 /** A mirror after a successful clone or fetch. */
