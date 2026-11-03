@@ -187,7 +187,7 @@ export interface ReposWire {
 }
 
 /**
- * Whether dsh-channels provides the `feishuTopics` service the analyze API
+ * Whether the Feishu channel plugin provides the `feishuTopics` service the analyze API
  * posts through: `missing` while it is not loaded, `incompatible` when its
  * contract version is not
  * the one this plugin speaks.
@@ -236,7 +236,7 @@ export interface AnalyzeWire {
   /** Token status; absent while the DSH composition has no credential store. */
   token?: TokenStatusWire
   topics: TopicsAvailability
-  /** Whether the loaded dsh-channels reports launch states, which report upload needs. */
+  /** Whether the loaded Feishu channel plugin reports launch states, which report upload needs. */
   reportsSupported: boolean
   /** Most recently accepted reports, newest first. */
   reports: ReportWire[]

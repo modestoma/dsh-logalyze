@@ -2,8 +2,10 @@
  * `logalyze_add_repo`：在对话中把一个 git 地址加入观象的应用仓库列表，并等待
  * 第一次拉取结束。
  *
- * - 写入与设置面板相同的覆盖文件，面板随即显示该仓库；新增前经 DSH 审批服务
- *   请求一次性授权，只有 `allowed-once` 才写入，没有审批服务时工具报错。
+ * - 写入与设置面板相同的覆盖文件，面板随即显示该仓库；新增前先发
+ *   `access/authorize`（级别 `admin`）问其他插件这个会话能不能改仓库列表，被拒绝
+ *   时工具报错、不问用户；再经 DSH 审批服务请求一次性授权，只有 `allowed-once`
+ *   才写入，没有审批服务时工具报错。
  * - 地址已在列表中时不请求授权、不写入，只重新拉取并报告状态；分支不同时报错，
  *   改分支在设置面板完成。
  * - 取消调用只停止等待，拉取在后台继续。
@@ -15,6 +17,7 @@
  */
 
 import { abortable } from '../abort.ts'
+import type { AuthorizeEvent } from '../access.ts'
 import { describeIssue, repoSchema } from '../config.ts'
 import { isDelegatedAgent } from '../dispatch/tool.ts'
 import type { ContentBlock, HostApproval, ToolDefinition, ToolRunContext } from '../host.ts'
@@ -93,6 +96,12 @@ export interface AddRepoDeps {
   /** DSH's approval service, when the composition has one. */
   approval(): HostApproval | undefined
   /**
+   * Ask the `access/authorize` listeners whether the calling Session may
+   * change the repository list; rejects with the reason. Absent means every
+   * Session may.
+   */
+  authorize?(event: AuthorizeEvent): Promise<void>
+  /**
    * Persist the repository in the panel settings and start syncing it.
    * @returns `exists` when it was already configured.
    */
@@ -128,7 +137,7 @@ export class RepoAdder {
    * @param rawArgs - model arguments.
    * @param exec - execution context of the calling agent.
    * @returns how the call ended and where the repository stands.
-   * @throws when the arguments are invalid, the address is configured with another branch, or no approval service is loaded; nothing is written then.
+   * @throws when the arguments are invalid, the address is configured with another branch, an `access/authorize` listener refused, or no approval service is loaded; nothing is written then.
    */
   async execute(rawArgs: unknown, exec: ToolRunContext): Promise<AddRepoValue> {
     const parsed = repoSchema.safeParse(rawArgs)
@@ -147,11 +156,12 @@ export class RepoAdder {
       return await this.settle('exists', spec.url, exec.signal)
     }
 
-    const approval = this.deps.approval()
-    if (approval === undefined) throw new Error('当前 DSH 组合没有审批服务（@deepseek-ai/dsh-user-approval），观象不会在未经授权时添加仓库')
     const branch = spec.branch === undefined ? '远端默认分支' : `分支 ${spec.branch}`
     const zh = `观象将把 ${spec.url}（${branch}）加入应用仓库列表并拉取，之后派发的子 Agent 会读取它的代码。`
     const en = `Logalyze will add ${spec.url} (${spec.branch ?? 'default branch'}) to its application repositories and mirror it; dispatched agents will read its code.`
+    await this.deps.authorize?.({ session: agent.session.header.id, level: 'admin', action: ADD_REPO_TOOL_NAME, summary: zh })
+    const approval = this.deps.approval()
+    if (approval === undefined) throw new Error('当前 DSH 组合没有审批服务（@deepseek-ai/dsh-user-approval），观象不会在未经授权时添加仓库')
     const outcome = await approval.request({
       agent,
       toolName: ADD_REPO_TOOL_NAME,

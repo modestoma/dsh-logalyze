@@ -187,7 +187,7 @@ export class ReportTracker {
   }
 
   /**
-   * React to dsh-channels' `feishu-topics/status` event: a launch that failed
+   * React to the Feishu channel plugin's `feishu-topics/status` event: a launch that failed
    * to start or was interrupted gets an analysis section explaining why.
    * Settled first turns are recorded from their `turn/end`.
    * @param state - the new launch state.

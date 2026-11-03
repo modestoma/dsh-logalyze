@@ -4,7 +4,6 @@ import { access, mkdir } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
 import type {
-  CommitAuthor,
   DshRepos,
   MirrorState,
   MirrorTreeEntry,
@@ -47,8 +46,7 @@ export interface RecordedPush {
   readonly dir: string
   readonly branch: string
   readonly message: string
-  readonly author?: CommitAuthor
-  readonly session?: string
+  readonly session: string
   readonly commit: string
   /** Files of the pushed commit, by path. */
   readonly files: Record<string, string>
@@ -90,7 +88,7 @@ function acceptedAddress(url: string): boolean {
  * unless a test replaces it.
  */
 export class FakeRepos implements DshRepos {
-  readonly version = 3 as const
+  readonly version = 4 as const
   /** While true, `syncMirror` never settles. */
   stalled = false
   /** While true, the provider reports no mirror directory and every mirror call rejects, as dsh-repo does before one is chosen. */
@@ -239,7 +237,7 @@ export class FakeRepos implements DshRepos {
 
   async pushWorkspace(dir: string, options: WorkspacePushOptions): Promise<WorkspacePushResult> {
     const workspace = this.workspace(dir)
-    const { branch, message, author, session } = options
+    const { branch, message, session } = options
     if (workspace.branch !== undefined && workspace.branch !== branch) throw repoError('invalid', `工作区已推送到 ${workspace.branch}`)
     if (branch === workspace.baseBranch) throw repoError('invalid', `不能推送到基准分支 ${branch}`)
     const env = { GIT_INDEX_FILE: workspace.index }
@@ -250,7 +248,7 @@ export class FakeRepos implements DshRepos {
     if (workspace.branch === undefined && (await git(workspace.mirror, 'ls-remote', '--heads', 'origin', branch)).trim() !== '') {
       throw repoError('conflict', `远端分支 ${branch} 已存在`)
     }
-    const identity = author ?? { name: 'fake', email: 'fake@example.com' }
+    const identity = { name: 'fake', email: 'fake@example.com' }
     const commit = (await gitEnv({
       GIT_AUTHOR_NAME: identity.name,
       GIT_AUTHOR_EMAIL: identity.email,
@@ -264,7 +262,7 @@ export class FakeRepos implements DshRepos {
     for (const path of (await git(workspace.mirror, 'diff', '--name-only', '--diff-filter=AM', workspace.baseCommit, commit)).split('\n').filter(Boolean)) {
       files[path] = await git(workspace.mirror, 'cat-file', 'blob', `${commit}:${path}`)
     }
-    this.pushes.push({ dir, branch, message, ...author === undefined ? {} : { author }, ...session === undefined ? {} : { session }, commit, files })
+    this.pushes.push({ dir, branch, message, session, commit, files })
     return { branch, commit }
   }
 

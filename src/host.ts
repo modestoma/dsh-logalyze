@@ -234,8 +234,8 @@ export interface ApprovalRequest {
 }
 
 /**
- * The optional `ctx.approval` slice. Answerers such as dsh_channels' Feishu
- * decision cards or the DSH Web prompt claim the request; without an answerer
+ * The optional `ctx.approval` slice. Answerers such as the Feishu channel
+ * plugin's decision cards or the DSH Web prompt claim the request; without an answerer
  * the outcome is `unavailable`.
  */
 export interface HostApproval {
@@ -264,12 +264,17 @@ export interface HostContext {
    */
   on(name: 'session/event', listener: (session: { readonly header: SessionHeader }, event: SessionEventEnvelope) => void): () => unknown
   /**
-   * Listen to dsh-channels' launch status event; it never fires without dsh-channels.
+   * Listen to the Feishu channel plugin's launch status event; it never fires without that plugin.
    * @param name - the event name.
    * @param listener - receives the new launch state.
    * @returns the disposer.
    */
   on(name: typeof FEISHU_TOPICS_STATUS_EVENT, listener: (state: TopicLaunchState) => void): () => unknown
+  /**
+   * Run every listener of a Cordis event concurrently and wait for all of
+   * them; rejects with an `AggregateError` of the listeners that threw.
+   */
+  parallel?(name: string, ...args: unknown[]): Promise<void>
   effect(callback: () => (() => void) | void, label?: string): () => unknown
   inject?(dependencies: string[], callback: (child: HostContext) => void): unknown
 }

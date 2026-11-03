@@ -21,7 +21,6 @@ import { describeIssue } from '../config.ts'
 import { admitLogs, isDelegatedAgent, logSchema, materializeLogs, newRunId, resolveRunBase, RUNS_SEGMENTS } from '../dispatch/tool.ts'
 import { runChild } from '../dispatch/child.ts'
 import type { Agent, ContentBlock, HostApproval, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
-import type { CommitAuthor } from '../repos/contract.ts'
 import { messageOf, requireRepos } from '../repos/lookup.ts'
 import type { RepoRegistry } from '../repos/registry.ts'
 import type { AppManifest, EditableSettings } from '../settings/contract.ts'
@@ -219,7 +218,6 @@ export interface RepoInitializerDeps {
   approval(): HostApproval | undefined
   /** What `ctx.get('dshRepos')` returns now. */
   repos(): unknown
-  readonly author?: CommitAuthor
   readonly fetch?: typeof fetch
   readonly now?: () => Date
 }
@@ -417,7 +415,6 @@ export class RepoInitializer {
       session: task.sessionId,
       title,
       body: `由观象起草的应用描述 ${AGENTS_DIR}/logalyze.yaml 与日志分析 SKILL ${AGENTS_DIR}/skills/${app.skill}/（基于提交 ${changes.base.slice(0, 12)}，会话 ${task.sessionId}）。合并后观象下一次加载 /logalyze 时启用该应用。说明：${reason.slice(0, REASON_DESCRIPTION_CHARS)}`,
-      ...this.deps.author === undefined ? {} : { author: this.deps.author },
       prompt: {
         zh: `观象将向 ${task.url} 推送新分支 ${branch}，并创建合并请求合入 ${target}，接入应用「${app.name}」（${app.id}）。改动：${describeFiles(files)}。说明：${preview}`,
         en: `Logalyze will push branch ${branch} to ${task.url} and open a merge request into ${target} to onboard application ${app.id}. Files: ${files.map(file => file.path).join(', ')}`,

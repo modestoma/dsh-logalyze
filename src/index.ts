@@ -13,7 +13,7 @@
  * `.agents/logalyze.yaml`。顶层 Agent 还可以用 `logalyze_add_repo` 在对话中
  * 添加仓库，并用 `logalyze_init_repo` / `logalyze_submit_init` 为缺少应用描述
  * 的仓库在工作区里起草并推送接入合并请求。另提供日志平台分析接口 `POST /open-api/logalyze`，
- * 经 dsh-channels 的 `feishuTopics` 服务在飞书群话题中开始分析；带 `logId` 的请求在
+ * 经飞书渠道插件的 `feishuTopics` 服务在飞书群话题中开始分析；带 `logId` 的请求在
  * 话题每轮结束后把报告目录交给回传命令。
  *
  * @module dsh-logalyze
@@ -96,7 +96,7 @@ export function apply(ctx: HostContext, config?: unknown, options: LogalyzePlugi
     })
     return () => { service.shutdown() }
   }, 'logalyze: repositories')
-  // Check reports waiting for their first turn whenever dsh-channels' service appears.
+  // Check reports waiting for their first turn whenever the Feishu channel plugin's service appears.
   ctx.inject?.([FEISHU_TOPICS_SERVICE], () => {
     void service.topicsAvailable().catch((error: unknown) => {
       ctx.logger?.error?.('logalyze: 核对分析报告失败：%s', error instanceof Error ? error.message : String(error))

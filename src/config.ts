@@ -107,11 +107,6 @@ const analyzeSchema = z.object({
   upload: uploadSchema.prefault({}),
 }).strict()
 
-const authorSchema = z.object({
-  name: z.string().trim().min(1, '提交作者名不能为空').refine(value => !/[<>\n]/.test(value), '提交作者名不能包含 < > 或换行'),
-  email: z.string().trim().min(1, '提交作者邮箱不能为空').refine(value => !/[<>\s]/.test(value), '提交作者邮箱不能包含 < > 或空白'),
-}).strict()
-
 /** Field validators shared by the cordis config and the panel overlay. */
 export const editableFields = {
   repos: z.array(repoSchema).superRefine((repos, issues) => {
@@ -142,11 +137,6 @@ const configSchema = z.object({
    * analyze API's bearer token.
    */
   analyzeTokenRef: z.string().trim().regex(TOKEN_ENV_PATTERN, '令牌名称只能包含字母、数字和下划线，且不能以数字开头').default('LOGALYZE_ANALYZE_TOKEN'),
-  /**
-   * Author and committer of SKILL improvement and onboarding commits;
-   * default: the account that owns the host token.
-   */
-  skillUpdateAuthor: authorSchema.optional(),
   /** Registered `ctx.subagents` provider the children start on. */
   subagentProvider: z.string().trim().min(1).default('spawn'),
   /**

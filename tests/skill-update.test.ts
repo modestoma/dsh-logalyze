@@ -189,7 +189,6 @@ async function setup(endTurn = true): Promise<Setup> {
     provider: 'spawn',
     settings: () => settings,
     workingDirectory: () => undefined,
-    author: { name: '观象', email: 'logalyze@example.com' },
     repos: () => repos.service,
     now: () => new Date(2026, 9, 31, 22, 0, 0),
   })
@@ -288,13 +287,11 @@ describe('logalyze_improve_skill', () => {
     expect(repos.pushWorkspace).toHaveBeenCalledWith(join(improveDir, 'repo'), {
       branch: value.branch,
       message: expect.any(String),
-      author: { name: '观象', email: 'logalyze@example.com' },
       session: 'parent',
       signal: exec.signal,
     })
     const [push] = repos.service.pushes
     expect(Object.keys(push!.files)).toEqual([SKILL, IN_SKILL(CASE)])
-    expect(push?.author).toEqual({ name: '观象', email: 'logalyze@example.com' })
     expect(git(origin, 'rev-parse', `${value.branch}^`).trim()).toBe(status.commit)
     expect(push?.message).toMatch(new RegExp(`^chore: 补充 traceId 字段说明与案例\\n\\n# 补充 traceId[\\s\\S]*\\n\\nProposed-by: 观象 Logalyze\\nAnalyzed-commit: ${task.commit}\\n$`))
     expect(repos.createChange).toHaveBeenCalledWith(origin, {
@@ -302,6 +299,7 @@ describe('logalyze_improve_skill', () => {
       body: expect.stringMatching(/^由观象在日志分析后经用户同意提出（应用 order-service，分析提交 [0-9a-f]{12}，会话 parent）。请评审案例和 SKILL 修改。\n\n# 补充 traceId/),
       sourceBranch: value.branch,
       targetBranch: 'main',
+      session: 'parent',
       signal: exec.signal,
     })
     const text = renderImproveValue(value)[0]?.text

@@ -1,5 +1,5 @@
 /**
- * 观象对 `dshRepos` 服务（version 3）的需求：只声明观象调用的方法和读取的
+ * 观象对 `dshRepos` 服务（version 4）的需求：只声明观象调用的方法和读取的
  * 字段。服务在运行时经 `ctx.get('dshRepos')` 取得，由任何按这一约定提供该服务
  * 的插件实现；观象不依赖提供方的包。
  *
@@ -11,7 +11,7 @@
  */
 
 /** The `dshRepos` service version this plugin calls. */
-export type DshReposVersion = 3
+export type DshReposVersion = 4
 
 /** Options every call accepts. */
 export interface CallOptions {
@@ -60,14 +60,10 @@ export interface SnapshotLease {
   release(): void
 }
 
-/** Name and email recorded on a commit. */
-export interface CommitAuthor {
-  readonly name: string
-  readonly email: string
-}
-
 /** Fields of a new pull or merge request. */
 export interface ChangeCreate extends CallOptions {
+  /** Session the request is opened for; the provider asks `access/authorize` for it first and fails with `forbidden` when refused. */
+  readonly session: string
   readonly title: string
   readonly body: string
   readonly sourceBranch: string
@@ -124,10 +120,13 @@ export interface WorkspacePushOptions extends CallOptions {
   readonly branch: string
   /** Message of the commit recording the uncommitted changes. */
   readonly message: string
-  /** Author and committer of that commit; default: the account that owns the host token. */
-  readonly author?: CommitAuthor
-  /** Session added to that commit's message as a `DSH-Session:` trailer. */
-  readonly session?: string
+  /**
+   * Session the push is made for: the provider asks `access/authorize` for
+   * it first (`forbidden` when refused), adds it to the commit message as a
+   * `DSH-Session:` trailer, and lets other plugins add trailers and name the
+   * author; otherwise the account that owns the host token authors the commit.
+   */
+  readonly session: string
 }
 
 /** Outcome of {@link DshRepos.pushWorkspace}. */

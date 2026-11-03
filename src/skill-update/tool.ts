@@ -42,7 +42,6 @@ import type { ChildLog } from '../dispatch/prompt.ts'
 import { admitLogs, isDelegatedAgent, logSchema, materializeLogs, newRunId, resolveRunBase, RUNS_SEGMENTS } from '../dispatch/tool.ts'
 import type { LogSource } from '../dispatch/tool.ts'
 import type { Agent, ContentBlock, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
-import type { CommitAuthor } from '../repos/contract.ts'
 import { messageOf, requireRepos } from '../repos/lookup.ts'
 import { disablesUserInvocation, skillDir, skillNameOf } from '../repos/manifest.ts'
 import type { RepoRegistry } from '../repos/registry.ts'
@@ -216,7 +215,6 @@ export interface SkillImproverDeps {
   settings(): EditableSettings
   /** The working-directory service, when the composition has one. */
   workingDirectory(): WorkingDirectoryService | undefined
-  readonly author?: CommitAuthor
   /** What `ctx.get('dshRepos')` returns now. */
   repos(): unknown
   readonly fetch?: typeof fetch
@@ -517,7 +515,6 @@ export class SkillImprover {
       session: request.sessionId,
       title,
       body: `${origin}。请评审${caseRequired ? '案例和 ' : ' '}SKILL 修改。\n\n${reason.slice(0, REASON_DESCRIPTION_CHARS)}`,
-      ...this.deps.author === undefined ? {} : { author: this.deps.author },
     })
     return { ...base, branch, files: [...changes.files], diffPath, ...outcome }
   }
