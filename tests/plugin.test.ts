@@ -221,7 +221,7 @@ describe('plugin', () => {
       expect(listed?.invocation.modelInvocable).toBe(autoInvoke)
       if (autoInvoke) expect(listed?.description).toContain('订单服务（order-service')
       // Inside the repositories and the run directories' workspaces only the bundled guides are listed.
-      for (const cwd of [join(h.repos.mirrorSettings().dir, '.snapshots', 'local', 'x'), join(dir, '.logalyze', 'runs', 'r1', 'init', 'repo')]) {
+      for (const cwd of [join(h.repos.root, '.snapshots', 'local', 'x'), join(dir, '.logalyze', 'runs', 'r1', 'init', 'repo')]) {
         expect((await provider.list({ cwd })).map(skill => skill.name)).toEqual(['logalyze-kit', 'logalyze-improve'])
       }
     }
@@ -276,7 +276,10 @@ describe('plugin', () => {
     const state = async (): Promise<StateWire> => await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
 
     await waitFor(async () => (await state()).repos[0]?.available === true)
-    expect((await state()).dshRepo).toEqual({ availability: 'ready', mirrorDir: h.repos.mirrorSettings().dir })
+    expect((await state()).dshRepo).toEqual({ availability: 'ready', mirrorDir: h.repos.root })
+    h.repos.mirrorUnset = true
+    expect((await state()).dshRepo).toEqual({ availability: 'ready' })
+    h.repos.mirrorUnset = false
     expect((await fetch(`${h.base}/logalyze/hosts`, { method: 'POST' })).status).not.toBe(200)
     expect((await fetch(`${h.base}/logalyze/token`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tokenEnv: 'GITLAB_TOKEN', value: 'x' }) })).status).toBe(400)
 

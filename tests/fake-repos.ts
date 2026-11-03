@@ -90,9 +90,11 @@ function acceptedAddress(url: string): boolean {
  * unless a test replaces it.
  */
 export class FakeRepos implements DshRepos {
-  readonly version = 2 as const
+  readonly version = 3 as const
   /** While true, `syncMirror` never settles. */
   stalled = false
+  /** While true, the provider reports no mirror directory and every mirror call rejects, as dsh-repo does before one is chosen. */
+  mirrorUnset = false
   /** When set, `acquireSnapshot` rejects with it. */
   snapshotError: Error | undefined
   private readonly listeners = new Set<() => void>()
@@ -104,8 +106,8 @@ export class FakeRepos implements DshRepos {
   /** @param root - directory for mirrors and snapshots. */
   constructor(readonly root: string) {}
 
-  mirrorSettings(): { dir: string } {
-    return { dir: this.root }
+  mirrorSettings(): { dir: string | undefined } {
+    return { dir: this.mirrorUnset ? undefined : this.root }
   }
 
   onHostsChange(listener: () => void): () => void {
@@ -133,6 +135,7 @@ export class FakeRepos implements DshRepos {
 
   async syncMirror(url: string, options: { readonly branch?: string } = {}): Promise<MirrorState> {
     if (!acceptedAddress(url)) throw repoError('invalid', `只支持 HTTPS 地址、file: URL 和本机绝对路径：${url}`)
+    if (this.mirrorUnset) throw repoError('unavailable', '镜像目录未设置：请到「代码仓库」设置页的「高级」里选择一个目录')
     if (this.stalled) return await new Promise(() => {})
     const dir = this.mirrorDir(url)
     try {

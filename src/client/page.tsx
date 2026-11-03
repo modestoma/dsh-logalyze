@@ -362,10 +362,11 @@ function ReposTab({ draft, setDraft, state, busy, openRepoSettings, onSync }: Ta
         </div>
       </div>
       {state.dshRepo.availability === 'ready' ? null : <div className="lz__notice lz__notice--error">{state.dshRepo.availability === 'missing' ? '没有加载 dsh-repo 插件，仓库无法拉取。请安装 dsh-repo。' : 'dsh-repo 版本与观象不兼容，仓库无法拉取。'}</div>}
+      {state.dshRepo.availability === 'ready' && state.dshRepo.mirrorDir === undefined ? <div className="lz__notice lz__notice--error">{state.dshRepo.mirrorProblem ?? 'dsh-repo 的镜像目录未设置，仓库无法拉取。'}请到 dsh-repo 的设置页「高级」里设置镜像目录。</div> : null}
       <p className="lz__secFoot">由 dsh-repo 拉取到它的镜像目录{state.dshRepo.mirrorDir === undefined ? '' : `（${state.dshRepo.mirrorDir}）`}。只支持 https 地址（也可以是 file URL 或本机绝对路径），不支持 ssh 地址；主机或令牌变更后会自动重新拉取。不留分支时跟随远端默认分支。每个仓库需包含 <span className="lz__mono">.agents/logalyze.yaml</span> 与其中声明的日志分析 SKILL。删除地址不会删除本地镜像。</p>
       <div className="lz__headRow">
         {state.repos.length > 0 ? <button type="button" className="lz__btn" disabled={busy} onClick={() => { onSync() }}>重新拉取全部</button> : null}
-        {openRepoSettings === undefined || state.dshRepo.availability === 'missing' ? null : <button type="button" className="lz__btn lz__btn--ghost" onClick={openRepoSettings}>管理主机与令牌</button>}
+        {openRepoSettings === undefined || state.dshRepo.availability === 'missing' ? null : <button type="button" className="lz__btn lz__btn--ghost" onClick={openRepoSettings}>{state.dshRepo.availability === 'ready' && state.dshRepo.mirrorDir === undefined ? '去设置镜像目录' : '管理主机与令牌'}</button>}
       </div>
     </section>
   )
