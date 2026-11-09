@@ -289,14 +289,16 @@ pnpm check        # 类型检查（Host 与 Client）+ 单元测试 + 构建 + �
 
 ## 发布
 
-版本号由 semantic-release 按 Conventional Commits 计算，并始终保持 0.x：破坏性变更只升次版本号（如 0.2 → 0.3），不会升到 1.0.0。推送到 `dev` 后，检查通过就自动发布 beta；正式版**只在手动触发时发布**，推送到 `main` 只跑检查。只有 `feat`、`fix` 或破坏性变更会产生新版本，其余类型的提交不发布。PR 标题需符合 `<type>(<scope>): <summary>`，type 取 `feat | fix | docs | test | refactor | chore | ci`。
+版本号由 semantic-release 按 Conventional Commits 计算，并始终保持 0.x：破坏性变更只升次版本号（如 0.2 → 0.3），不会升到 1.0.0。推送（含合并 PR）到 `main` 后，检查通过就自动发布正式版；beta **只在手动触发时发布**，推送到 `dev` 只跑检查。只有 `feat`、`fix` 或破坏性变更会产生新版本，其余类型的提交不发布。PR 标题需符合 `<type>(<scope>): <summary>`，type 取 `feat | fix | docs | test | refactor | chore | ci`。
 
 | 分支 | 触发 | 版本 | npm dist-tag |
 | --- | --- | --- | --- |
-| `main` | 手动 | 正式版，如 `0.1.0` | `latest` |
-| `dev` | 推送自动 | 预发布版，如 `0.1.0-beta.1` | `beta` |
+| `main` | 推送自动 | 正式版，如 `0.1.0` | `latest` |
+| `dev` | 手动 | 预发布版，如 `0.1.0-beta.1` | `beta` |
 
-发布正式版：在 GitHub Actions 的 `pipeline` workflow 点击 **Run workflow** 并选择 `main`。workflow 取 `dev` 当前的提交，把 `main` 快进到这个提交，再自动触发一次新的 `pipeline` 运行，在 `main` 的新提交上发布正式版（npm 来源证明记录的是触发运行的提交，所以发布要放在快进之后新开的运行里；Actions 里会看到两次运行）。正式版的 tag 因此打在 `dev` 的提交上：不用再提 `dev` → `main` 的 PR，发版后也不用把 `main` 合回 `dev`，`dev` 的下一个 beta 自动从新版本往上算。`main` 有 `dev` 没有的提交时无法快进，workflow 报错停止。`dry_run` 默认勾选，只预览 `dev` 当前提交的下一个版本号，不移动 `main`；取消勾选才真正快进 `main`、发布 npm 包、打 tag 并创建 GitHub Release。在 `dev` 上手动触发同样可用，用来预览或补发 beta。安装 beta 版用 `dsh-logalyze@beta`。
+发布正式版：提 `dev` → `main` 的 PR 并合并，或者直接把 `dev` 推送到 `main`（`git push origin dev:main`，只能快进，且需分支保护允许）。`main` 收到推送后 `pipeline` 先跑检查，通过后发布 npm 包、打 tag 并创建 GitHub Release。发布成功后 workflow 把这个提交带回 `dev`：`dev` 在此之后没有新提交时直接快进，有新提交时在 `dev` 上建一个合并提交（`chore: merge main into dev after stable release`）。这样正式版的 tag 总在 `dev` 的历史里，下一个 beta 从新版本往上算，发版后不用手动把 `main` 合回 `dev`。合并有冲突或被分支保护拒绝时这一步报错，此时手动提 `main` → `dev` 的 PR 合并即可。发布失败时可以在 `main` 上手动触发 `pipeline` 重试。
+
+发布 beta：在 GitHub Actions 的 `pipeline` workflow 点击 **Run workflow** 并选择 `dev`，发布 `dev` 当前提交的 beta 版。勾选 `dry_run` 只预览下一个版本号，不发布。安装 beta 版用 `dsh-logalyze@beta`。
 
 | 路径 | 内容 |
 |---|---|

@@ -7,14 +7,14 @@ on:
     branches: [main, dev]
     # `edited` re-validates a title-only change.
     types: [opened, synchronize, reopened, edited]
-  # A push to dev publishes a beta. A manual dispatch on main fast-forwards main
-  # to the current dev commit and publishes it as a stable version.
+  # A push to main publishes a stable version. A manual dispatch on dev
+  # publishes a beta; on main it retries or previews the stable release.
   workflow_dispatch:
     inputs:
       dry_run:
-        description: Preview the next version without moving main or publishing
+        description: Preview the next version without publishing
         type: boolean
-        default: true
+        default: false
 
 concurrency:
   # Each manual dispatch gets its own group so a newer dispatch never replaces
@@ -26,57 +26,7 @@ permissions:
   contents: read
 
 jobs:
-  # A manual dispatch on main releases the current dev commit. When main is
-  # behind dev, a real release fast-forwards main and dispatches a new run on
-  # main, which publishes at the promoted commit: npm provenance records the
-  # triggering commit, and only a run started after the move has the promoted
-  # one. A dry run skips the move and previews the dev commit. Every other run
-  # keeps the event's commit (`ref` empty) and proceeds (`release` true).
-  promote:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-      actions: write
-    outputs:
-      ref: ${{ steps.promote.outputs.ref }}
-      release: ${{ steps.promote.outputs.release }}
-    steps:
-      - id: promote
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MAIN_DISPATCH: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
-          DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          # A run dispatched by this job after the move publishes main as is.
-          if [ "$MAIN_DISPATCH" != true ] || [ "$GITHUB_ACTOR" = 'github-actions[bot]' ]; then
-            echo "release=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          dev=$(gh api "repos/$GITHUB_REPOSITORY/commits/dev" --jq .sha)
-          if [ "$dev" = "$GITHUB_SHA" ]; then
-            echo "release=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...$dev" --jq .status)
-          if [ "$status" != ahead ]; then
-            echo "::error::main has commits that dev does not contain (dev is $status). Merge main into dev, then release again."
-            exit 1
-          fi
-          if [ "$DRY_RUN" = true ]; then
-            { echo "ref=$dev"; echo "release=true"; } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Without force, GitHub rejects an update that is not a fast-forward.
-          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/main" -f sha="$dev" -F force=false --silent
-          workflow=${GITHUB_WORKFLOW_REF%@*}
-          gh workflow run "${workflow##*/}" --repo "$GITHUB_REPOSITORY" --ref main -f dry_run=false
-          echo "::notice::main fast-forwarded to $dev; the stable release continues in a new pipeline run on main."
-          echo "release=false" >> "$GITHUB_OUTPUT"
-
   check:
-    needs: promote
-    if: needs.promote.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -86,7 +36,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.promote.outputs.ref }}
           persist-credentials: false
       - uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2.0.2
         with:
@@ -103,17 +52,16 @@ jobs:
       - name: Typecheck, test, build, and verify loaders
         run: pnpm check
 
-  # A push to dev publishes a beta prerelease once checks pass; a push to main
-  # only runs checks. A manual dispatch on main publishes a stable version once
-  # `promote` has main at the dev commit, so the stable tag is on a dev commit
-  # and dev never needs main merged back. On dev a manual dispatch previews or
-  # publishes a beta.
+  # A push to main (a direct push or a merged pull request) publishes a stable
+  # version once checks pass; a push to dev only runs checks. A manual dispatch
+  # on dev previews or publishes a beta; on main it previews or retries the
+  # stable release of main's current commit.
   release:
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/dev') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_dispatch' &&
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'))
-    needs: [promote, check]
+    needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -127,7 +75,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.promote.outputs.ref }}
           fetch-depth: 0
           persist-credentials: false
       - uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2.0.2
@@ -156,3 +103,34 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pnpm exec semantic-release
+      # semantic-release counts a dev beta from the newest tag in dev's history,
+      # so dev must contain every commit that main released; otherwise the next
+      # beta repeats the version just published. This step fast-forwards dev to
+      # the released commit, or merges it into dev when dev has commits of its
+      # own. It runs inside this job so that no queued beta release can take
+      # the release lock between the stable publish and the sync.
+      - name: Bring the released commit into dev
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || !inputs.dry_run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/dev...$GITHUB_SHA" --jq .status)
+          case "$status" in
+            identical | behind)
+              echo "::notice::dev already contains $GITHUB_SHA."
+              exit 0
+              ;;
+            ahead)
+              # Without force, GitHub rejects the update if dev moved meanwhile;
+              # the merge below then handles the new dev commits.
+              if gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/dev" -f sha="$GITHUB_SHA" -F force=false --silent; then
+                echo "::notice::dev fast-forwarded to $GITHUB_SHA."
+                exit 0
+              fi
+              ;;
+          esac
+          if ! gh api -X POST "repos/$GITHUB_REPOSITORY/merges" -f base=dev -f head="$GITHUB_SHA" -f commit_message="chore: merge main into dev after stable release" --silent; then
+            echo "::error::Could not bring $GITHUB_SHA into dev (merge conflict or branch protection). Merge main into dev with a pull request before the next beta."
+            exit 1
+          fi
+          echo "::notice::Merged $GITHUB_SHA into dev."
