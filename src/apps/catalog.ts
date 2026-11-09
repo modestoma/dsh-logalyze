@@ -55,9 +55,11 @@ export class CatalogFollower {
 
   private async reload(resync: boolean): Promise<void> {
     const lookup = this.deps.repos.lookup()
-    this.syncedWith = lookup.availability === 'ready' ? lookup.service : undefined
     const { registry } = this.deps
+    this.syncedWith = undefined
     registry.configure(await this.deps.repos.appRepos())
+    // Only a catalog that was read counts as synced, so a failed read is retried when the service appears again.
+    this.syncedWith = lookup.availability === 'ready' ? lookup.service : undefined
     await (resync ? registry.resyncAll() : registry.syncAll())
   }
 

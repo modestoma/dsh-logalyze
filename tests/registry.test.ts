@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import { CatalogFollower } from '../src/apps/catalog.ts'
 import { RepoRegistry } from '../src/apps/registry.ts'
 import { MANIFEST_PATH } from '../src/apps/manifest.ts'
 import { FakeRepos, repoError } from './fake-repos.ts'
@@ -232,5 +233,20 @@ describe('repository registry', () => {
     await registry.syncAll()
     await expect(registry.acquire(['pay-service'])).rejects.toThrow('「pay-service」不在应用注册表中。可用的应用 id：order-service')
     expect(registry.status()[0]?.activeRuns).toBe(0)
+  })
+})
+
+describe('catalog follower', () => {
+  it('reads the catalog again when the service appears after a failed startup read', async () => {
+    const { root, registry, fake } = await setup()
+    const origin = await createAppRepo(join(root, 'origin'))
+    fake.setCatalog([{ url: origin }])
+    const follower = new CatalogFollower({ registry, repos: new ReposClient(() => fake), active: () => true, error: () => {} })
+    const repoList = fake.repoList.bind(fake)
+    fake.repoList = async () => { throw repoError('unavailable', 'catalog unreadable') }
+    await expect(follower.load()).rejects.toThrow('catalog unreadable')
+    fake.repoList = repoList
+    await follower.serviceAppeared()
+    expect(registry.readyApps().map(app => app.app.id)).toEqual(['order-service'])
   })
 })

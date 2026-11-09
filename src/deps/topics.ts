@@ -6,7 +6,7 @@
  */
 
 import type { TopicsAvailability } from '../settings/contract.ts'
-import type { FeishuTopicService, FeishuTopicsVersion } from './topics-contract.ts'
+import type { FeishuTopicService, FeishuTopicsVersion, TopicLaunchState } from './topics-contract.ts'
 
 /** Name the Feishu channel plugin provides the service under. */
 export const FEISHU_TOPICS_SERVICE = 'feishuTopics'
@@ -29,4 +29,22 @@ export function lookupTopics(value: unknown): TopicsLookup {
   if (value === undefined || value === null) return { availability: 'missing' }
   if ((value as { version?: unknown }).version !== FEISHU_TOPICS_VERSION) return { availability: 'incompatible' }
   return { availability: 'ready', service: value as FeishuTopicService }
+}
+
+/** The launch-state methods report tracking reads. */
+export interface TopicStates {
+  state(key: string): TopicLaunchState | undefined
+  launchKeyOf(sessionId: string): string | undefined
+}
+
+/**
+ * The launch-state methods of a usable provider.
+ * @param lookup - the lookup result.
+ * @returns both methods, or undefined while the service is unusable or an older version-2 provider lacks either.
+ */
+export function topicStatesOf(lookup: TopicsLookup): TopicStates | undefined {
+  if (lookup.availability !== 'ready') return undefined
+  const { state, launchKeyOf } = lookup.service
+  if (state === undefined || launchKeyOf === undefined) return undefined
+  return { state: key => state.call(lookup.service, key), launchKeyOf: sessionId => launchKeyOf.call(lookup.service, sessionId) }
 }

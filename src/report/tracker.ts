@@ -24,6 +24,7 @@ import { lstat, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { AnalyzeRequest } from '../analyze/contract.ts'
 import type { TopicLaunchState } from '../deps/topics-contract.ts'
+import type { TopicStates } from '../deps/topics.ts'
 import type { SessionEventEnvelope, SessionHeader } from '../host.ts'
 import { replaceFile } from '../util/files.ts'
 import { REPORT_DIR, REPORT_ENTRY } from '../settings/contract.ts'
@@ -37,17 +38,11 @@ import type { ReportSection } from './render.ts'
 import { reportIdOf } from './store.ts'
 import type { ReportRecord, ReportStore } from './store.ts'
 
-/** The `feishuTopics` methods report tracking reads. */
-export interface ReportTopics {
-  state(key: string): TopicLaunchState | undefined
-  launchKeyOf(sessionId: string): string | undefined
-}
-
 /** Collaborators of the tracker. */
 export interface ReportTrackerDeps {
   readonly store: ReportStore
   /** The launch-state methods of the loaded `feishuTopics`, or undefined while unavailable. */
-  topics(): ReportTopics | undefined
+  topics(): TopicStates | undefined
   /** Current upload settings. */
   upload(): UploadSettings
   readonly warn: (message: string) => void

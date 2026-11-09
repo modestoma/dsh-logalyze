@@ -95,7 +95,11 @@ export interface TopicLaunchState {
 /** Name of the event the Feishu channel plugin emits after a launch status is recorded; listeners receive the {@link TopicLaunchState}. */
 export const FEISHU_TOPICS_STATUS_EVENT = 'feishu-topics/status'
 
-/** The `feishuTopics` service. */
+/**
+ * The `feishuTopics` service. {@link FeishuTopicService.state} and
+ * {@link FeishuTopicService.launchKeyOf} were added without a version change,
+ * so older version-2 providers lack them; report tracking needs both.
+ */
 export interface FeishuTopicService {
   readonly version: FeishuTopicsVersion
   /**
@@ -109,11 +113,11 @@ export interface FeishuTopicService {
    * @param key - the launch's idempotency key.
    * @returns the state, or undefined for an unknown key or while disconnected.
    */
-  state(key: string): TopicLaunchState | undefined
+  state?(key: string): TopicLaunchState | undefined
   /**
    * Find the launch whose topic route currently names a Session.
    * @param sessionId - DSH session id.
    * @returns the launch's idempotency key, or undefined.
    */
-  launchKeyOf(sessionId: string): string | undefined
+  launchKeyOf?(sessionId: string): string | undefined
 }

@@ -232,6 +232,8 @@ export interface AnalyzeWire {
   /** Token status; absent while the DSH composition has no credential store. */
   token?: TokenStatusWire
   topics: TopicsAvailability
+  /** Whether the provider reports launch states, which report uploads need; older version-2 providers do not. */
+  reportsSupported: boolean
   /** Most recently accepted reports, newest first. */
   reports: ReportWire[]
 }

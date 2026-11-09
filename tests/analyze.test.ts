@@ -6,7 +6,7 @@ import type { FeishuTopicService, TopicLaunchResult, TopicLaunchSpec, TopicLaunc
 import { ANALYZE_MAX_PROMPT_CHARS, analyzeRequestHash, parseAnalyzeRequest, REPORT_PROMPT_RESERVE } from '../src/analyze/contract.ts'
 import type { AnalyzeRequest } from '../src/analyze/contract.ts'
 import { analyzeResponseOf, analyzeTopicSpec, REPORT_PROMPT_SECTION } from '../src/analyze/topics.ts'
-import { lookupTopics } from '../src/deps/topics.ts'
+import { lookupTopics, topicStatesOf } from '../src/deps/topics.ts'
 import { apply } from '../src/index.ts'
 import type { HostContext, HostCredentials } from '../src/host.ts'
 import type { StateWire } from '../src/settings/contract.ts'
@@ -169,6 +169,14 @@ describe('analyze contract', () => {
     expect(lookupTopics({ version: 1, launch: () => undefined }).availability).toBe('incompatible')
     expect(lookupTopics(fakeTopics()).availability).toBe('ready')
   })
+
+  it('tracks reports only with a provider that reports launch states', () => {
+    expect(topicStatesOf(lookupTopics(fakeTopics()))).toBeDefined()
+    const { state: _state, launchKeyOf: _launchKeyOf, ...older } = fakeTopics()
+    expect(lookupTopics(older).availability).toBe('ready')
+    expect(topicStatesOf(lookupTopics(older))).toBeUndefined()
+    expect(topicStatesOf(lookupTopics(undefined))).toBeUndefined()
+  })
 })
 
 describe('analyze route', () => {
@@ -177,7 +185,7 @@ describe('analyze route', () => {
     const h = await harness({ credentials }, { analyze: { enabled: true } })
     expect(h.routes.has('/open-api/logalyze')).toBe(false)
     const state = await (await fetch(`${h.base}/logalyze/state`)).json() as StateWire
-    expect(state.analyze).toEqual({ route: '/open-api/logalyze', tokenEnv: 'LOGALYZE_ANALYZE_TOKEN', token: { tokenEnv: 'LOGALYZE_ANALYZE_TOKEN', configured: false, writable: true }, topics: 'missing', reports: [] })
+    expect(state.analyze).toEqual({ route: '/open-api/logalyze', tokenEnv: 'LOGALYZE_ANALYZE_TOKEN', token: { tokenEnv: 'LOGALYZE_ANALYZE_TOKEN', configured: false, writable: true }, topics: 'missing', reportsSupported: false, reports: [] })
   })
 
   it('is not registered for an incompatible provider', async () => {

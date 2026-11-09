@@ -470,6 +470,7 @@ function AnalyzeTab({ draft, setDraft, analyze, credentialsAvailable, overridden
               <div className="lz__rowLabel">开启接口 <Overridden keys={overridden} name="analyze" /><span className={`lz__pill ${topics.pill}`}><span className="lz__dot" />{topics.text}</span></div>
               <div className="lz__rowSummary">日志平台调用接口后，观象经飞书渠道（dsh-channels）在目标群发出分析卡片，并在卡片下的话题里开始分析；群内成员都可以在话题里继续追问。关闭时接口回复 404。</div>
               {analyze.topics === 'ready' ? null : <div className="lz__rowError">{analyze.topics === 'missing' ? '接口需要加载 dsh-channels。' : '请把观象与 dsh-channels 升级到相互兼容的版本。'}</div>}
+              {analyze.reportsSupported || analyze.topics !== 'ready' ? null : <div className="lz__rowError">当前 dsh-channels 版本不提供话题状态查询，报告不会回传；请升级 dsh-channels。</div>}
             </div>
             <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="开启分析接口" checked={draft.analyzeEnabled} onChange={(event) => { setDraft({ ...draft, analyzeEnabled: event.target.checked }) }} /></div>
           </div>

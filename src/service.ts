@@ -15,7 +15,8 @@ import { describeIssue } from './config.ts'
 import { DSH_REPOS_SERVICE, LOG_ANALYSIS_FEATURE, ReposClient } from './deps/repos.ts'
 import type { DshRepos } from './deps/repos-contract.ts'
 import { FEISHU_TOPICS_STATUS_EVENT } from './deps/topics-contract.ts'
-import { FEISHU_TOPICS_SERVICE, lookupTopics } from './deps/topics.ts'
+import { FEISHU_TOPICS_SERVICE, lookupTopics, topicStatesOf } from './deps/topics.ts'
+import type { TopicStates } from './deps/topics.ts'
 import { Dispatcher } from './dispatch/tool.ts'
 import type { HostContext, HostCredentials, ToolActivationContext, ToolDefinition, WorkingDirectoryService } from './host.ts'
 import { SkillViewer } from './improve/show.ts'
@@ -25,7 +26,6 @@ import { RepoInitializer } from './onboard/init.ts'
 import type { CommandRunner } from './report/command.ts'
 import { defaultReportsDir, ReportStore } from './report/store.ts'
 import { ReportTracker } from './report/tracker.ts'
-import type { ReportTopics } from './report/tracker.ts'
 import { inRunDirectory, isDelegatedAgent, isInside } from './runs/run-dir.ts'
 import { ANALYZE_ROUTE } from './settings/contract.ts'
 import type { StateWire } from './settings/contract.ts'
@@ -268,9 +268,8 @@ export class LogalyzeService {
   }
 
   /** The launch-state methods of the loaded `feishuTopics`. */
-  private reportTopics(): ReportTopics | undefined {
-    const lookup = lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE))
-    return lookup.availability === 'ready' ? lookup.service : undefined
+  private reportTopics(): TopicStates | undefined {
+    return topicStatesOf(lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE)))
   }
 
   /** @returns the panel state. */
@@ -286,6 +285,7 @@ export class LogalyzeService {
         tokenEnv: this.token.ref,
         ...token === undefined ? {} : { token },
         topics: lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE)).availability,
+        reportsSupported: this.reportTopics() !== undefined,
         reports: this.reports.list(),
       },
     }

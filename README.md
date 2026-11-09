@@ -274,7 +274,7 @@ Content-Type: application/json
 - 回传记录保存在 `$DSH_HOME/logalyze/reports/`，DSH 重启后继续上传没有完成的报告，并核对仍在等待首轮的报告：首轮在观象未运行时结束的，「分析结论」注明没有记录到回复。
 - 回传记录最多保留 200 份，最近活动（接受请求或记录一轮）超过 30 天的记录被清理；启动时和每接受一份新报告时清理，正在上传的记录这次跳过。清理删除记录文件和 `$DSH_HOME/logalyze/reports/<报告 id>/`，话题工作目录里的 `report/` 归话题所有，不删除。
 
-**前提**：飞书渠道插件的 `feishuTopics` 服务版本 2，它提供话题状态查询（`state`、`launchKeyOf` 和 `feishu-topics/status` 事件）。
+**前提**：飞书渠道插件的 `feishuTopics` 服务（版本 2）要提供话题状态查询（`state`、`launchKeyOf` 和 `feishu-topics/status` 事件）。较早的版本 2 没有这些功能时，接口照常接受请求，但报告不会回传，面板会提示升级。
 
 ## 通过飞书使用
 
