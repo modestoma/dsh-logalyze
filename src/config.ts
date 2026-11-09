@@ -9,7 +9,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import { z } from 'zod'
 import { TOKEN_ENV_PATTERN, UPLOAD_PLACEHOLDERS } from './settings/contract.ts'
-import type { EditableSettings, RepoSpec } from './settings/contract.ts'
+import type { EditableSettings } from './settings/contract.ts'
 
 /** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
@@ -49,7 +49,7 @@ export function isAcceptedBranch(value: string): boolean {
     && !value.endsWith('.lock')
 }
 
-/** One application repository: git address and optional branch. */
+/** Arguments of `logalyze_add_repo`: git address and optional branch. */
 export const repoSchema = z.object({
   url: z.string().trim().min(1, 'git 地址不能为空').refine(isAcceptedGitUrl, '不支持的 git 地址（支持 https URL、file URL 或本机绝对路径，不支持 ssh 和 user@host:path）'),
   branch: z.string().trim().optional().transform(value => value === '' ? undefined : value)
@@ -107,15 +107,15 @@ const analyzeSchema = z.object({
   upload: uploadSchema.prefault({}),
 }).strict()
 
+/**
+ * The former `repos` key: application repositories are now the dsh-repo
+ * catalog repositories with the log analysis feature turned on, so any value
+ * fails with that instruction.
+ */
+const retiredRepos = z.never({ error: '应用仓库已改在 dsh-repo 中配置：删除 repos，在「代码仓库 → 仓库」中添加这些仓库并打开「日志分析」功能' }).optional()
+
 /** Field validators shared by the cordis config and the panel overlay. */
 export const editableFields = {
-  repos: z.array(repoSchema).superRefine((repos, issues) => {
-    const seen = new Set<string>()
-    for (const [index, repo] of repos.entries()) {
-      if (seen.has(repo.url)) issues.addIssue({ code: 'custom', path: [index, 'url'], message: `重复的 git 地址：${repo.url}` })
-      seen.add(repo.url)
-    }
-  }),
   fetchIntervalMs: durationMs(0),
   maxAppsPerRequest: z.number().int().min(1).max(32),
   dispatchTimeoutMs: durationMs(1000),
@@ -125,7 +125,7 @@ export const editableFields = {
 }
 
 const configSchema = z.object({
-  repos: editableFields.repos.default([]),
+  repos: retiredRepos,
   fetchIntervalMs: editableFields.fetchIntervalMs.default(0),
   maxAppsPerRequest: editableFields.maxAppsPerRequest.default(4),
   dispatchTimeoutMs: editableFields.dispatchTimeoutMs.default(30 * 60 * 1000),
@@ -160,7 +160,7 @@ export const pluginConfigSchema = configSchema.prefault({})
 
 /** Panel overlay: any subset of the editable settings. */
 export const overlaySchema = z.object({
-  repos: editableFields.repos.optional(),
+  repos: retiredRepos,
   fetchIntervalMs: editableFields.fetchIntervalMs.optional(),
   maxAppsPerRequest: editableFields.maxAppsPerRequest.optional(),
   dispatchTimeoutMs: editableFields.dispatchTimeoutMs.optional(),
@@ -221,10 +221,6 @@ export function expandHome(path: string): string {
   return resolve(path)
 }
 
-function copyRepos(repos: readonly RepoSpec[]): RepoSpec[] {
-  return repos.map(repo => repo.branch === undefined ? { url: repo.url } : { url: repo.url, branch: repo.branch })
-}
-
 /**
  * The editable settings a configuration implies.
  * @param config - validated plugin configuration.
@@ -232,7 +228,6 @@ function copyRepos(repos: readonly RepoSpec[]): RepoSpec[] {
  */
 export function defaultsOf(config: LogalyzeConfig): EditableSettings {
   return {
-    repos: copyRepos(config.repos),
     fetchIntervalMs: config.fetchIntervalMs,
     maxAppsPerRequest: config.maxAppsPerRequest,
     dispatchTimeoutMs: config.dispatchTimeoutMs,
@@ -251,7 +246,6 @@ export function defaultsOf(config: LogalyzeConfig): EditableSettings {
  */
 export function applyOverlay(defaults: EditableSettings, overlay: SettingsOverlay): EditableSettings {
   return {
-    repos: overlay.repos === undefined ? defaults.repos : copyRepos(overlay.repos),
     fetchIntervalMs: overlay.fetchIntervalMs ?? defaults.fetchIntervalMs,
     maxAppsPerRequest: overlay.maxAppsPerRequest ?? defaults.maxAppsPerRequest,
     dispatchTimeoutMs: overlay.dispatchTimeoutMs ?? defaults.dispatchTimeoutMs,

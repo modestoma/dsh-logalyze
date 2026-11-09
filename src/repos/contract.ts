@@ -1,7 +1,11 @@
 /**
- * 观象对 `dshRepos` 服务（version 4）的需求：只声明观象调用的方法和读取的
+ * 观象对 `dshRepos` 服务（version 5）的需求：只声明观象调用的方法和读取的
  * 字段。服务在运行时经 `ctx.get('dshRepos')` 取得，由任何按这一约定提供该服务
  * 的插件实现；观象不依赖提供方的包。
+ *
+ * 服务方维护仓库清单：只有清单里的仓库可以访问，每个仓库有权限（读、改代码、
+ * 合并）和其他插件注册的功能开关。观象注册「日志分析」功能，只使用打开了这个
+ * 功能的仓库。
  *
  * 镜像和工作区只接受 HTTPS 地址、`file:` URL 和本机绝对路径。每个方法在预期内
  * 的失败时以 `name` 为 `RepoError`、带字符串 `code` 的错误拒绝（例如
@@ -11,7 +15,7 @@
  */
 
 /** The `dshRepos` service version this plugin calls. */
-export type DshReposVersion = 4
+export type DshReposVersion = 5
 
 /** Options every call accepts. */
 export interface CallOptions {
@@ -136,9 +140,75 @@ export interface WorkspacePushResult {
   readonly commit: string
 }
 
+/** Access a catalog entry grants, from the least. */
+export type RepoAccess = 'read' | 'write' | 'merge'
+
+/** A feature other plugins can turn on per catalog repository. */
+export interface RepoFeature {
+  /** Lowercase letters, digits, and `-`, starting with a letter; at most 40 characters. */
+  readonly id: string
+  /** Switch label on the provider's settings page; at most 20 characters. */
+  readonly title: string
+  /** At most 200 characters. */
+  readonly description?: string
+}
+
+/** One catalog repository, as {@link DshRepos.listRepos} returns it. */
+export interface CatalogRepo {
+  readonly id: string
+  /** Address as the catalog stores it. */
+  readonly url: string
+  /** Branch to follow; absent follows the remote's default branch. */
+  readonly branch?: string
+  readonly access: RepoAccess
+  /** Feature ids turned on for the repository. */
+  readonly features: readonly string[]
+}
+
+/** Options of {@link DshRepos.addRepo}. */
+export interface RepoAddOptions extends CallOptions {
+  readonly branch?: string
+  /** Access of a new entry; an existing entry keeps its access. Default `read`. */
+  readonly access?: RepoAccess
+  /** Feature ids to turn on. */
+  readonly features?: readonly string[]
+  /** Session the change is made for: the provider asks `access/authorize` (level `admin`) before changing the catalog and fails with `forbidden` when refused. */
+  readonly session?: string
+}
+
+/** Outcome of {@link DshRepos.addRepo}. */
+export interface RepoAddResult {
+  readonly status: 'added' | 'updated' | 'unchanged'
+  readonly repo: CatalogRepo
+}
+
 /** The `dshRepos` methods this plugin calls. */
 export interface DshRepos {
   readonly version: DshReposVersion
+  /**
+   * The catalog repositories.
+   * @param options - `feature` lists only the repositories with that feature turned on.
+   * @returns the repositories in catalog order.
+   */
+  listRepos(options?: { readonly feature?: string }): readonly CatalogRepo[]
+  /**
+   * Register a feature; the provider's settings page shows a switch for it on every repository.
+   * @returns disposer that withdraws the registration.
+   */
+  registerFeature(feature: RepoFeature): () => void
+  /**
+   * Observe catalog changes and feature registrations.
+   * @param listener - runs after each change.
+   * @returns disposer that stops the observation.
+   */
+  onReposChange(listener: () => void): () => void
+  /**
+   * Add a repository to the catalog, or turn features on for the entry holding it; nothing is asked or written when nothing changes.
+   * @param url - HTTPS address on a configured host, `file:` URL, or absolute local path.
+   * @returns the outcome and the entry.
+   * @throws `conflict` when the entry follows another branch; `forbidden` when `access/authorize` refused; `not-allowed` for an address on an unconfigured host.
+   */
+  addRepo(url: string, options?: RepoAddOptions): Promise<RepoAddResult>
   /** @returns where mirrors and snapshots live. */
   mirrorSettings(): MirrorSettings
   /**

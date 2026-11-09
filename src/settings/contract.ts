@@ -7,7 +7,7 @@
 
 /** GET：面板所需的全部状态（生效设置、默认值、仓库与应用）。 */
 export const STATE_ROUTE = '/logalyze/state'
-/** PUT：保存可编辑设置；DELETE：清除面板覆盖、恢复 cordis.yml 默认值。 */
+/** PUT：保存可编辑设置；DELETE：清除面板覆盖、恢复 cordis.yml 默认值。应用仓库不在这里编辑，来自 dsh-repo 的仓库清单。 */
 export const SETTINGS_ROUTE = '/logalyze/settings'
 /** POST：立即重新拉取全部仓库，或 body `{ url }` 指定的一个仓库。 */
 export const SYNC_ROUTE = '/logalyze/sync'
@@ -22,9 +22,9 @@ export const TOKEN_ROUTE = '/logalyze/token'
  */
 export const ANALYZE_ROUTE = '/open-api/logalyze'
 
-/** One configured application repository. */
+/** One application repository: a dsh-repo catalog repository with the log analysis feature turned on. */
 export interface RepoSpec {
-  /** Git remote address, mirrored by dsh-repo with the token of its host or the machine's existing git credentials. */
+  /** Git remote address as the catalog stores it, mirrored by dsh-repo. */
   url: string
   /** Remote branch to follow; omitted follows the remote's default branch. */
   branch?: string
@@ -92,8 +92,6 @@ export interface AnalyzeSettings {
 
 /** The settings the Web panel can override; every field is required on the wire. */
 export interface EditableSettings {
-  /** Application repositories to mirror and keep updated. */
-  repos: RepoSpec[]
   /** Minimum age of a repository's last sync before loading `/logalyze` syncs it again, in milliseconds; 0 syncs on every load. */
   fetchIntervalMs: number
   /** Maximum number of child analyses one dispatch may start. */
@@ -109,7 +107,7 @@ export interface EditableSettings {
 }
 
 /** Keys of {@link EditableSettings}, in panel order. */
-export const EDITABLE_KEYS = ['repos', 'fetchIntervalMs', 'maxAppsPerRequest', 'dispatchTimeoutMs', 'download', 'skillUpdates', 'analyze'] as const satisfies readonly (keyof EditableSettings)[]
+export const EDITABLE_KEYS = ['fetchIntervalMs', 'maxAppsPerRequest', 'dispatchTimeoutMs', 'download', 'skillUpdates', 'analyze'] as const satisfies readonly (keyof EditableSettings)[]
 
 /** One editable key. */
 export type EditableKey = (typeof EDITABLE_KEYS)[number]

@@ -60,11 +60,10 @@ async function setup(overrides: Partial<EditableSettings> = {}, gaps = false) {
   const registry = new RepoRegistry({ repos: () => repos, onChange: () => {} })
   const settings: EditableSettings = {
     ...defaultsOf(resolveConfig({})),
-    repos: [{ url: origin }],
     download: { allowedHosts: ['127.0.0.1'], maxBytes: 1024, timeoutMs: 5000 },
     ...overrides,
   }
-  registry.configure(settings.repos)
+  registry.configure([{ url: origin }])
   await registry.syncAll()
   const { service, started } = fakeSubagents()
   const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: () => repos })

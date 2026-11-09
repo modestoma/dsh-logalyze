@@ -116,7 +116,7 @@ describe('repository registry', () => {
     await registry.resyncAll()
     expect(registry.status()[0]).toMatchObject({ phase: 'ready', available: true })
     expect(registry.branchOf(origin)).toBe('main')
-    expect(() => registry.branchOf('/elsewhere')).toThrow('已不在配置中')
+    expect(() => registry.branchOf('/elsewhere')).toThrow('已不是观象的应用仓库')
   })
 
   it('makes every repository declaring the same application id unavailable', async () => {
