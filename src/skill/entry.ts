@@ -9,9 +9,7 @@
 import type { SkillDefinition, SkillProvider, SkillProviderControl } from '../host.ts'
 import type { AppManifest } from '../settings/contract.ts'
 import type { BundledSkill } from './bundled.ts'
-import { DISPATCH_TOOL_NAME } from '../dispatch/tool.ts'
-import { ADD_REPO_TOOL_NAME } from '../onboard/names.ts'
-import { IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from '../skill-update/names.ts'
+import { ADD_REPO_TOOL_NAME, DISPATCH_TOOL_NAME, IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from '../tool-names.ts'
 
 /** Entry skill name, addressed as `/logalyze`. */
 export const ENTRY_SKILL_NAME = 'logalyze'

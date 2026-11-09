@@ -1,8 +1,11 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { disablesUserInvocation, parseManifest, readAppManifest } from '../src/repos/manifest.ts'
+import { checkAppManifest, disablesUserInvocation, parseManifest } from '../src/apps/manifest.ts'
+import { treeReader } from '../src/apps/tree.ts'
 import { EXAMPLE_APP, tempDir } from './helpers.ts'
+
+const readAppManifest = (dir: string) => checkAppManifest(treeReader(dir, 1024 * 1024))
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { await Promise.all(cleanups.splice(0).map(cleanup => cleanup())) })

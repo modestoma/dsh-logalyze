@@ -6,14 +6,14 @@
  * 同一应用的所有改进点在这一个子 Agent 中一次完成。子 Agent 的工作目录是可写
  * 工作区，它直接修改其中的 SKILL 目录。
  *
- * @module dsh-logalyze/skill-update/prompt
+ * @module dsh-logalyze/improve/prompt
  */
 
-import type { ChildLog } from '../dispatch/prompt.ts'
-import { skillDir } from '../repos/manifest.ts'
+import { skillDir } from '../apps/manifest.ts'
+import { REASON_FILE } from '../runs/changes.ts'
+import type { ChildLog } from '../runs/logs.ts'
 import type { AppManifest } from '../settings/contract.ts'
 import { IMPROVE_SKILL_NAME } from '../skill/bundled.ts'
-import { REASON_FILE } from './workspace.ts'
 
 /** Directory inside a SKILL that holds case files. */
 export const CASES_DIR = 'cases'

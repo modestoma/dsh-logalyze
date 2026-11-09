@@ -4,16 +4,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Mock } from 'vitest'
 import { defaultsOf, resolveConfig } from '../src/config.ts'
 import type { Agent, SubagentActivation, SubagentResult, SubagentService } from '../src/host.ts'
-import { RepoRegistry } from '../src/repos/registry.ts'
+import { RepoRegistry } from '../src/apps/registry.ts'
 import type { EditableSettings } from '../src/settings/contract.ts'
-import type { WorkspaceFileChange, WorkspaceStatus } from '../src/repos/contract.ts'
-import { replaceFile } from '../src/skill-update/files.ts'
-import { checkChanges, DIFF_FILE } from '../src/skill-update/workspace.ts'
-import { renderShowSkillValue, SkillViewer } from '../src/skill-update/show.ts'
-import { renderImproveValue, SkillImprover } from '../src/skill-update/tool.ts'
-import type { AnalyzedTask } from '../src/skill-update/tool.ts'
+import type { WorkspaceFileChange, WorkspaceStatus } from '../src/deps/repos-contract.ts'
+import { replaceFile } from '../src/util/files.ts'
+import { checkChanges, DIFF_FILE } from '../src/runs/changes.ts'
+import { renderShowSkillValue, SkillViewer } from '../src/improve/show.ts'
+import { renderImproveValue, SkillImprover } from '../src/improve/tool.ts'
+import type { AnalyzedTask } from '../src/improve/tool.ts'
 import { declinedError, FakeRepos, repoError } from './fake-repos.ts'
 import { createAppRepo, git, tempDir } from './helpers.ts'
+import { ReposClient } from '../src/deps/repos.ts'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { await Promise.all(cleanups.splice(0).map(cleanup => cleanup())) })
@@ -49,7 +50,7 @@ async function workspace(files: Record<string, string>, changes: Partial<Workspa
 const SCOPE = { root: '.agents/skills/log-analysis', allows: () => true, description: '.agents/skills/log-analysis/' }
 
 describe('checkChanges', () => {
-  it('reads the added and modified files of the scope in path order and digests them', async () => {
+  it('reads the added and modified files of the scope in path order', async () => {
     const { changes } = await workspace({ [SKILL]: '# new\n', '.agents/skills/log-analysis/cases/a.md': 'a' }, [
       { path: SKILL, status: 'modified', additions: 2, deletions: 1 },
       { path: '.agents/skills/log-analysis/cases/a.md' },
@@ -61,9 +62,6 @@ describe('checkChanges', () => {
       contents: expect.arrayContaining([{ path: SKILL, relative: 'SKILL.md', content: '# new\n' }]),
       diff: 'diff --git a/x b/x\n',
     })
-    expect(checked.digest).toMatch(/^[0-9a-f]{64}$/)
-    const same = await workspace({ [SKILL]: '# new\n', '.agents/skills/log-analysis/cases/a.md': 'a' }, [{ path: '.agents/skills/log-analysis/cases/a.md' }, { path: SKILL, status: 'modified' }])
-    expect((await checkChanges(same.changes, SCOPE, LIMITS)).digest).toBe(checked.digest)
   })
 
   it('rejects the whole change when anything is out of scope or not an added or modified text file', async () => {
@@ -177,7 +175,7 @@ async function setup(endTurn = true): Promise<Setup> {
     skillUpdates: { enabled: true, maxFiles: 4, maxFileBytes: 65536 },
   }
   const repos = fakeRepos(join(root, 'mirrors'))
-  const registry = new RepoRegistry({ repos: () => repos.service, onChange: () => {} })
+  const registry = new RepoRegistry({ repos: new ReposClient(() => repos.service), onChange: () => {} })
   registry.configure([{ url: origin }])
   await registry.syncAll()
   const [ready] = registry.readyApps()
@@ -188,7 +186,7 @@ async function setup(endTurn = true): Promise<Setup> {
     provider: 'spawn',
     settings: () => settings,
     workingDirectory: () => undefined,
-    repos: () => repos.service,
+    repos: new ReposClient(() => repos.service),
     now: () => new Date(2026, 9, 31, 22, 0, 0),
   })
   const workDir = join(root, 'project', '.logalyze', 'runs', 'r1', '1-order-service')
@@ -463,7 +461,7 @@ describe('logalyze_improve_skill', () => {
     improver.turnEnded('parent')
     await expect(improver.execute({ ...args, workDirs: [broken], feedback: 'x' }, exec)).rejects.toThrow('skill-gap.md 是空的')
 
-    const withoutRepos = new SkillImprover({ registry, subagents: fakeSubagents().service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: () => undefined })
+    const withoutRepos = new SkillImprover({ registry, subagents: fakeSubagents().service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: new ReposClient(() => undefined) })
     await withoutRepos.inspect(task)
     withoutRepos.turnEnded('parent')
     await expect(withoutRepos.execute(args, exec)).rejects.toThrow('需要 dsh-repo 插件提供的 dshRepos 服务')
@@ -533,7 +531,7 @@ describe('logalyze_improve_skill', () => {
 describe('logalyze_show_skill', () => {
   it('shows the SKILL file list and a file from the latest synced commit', async () => {
     const { origin, registry, repos } = await setup()
-    const viewer = new SkillViewer({ registry, repos: () => repos.service })
+    const viewer = new SkillViewer({ registry, repos: new ReposClient(() => repos.service) })
     const exec = { signal: new AbortController().signal, agent: { id: 'parent', session: { header: { id: 'parent' } } } }
     const value = await viewer.execute({ app: 'order-service' }, exec)
     const commit = registry.status()[0]!.commit!

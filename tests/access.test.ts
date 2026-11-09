@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { ACCESS_AUTHORIZE_EVENT, authorize } from '../src/access.ts'
-import type { AuthorizeEvent } from '../src/access.ts'
+import { ACCESS_AUTHORIZE_EVENT, authorize } from '../src/deps/access.ts'
+import type { AuthorizeEvent } from '../src/deps/access.ts'
 
 const event: AuthorizeEvent = { session: 's1', level: 'admin', action: 'logalyze_add_repo', summary: '加入仓库' }
 

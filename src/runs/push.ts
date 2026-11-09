@@ -8,12 +8,12 @@
  * - 推送提交工作区里未提交的改动，从不强推；远端分支已经变化时报告 `exists`。
  * - 分支推送后合并请求没有创建时报告 `pushed`，由用户手动创建。
  *
- * @module dsh-logalyze/skill-update/commit
+ * @module dsh-logalyze/runs/push
  */
 
 import type { Agent, ToolRunContext } from '../host.ts'
-import type { DshRepos } from '../repos/contract.ts'
-import { declinedOutcome, repoErrorCode } from '../repos/lookup.ts'
+import { declinedOutcome, repoErrorCode } from '../deps/repos.ts'
+import type { DshRepos } from '../deps/repos-contract.ts'
 
 /** Conventional Commits prefix of every SKILL improvement and onboarding commit subject and merge request title; no other type is allowed. */
 export const SKILL_COMMIT_PREFIX = 'chore: '

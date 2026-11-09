@@ -6,11 +6,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import { resolveConfig, defaultsOf } from '../src/config.ts'
 import { Dispatcher, renderDispatchValue } from '../src/dispatch/tool.ts'
 import type { Agent, SubagentActivation, SubagentResult, SubagentService } from '../src/host.ts'
-import { RepoRegistry } from '../src/repos/registry.ts'
+import { RepoRegistry } from '../src/apps/registry.ts'
 import type { EditableSettings } from '../src/settings/contract.ts'
-import { SkillImprover } from '../src/skill-update/tool.ts'
+import { SkillImprover } from '../src/improve/tool.ts'
 import { FakeRepos } from './fake-repos.ts'
 import { createAppRepo, tempDir } from './helpers.ts'
+import { ReposClient } from '../src/deps/repos.ts'
 
 let server: Server
 let port = 0
@@ -57,7 +58,7 @@ async function setup(overrides: Partial<EditableSettings> = {}, gaps = false) {
   const project = join(dir, 'project')
   await createAppRepo(project)
   const repos = new FakeRepos(join(dir, 'mirrors'))
-  const registry = new RepoRegistry({ repos: () => repos, onChange: () => {} })
+  const registry = new RepoRegistry({ repos: new ReposClient(() => repos), onChange: () => {} })
   const settings: EditableSettings = {
     ...defaultsOf(resolveConfig({})),
     download: { allowedHosts: ['127.0.0.1'], maxBytes: 1024, timeoutMs: 5000 },
@@ -66,7 +67,7 @@ async function setup(overrides: Partial<EditableSettings> = {}, gaps = false) {
   registry.configure([{ url: origin }])
   await registry.syncAll()
   const { service, started } = fakeSubagents()
-  const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: () => repos })
+  const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: new ReposClient(() => repos) })
   const dispatcher = new Dispatcher({
     registry,
     ...gaps ? { gaps: improver } : {},

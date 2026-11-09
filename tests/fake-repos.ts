@@ -18,7 +18,7 @@ import type {
   WorkspacePushParams,
   WorkspacePushResult,
   WorkspaceStatus,
-} from '../src/repos/contract.ts'
+} from '../src/deps/repos-contract.ts'
 
 const run = promisify(execFile)
 
@@ -110,6 +110,8 @@ export class FakeRepos implements DshRepos {
   openMr: ((input: { readonly repo: string; readonly branch: string; readonly base: string; readonly title: string; readonly body?: string }) => Promise<MrSummary>) | undefined
   /** Reported when a push asks for a merge request while {@link openMr} is unset. */
   mrError = 'merge requests are not set up in this test'
+  /** Every {@link snapshotAcquire} call, oldest first. */
+  readonly acquires: SnapshotAcquireParams[] = []
   /** Every {@link workspaceCreate} call, oldest first. */
   readonly creates: WorkspaceCreateParams[] = []
   /** Every {@link workspacePush} call, oldest first, including rejected ones. */
@@ -206,6 +208,7 @@ export class FakeRepos implements DshRepos {
   }
 
   async snapshotAcquire(params: SnapshotAcquireParams): Promise<SnapshotLease> {
+    this.acquires.push(params)
     if (this.snapshotError !== undefined) throw this.snapshotError
     const { repo } = params
     const mirror = await this.sync(repo)

@@ -10,20 +10,21 @@
  *   或 SKILL 不合法时该应用不可用。
  * - 多个仓库声明同一个应用 id 时，这些仓库全部不可用。
  *
- * @module dsh-logalyze/repos/registry
+ * @module dsh-logalyze/apps/registry
  */
 
-import type { DshRepos, SnapshotLease } from './contract.ts'
+import type { ReposClient } from '../deps/repos.ts'
+import type { SnapshotLease } from '../deps/repos-contract.ts'
 import type { AppManifest, RepoSpec, RepoStatusWire } from '../settings/contract.ts'
-import { messageOf, requireRepos } from './lookup.ts'
+import { messageOf } from '../util/errors.ts'
 import { checkAppManifest } from './manifest.ts'
 import type { ManifestRead } from './manifest.ts'
-import { MAX_REPO_FILE_BYTES, treeReader, withSnapshot } from './snapshot.ts'
+import { MAX_REPO_FILE_BYTES, treeReader } from './tree.ts'
 
 /** Collaborators of the registry. */
 export interface RepoRegistryDeps {
-  /** The current `ctx.get('dshRepos')` value, looked up on every use. */
-  readonly repos: () => unknown
+  /** The `dshRepos` service, looked up on every use. */
+  readonly repos: ReposClient
   /** Called after any status change (sync start/end, configuration, leases). */
   readonly onChange: () => void
   readonly now?: () => number
@@ -213,7 +214,7 @@ export class RepoRegistry {
     const ready = new Map(this.readyEntries().map(item => [item.ready.app.id, item]))
     const missing = unique.filter(id => !ready.has(id))
     if (missing.length > 0) throw new Error(this.unknownMessage(missing))
-    const service = requireRepos(this.deps.repos())
+    const service = this.deps.repos.require()
     const held = unique.map((id) => {
       const { entry, ready: app } = ready.get(id) as { entry: RepoEntry; ready: ReadyApp }
       entry.activeRuns += 1
@@ -305,8 +306,7 @@ export class RepoRegistry {
     if (entry.retired) return
     let head: { commit: string; manifest: ManifestRead }
     try {
-      const service: DshRepos = requireRepos(this.deps.repos())
-      head = await withSnapshot(service, entry.spec.url, entry.spec.branch, undefined, async lease => ({
+      head = await this.deps.repos.withSnapshot(entry.spec.url, entry.spec.branch, undefined, async lease => ({
         commit: lease.commit,
         manifest: await checkAppManifest(treeReader(lease.path, MAX_REPO_FILE_BYTES)),
       }))

@@ -7,9 +7,9 @@
  * @module dsh-logalyze/onboard/prompt
  */
 
-import type { ChildLog } from '../dispatch/prompt.ts'
+import { REASON_FILE } from '../runs/changes.ts'
+import type { ChildLog } from '../runs/logs.ts'
 import { KIT_SKILL_NAME } from '../skill/bundled.ts'
-import { REASON_FILE } from '../skill-update/workspace.ts'
 import { AGENTS_DIR } from './draft.ts'
 
 /** Inputs of one drafting prompt. */

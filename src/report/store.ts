@@ -7,10 +7,11 @@
  */
 
 import { createHash } from 'node:crypto'
-import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { z } from 'zod'
 import { resolveDshHome } from '../config.ts'
+import { replaceFile } from '../util/files.ts'
 
 const STATUS = z.enum(['done', 'stopped', 'error', 'failed', 'interrupted'])
 
@@ -81,8 +82,6 @@ export function defaultReportsDir(env: NodeJS.ProcessEnv = process.env): string 
   return join(resolveDshHome(env), 'logalyze', 'reports')
 }
 
-let writes = 0
-
 /** Reads and writes the report records of one directory. */
 export class ReportStore {
   private readonly records = new Map<string, ReportRecord>()
@@ -134,10 +133,6 @@ export class ReportStore {
   async put(record: ReportRecord): Promise<void> {
     this.records.set(record.id, record)
     await mkdir(this.dir, { recursive: true })
-    const path = join(this.dir, `${record.id}.json`)
-    writes += 1
-    const temporary = `${path}.${process.pid}.${writes}.tmp`
-    await writeFile(temporary, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 })
-    await rename(temporary, path)
+    await replaceFile(join(this.dir, `${record.id}.json`), `${JSON.stringify(record)}\n`, 0o600)
   }
 }

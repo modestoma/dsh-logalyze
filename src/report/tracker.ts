@@ -18,12 +18,12 @@
  * @module dsh-logalyze/report/tracker
  */
 
-import { randomUUID } from 'node:crypto'
-import { lstat, mkdir, rename, writeFile } from 'node:fs/promises'
+import { lstat, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { AnalyzeRequest } from '../analyze/contract.ts'
-import type { TopicLaunchState } from '../analyze/feishu-topics.ts'
+import type { TopicLaunchState } from '../deps/topics-contract.ts'
 import type { SessionEventEnvelope, SessionHeader } from '../host.ts'
+import { replaceFile } from '../util/files.ts'
 import { REPORT_DIR, REPORT_ENTRY } from '../settings/contract.ts'
 import type { ReportStatus, ReportWire, UploadPhase, UploadSettings } from '../settings/contract.ts'
 import { runCommand, uploadArgv } from './command.ts'
@@ -454,13 +454,8 @@ export class ReportTracker {
     try {
       await mkdir(dir, { recursive: true })
       if (!(await lstat(dir)).isDirectory()) return { ok: false, retryable: false, error: `报告目录 ${dir} 不是普通目录（可能是符号链接），没有上传` }
-      const entry = join(dir, REPORT_ENTRY)
-      // The directory is agent-writable: create the temporary file exclusively
-      // under a fresh name, so an existing entry (a symbolic link included) is never followed.
-      const temporary = join(dir, `.${REPORT_ENTRY}.${randomUUID()}.tmp`)
-      await writeFile(temporary, renderReport(record, record.sections), { encoding: 'utf8', flag: 'wx' })
-      // Renaming replaces whatever the agent left under the entry name, a symbolic link included.
-      await rename(temporary, entry)
+      // The directory is agent-writable; replacing never follows what the agent left under the entry name.
+      await replaceFile(join(dir, REPORT_ENTRY), renderReport(record, record.sections))
       const listing = await listReport(dir)
       if (listing.refused.length > 0) return { ok: false, retryable: false, error: `报告目录里有符号链接或特殊文件，没有上传：${listing.refused.slice(0, 5).join('、')}` }
       if (listing.count > settings.maxFiles) return { ok: false, retryable: false, error: `报告目录有 ${listing.count} 个文件，超过上限 ${settings.maxFiles}，没有上传` }

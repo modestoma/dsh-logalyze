@@ -4,7 +4,7 @@
  * package. The plugin provides the service under `feishuTopics` and emits
  * {@link FEISHU_TOPICS_STATUS_EVENT}; both are looked up at run time.
  *
- * @module dsh-logalyze/analyze/feishu-topics
+ * @module dsh-logalyze/deps/topics-contract
  */
 
 /** The contract version this plugin speaks. Version 2 dropped the `workspace` parameter: the channel derives the topic directory from the group and the topic. */
@@ -95,10 +95,7 @@ export interface TopicLaunchState {
 /** Name of the event the Feishu channel plugin emits after a launch status is recorded; listeners receive the {@link TopicLaunchState}. */
 export const FEISHU_TOPICS_STATUS_EVENT = 'feishu-topics/status'
 
-/**
- * The `feishuTopics` service. `state` and `launchKeyOf` exist on providers
- * released with them; this plugin checks for them before calling.
- */
+/** The `feishuTopics` service. */
 export interface FeishuTopicService {
   readonly version: FeishuTopicsVersion
   /**
@@ -112,11 +109,11 @@ export interface FeishuTopicService {
    * @param key - the launch's idempotency key.
    * @returns the state, or undefined for an unknown key or while disconnected.
    */
-  state?(key: string): TopicLaunchState | undefined
+  state(key: string): TopicLaunchState | undefined
   /**
    * Find the launch whose topic route currently names a Session.
    * @param sessionId - DSH session id.
    * @returns the launch's idempotency key, or undefined.
    */
-  launchKeyOf?(sessionId: string): string | undefined
+  launchKeyOf(sessionId: string): string | undefined
 }

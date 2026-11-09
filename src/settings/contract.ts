@@ -230,8 +230,6 @@ export interface AnalyzeWire {
   /** Token status; absent while the DSH composition has no credential store. */
   token?: TokenStatusWire
   topics: TopicsAvailability
-  /** Whether the loaded Feishu channel plugin reports launch states, which report upload needs. */
-  reportsSupported: boolean
   /** Most recently accepted reports, newest first. */
   reports: ReportWire[]
 }

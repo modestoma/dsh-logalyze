@@ -122,7 +122,7 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
 
 ### 应用仓库与拉取
 
-观象自己不运行 git，也不依赖其他插件的包。仓库清单、只读快照、工作区和推送 SKILL 修改都调用运行时的 `dshRepos` 服务（服务版本 6，例如由 [dsh-repo](https://github.com/modestoma/dsh-repo) 提供），它用到的方法见 `src/repos/contract.ts`。没有该服务或服务版本不符时观象没有应用仓库，原因显示在设置面板。
+观象自己不运行 git，也不依赖其他插件的包。仓库清单、只读快照、工作区和推送 SKILL 修改都调用运行时的 `dshRepos` 服务（服务版本 6，例如由 [dsh-repo](https://github.com/modestoma/dsh-repo) 提供），它用到的方法见 `src/deps/repos-contract.ts`。没有该服务或服务版本不符时观象没有应用仓库，原因显示在设置面板。
 
 - 观象在服务出现时注册功能 `log-analysis`（标题「日志分析」），dsh-repo 设置页的每个仓库多一个「日志分析」开关；插件卸载时撤销注册。
 - 应用仓库是 `repoList({ feature: 'log-analysis' })` 返回的仓库，按清单里的分支拉取：每次拉取取该分支最新提交的只读快照（`snapshotAcquire`，dsh-repo 先从远端 fetch），从快照读出应用描述和 SKILL 后立即释放。清单变化后观象重新配置注册表，新出现或分支变了的仓库立即拉取，被删除或关掉功能的仓库在进行中的分析结束后移除。
@@ -273,11 +273,11 @@ Content-Type: application/json
 - 报告目录里有符号链接或其他非普通文件，或者文件数、总大小超过 `maxFiles` / `maxBytes` 时不上传，回传记录写明原因，等内容变化或手动重新上传。
 - 回传记录保存在 `$DSH_HOME/logalyze/reports/`，DSH 重启后继续上传没有完成的报告，并核对仍在等待首轮的报告：首轮在观象未运行时结束的，「分析结论」注明没有记录到回复。
 
-**前提**：飞书渠道插件的 `feishuTopics` 服务要提供话题状态查询（`state`、`launchKeyOf` 和 `feishu-topics/status` 事件）。旧版本没有这些功能时，接口照常接受请求，但报告不会回传，面板会提示升级。
+**前提**：飞书渠道插件的 `feishuTopics` 服务版本 2，它提供话题状态查询（`state`、`launchKeyOf` 和 `feishu-topics/status` 事件）。
 
 ## 通过飞书使用
 
-在飞书里使用 `/logalyze` 不需要观象与飞书渠道插件之间的任何接口：渠道插件把不在自己命令表中的 `/` 开头消息作为普通 prompt 交给 dsh，dsh 识别 `/logalyze` 后展开入口 SKILL。飞书附件的宿主路径会出现在消息里，入口 SKILL 会把它作为日志路径派发。只有[日志平台分析接口](#日志平台分析接口)经渠道插件的 `feishuTopics` 服务发卡开话题；观象在 `src/analyze/feishu-topics.ts` 本地声明它用到的服务接口，不依赖渠道插件的包，运行时按服务名查找，没有加载时其余功能不受影响。写操作的授权和提交身份同样只经 `access/authorize`、`repo/commit-trailers` 两个中立事件由渠道插件回答（见[SKILL 改进](#skill-改进)）。
+在飞书里使用 `/logalyze` 不需要观象与飞书渠道插件之间的任何接口：渠道插件把不在自己命令表中的 `/` 开头消息作为普通 prompt 交给 dsh，dsh 识别 `/logalyze` 后展开入口 SKILL。飞书附件的宿主路径会出现在消息里，入口 SKILL 会把它作为日志路径派发。只有[日志平台分析接口](#日志平台分析接口)经渠道插件的 `feishuTopics` 服务发卡开话题；观象在 `src/deps/topics-contract.ts` 本地声明它用到的服务接口，不依赖渠道插件的包，运行时按服务名查找，没有加载时其余功能不受影响。写操作的授权和提交身份同样只经 `access/authorize`、`repo/commit-trailers` 两个中立事件由渠道插件回答（见[SKILL 改进](#skill-改进)）。
 
 ## 开发
 
@@ -300,17 +300,20 @@ pnpm check        # 类型检查（Host 与 Client）+ 单元测试 + 构建 + �
 | 路径 | 内容 |
 |---|---|
 | `src/index.ts` | Cordis 插件入口 |
-| `src/service.ts` | 生效设置、注册表、入口 SKILL 与各工具的注册 |
-| `src/repos/` | `dshRepos` 服务需求与查找、应用描述校验、应用注册表 |
+| `src/service.ts` | 组装各部分，注册入口 SKILL 和工具，提供面板状态 |
+| `src/deps/` | 其他插件的服务和事件：`dshRepos`、`feishuTopics` 的接口声明与查找，`access/authorize` |
+| `src/apps/` | 应用描述校验、快照文件读取、应用注册表、跟随 dsh-repo 仓库清单 |
+| `src/runs/` | 运行目录、日志准入与下载、子 Agent 运行、工作区准备、改动检查、推送与合并请求 |
+| `src/dispatch/` | 派发工具与分析子 Agent 首条消息 |
+| `src/improve/` | SKILL 查看工具、SKILL 不足记录、改进工具与改进子 Agent 首条消息 |
+| `src/onboard/` | 在对话中添加仓库、在工作区起草应用描述与 SKILL、推送接入合并请求 |
 | `src/skill/` | `/logalyze` 入口 SKILL 与随包指导 SKILL（`/logalyze-kit`、`/logalyze-improve`）的 provider |
 | `skills/logalyze-kit/` | 接入套件 SKILL 正文 |
 | `skills/logalyze-improve/` | SKILL 改进指南正文 |
-| `src/dispatch/` | 派发工具、日志下载、子 Agent 首条消息与运行 |
-| `src/skill-update/` | SKILL 查看工具、SKILL 不足记录、改进工具与改进子 Agent 首条消息、工作区改动检查、推送与合并请求 |
-| `src/onboard/` | 在对话中添加仓库、在工作区起草应用描述与 SKILL、推送接入合并请求 |
-| `src/analyze/` | 日志平台分析接口：请求校验、令牌、`feishuTopics` 接口声明与转换 |
+| `src/analyze/` | 日志平台分析接口：请求校验、令牌、到 `feishuTopics` 的转换 |
 | `src/report/` | 报告回传：轮次记录、`report.md` 生成、目录检查、回传命令、持久化 |
-| `src/settings/` | 面板契约、覆盖文件、HTTP 路由 |
+| `src/settings/` | 面板契约、生效设置与覆盖文件、HTTP 路由 |
+| `src/util/` | 取消、文件读写、HTTP 等通用小工具 |
 | `src/client/` | 左侧栏入口与设置页面 |
 | `examples/order-service/` | 示例应用仓库 |
 

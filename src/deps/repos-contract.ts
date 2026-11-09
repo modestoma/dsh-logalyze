@@ -13,7 +13,7 @@
  * `name` 为 `RepoError`、带字符串 `code` 的错误拒绝（例如 `conflict` 表示远端
  * 分支已变，`declined` 表示用户没有批准，`invalid` 表示参数违反约定）。
  *
- * @module dsh-logalyze/repos/contract
+ * @module dsh-logalyze/deps/repos-contract
  */
 
 /** The `dshRepos` service version this plugin calls. */

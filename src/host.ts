@@ -10,7 +10,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { FEISHU_TOPICS_STATUS_EVENT, TopicLaunchState } from './analyze/feishu-topics.ts'
+import type { FEISHU_TOPICS_STATUS_EVENT, TopicLaunchState } from './deps/topics-contract.ts'
 
 /** One model-facing content block (text is the only kind this plugin produces). */
 export interface ContentBlock {

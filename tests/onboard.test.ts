@@ -3,15 +3,16 @@ import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { defaultsOf, resolveConfig } from '../src/config.ts'
 import type { Agent, ApprovalOutcome, ApprovalRequest, SubagentActivation, SubagentResult, SubagentService } from '../src/host.ts'
-import type { AuthorizeEvent } from '../src/access.ts'
+import type { AuthorizeEvent } from '../src/deps/access.ts'
 import { renderAddRepoValue, RepoAdder } from '../src/onboard/add.ts'
 import { checkInitDraft } from '../src/onboard/draft.ts'
 import { renderInitRepoValue, renderSubmitInitValue, RepoInitializer } from '../src/onboard/init.ts'
 import { renderInitPrompt } from '../src/onboard/prompt.ts'
-import { RepoRegistry } from '../src/repos/registry.ts'
+import { RepoRegistry } from '../src/apps/registry.ts'
 import type { EditableSettings, RepoSpec } from '../src/settings/contract.ts'
 import { declinedError, FakeRepos } from './fake-repos.ts'
 import { createAppRepo, EXAMPLE_APP, git, tempDir } from './helpers.ts'
+import { ReposClient } from '../src/deps/repos.ts'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { await Promise.all(cleanups.splice(0).map(cleanup => cleanup())) })
@@ -64,7 +65,7 @@ describe('logalyze_add_repo', () => {
     const ready = await createAppRepo(join(root, 'order-service'))
     const bare = await bareRepo(join(root, 'billing'))
     const repos = new FakeRepos(join(root, 'mirrors'))
-    const registry = new RepoRegistry({ repos: () => repos, onChange: () => {} })
+    const registry = new RepoRegistry({ repos: new ReposClient(() => repos), onChange: () => {} })
     const configured: RepoSpec[] = []
     const addRepo = vi.fn(async (spec: RepoSpec) => {
       configured.push(spec)
@@ -132,7 +133,7 @@ describe('logalyze_add_repo', () => {
     await expect(adder.execute({ url: 'git@github.com:example/order-service.git' }, run())).rejects.toThrow('不支持 ssh')
     await expect(adder.execute({ url: '/a', extra: 1 }, run())).rejects.toThrow('参数不合法')
     await expect(adder.execute({ url: '/a' }, run(child))).rejects.toThrow('不能在子 Agent 中调用')
-    const withoutApproval = new RepoAdder({ registry: new RepoRegistry({ repos: () => undefined, onChange: () => {} }), approval: () => undefined, addRepo: vi.fn() })
+    const withoutApproval = new RepoAdder({ registry: new RepoRegistry({ repos: new ReposClient(() => undefined), onChange: () => {} }), approval: () => undefined, addRepo: vi.fn() })
     await expect(withoutApproval.execute({ url: '/a' }, run())).rejects.toThrow('没有审批服务')
     expect(approval.request).toHaveBeenCalledTimes(1)
   })
@@ -162,7 +163,7 @@ describe('init drafts', () => {
   it('accepts the manifest and the files of its SKILL directory, read from the workspace', async () => {
     const { repos, workDir } = await opened()
     await writeDraft(workDir, { '.agents/logalyze.yaml': MANIFEST, '.agents/skills/order-logs/SKILL.md': SKILL, '.agents/skills/order-logs/references/payment.md': '支付回调' })
-    const draft = await checkInitDraft(repos, workDir, LIMITS)
+    const draft = await checkInitDraft(new ReposClient(() => repos), workDir, LIMITS)
     expect(draft.app).toMatchObject({ id: 'billing-service', skill: 'order-logs' })
     expect(draft.reason).toBe('按 Controller 与 Service 划分领域；traceId 字段待确认')
     expect(draft.changes.contents.map(file => file.path)).toEqual(['.agents/logalyze.yaml', '.agents/skills/order-logs/SKILL.md', '.agents/skills/order-logs/references/payment.md'])
@@ -183,19 +184,19 @@ describe('init drafts', () => {
     for (const [files, message] of cases) {
       const { repos, workDir } = await opened()
       if (files !== undefined) await writeDraft(workDir, files)
-      await expect(checkInitDraft(repos, workDir, LIMITS)).rejects.toThrow(message)
+      await expect(checkInitDraft(new ReposClient(() => repos), workDir, LIMITS)).rejects.toThrow(message)
     }
     const noReason = await opened()
     await writeDraft(noReason.workDir, { '.agents/logalyze.yaml': MANIFEST, '.agents/skills/order-logs/SKILL.md': SKILL }, ' ')
-    await expect(checkInitDraft(noReason.repos, noReason.workDir, LIMITS)).rejects.toThrow('reason.md 不能为空')
+    await expect(checkInitDraft(new ReposClient(() => noReason.repos), noReason.workDir, LIMITS)).rejects.toThrow('reason.md 不能为空')
     const deleted = await opened()
     await writeDraft(deleted.workDir, { '.agents/logalyze.yaml': MANIFEST, '.agents/skills/order-logs/SKILL.md': SKILL })
     await rm(join(deleted.workDir, 'repo', 'README.md'))
-    await expect(checkInitDraft(deleted.repos, deleted.workDir, LIMITS)).rejects.toThrow('工作区改动了 README.md')
+    await expect(checkInitDraft(new ReposClient(() => deleted.repos), deleted.workDir, LIMITS)).rejects.toThrow('工作区改动了 README.md')
     // The repository ignores the SKILL, so a push would carry only the manifest.
     const ignored = await opened('SKILL.md\n')
     await writeDraft(ignored.workDir, { '.agents/logalyze.yaml': MANIFEST, '.agents/skills/order-logs/SKILL.md': SKILL })
-    await expect(checkInitDraft(ignored.repos, ignored.workDir, LIMITS)).rejects.toThrow('.agents/skills/order-logs/SKILL.md 被仓库的忽略规则')
+    await expect(checkInitDraft(new ReposClient(() => ignored.repos), ignored.workDir, LIMITS)).rejects.toThrow('.agents/skills/order-logs/SKILL.md 被仓库的忽略规则')
   })
 })
 
@@ -231,7 +232,7 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     repos.openMr = openMr
     const workspacePush = vi.spyOn(repos, 'workspacePush')
     const settings: EditableSettings = { ...defaultsOf(resolveConfig({})), skillUpdates: { enabled: false, maxFiles: 8, maxFileBytes: 65536 } }
-    const registry = new RepoRegistry({ repos: () => repos, onChange: () => {} })
+    const registry = new RepoRegistry({ repos: new ReposClient(() => repos), onChange: () => {} })
     registry.configure([{ url: origin }, { url: other }, ...duplicates])
     await registry.syncAll()
     const children = subagents(work, outcome)
@@ -241,7 +242,7 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
       provider: 'spawn',
       settings: () => settings,
       workingDirectory: () => undefined,
-      repos: () => repos,
+      repos: new ReposClient(() => repos),
       now: () => new Date(2026, 9, 31, 21, 0, 0),
     })
     const agent: Agent = { id: 'parent', session: { header: { id: 'parent', cwd: project } } }

@@ -6,11 +6,11 @@
  * 运行目录对 Agent 可写，记录按不可信输入读取：只接受普通文件、UTF-8 文本和
  * 大小上限。
  *
- * @module dsh-logalyze/skill-update/gap
+ * @module dsh-logalyze/improve/gap
  */
 
 import { join } from 'node:path'
-import { kindOf, ProposalError, readText } from './files.ts'
+import { kindOf, ProposalError, readText } from '../util/files.ts'
 
 /** Gap record inside a task's run directory. */
 export const GAP_FILE = 'skill-gap.md'

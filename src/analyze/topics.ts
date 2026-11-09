@@ -1,44 +1,16 @@
 /**
- * 分析请求到飞书渠道插件 `feishuTopics` 服务的转换：根卡片内容、工作区
- * `analyze/<app>/<errorCode>`、幂等键与指纹，以及服务结果到 HTTP 响应的映射。
+ * 分析请求到飞书渠道插件 `feishuTopics` 服务的转换：根卡片内容、幂等键与
+ * 指纹，以及服务结果到 HTTP 响应的映射。
  *
- * 服务接口在 `./feishu-topics.ts` 本地声明；服务在运行时经
- * `ctx.get('feishuTopics')` 取得，版本不符时不调用。带 `logId` 的请求在
- * 提示词后追加「报告文件」一节，说明报告目录的写法。
+ * 带 `logId` 的请求在提示词后追加「报告文件」一节，说明报告目录的写法。
  *
  * @module dsh-logalyze/analyze/topics
  */
 
-import type {
-  FeishuTopicService, FeishuTopicsVersion, TopicLaunchResult, TopicLaunchSpec,
-} from './feishu-topics.ts'
+import type { FeishuTopicService, TopicLaunchResult, TopicLaunchSpec } from '../deps/topics-contract.ts'
 import { REPORT_DIR, REPORT_ENTRY } from '../settings/contract.ts'
-import type { TopicsAvailability } from '../settings/contract.ts'
 import { analyzeRequestHash } from './contract.ts'
 import type { AnalyzeRequest, AnalyzeResponse } from './contract.ts'
-
-/** Name the Feishu channel plugin provides the service under. */
-export const FEISHU_TOPICS_SERVICE = 'feishuTopics'
-
-/** The `feishuTopics` contract version this plugin speaks. */
-export const FEISHU_TOPICS_VERSION: FeishuTopicsVersion = 2
-
-/** Result of looking the service up. */
-export type TopicsLookup =
-  | { readonly availability: 'ready'; readonly service: FeishuTopicService }
-  | { readonly availability: Exclude<TopicsAvailability, 'ready'> }
-
-/**
- * Classify the value `ctx.get('feishuTopics')` returned. The provider is
- * another package, so its contract version is checked at run time.
- * @param value - the looked-up service, or undefined.
- * @returns the usable service, or why there is none.
- */
-export function lookupTopics(value: unknown): TopicsLookup {
-  if (value === undefined || value === null) return { availability: 'missing' }
-  if ((value as { version?: unknown }).version !== FEISHU_TOPICS_VERSION) return { availability: 'incompatible' }
-  return { availability: 'ready', service: value as FeishuTopicService }
-}
 
 /**
  * Section appended to the prompt of a request with `logId`, telling the

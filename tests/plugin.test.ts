@@ -105,6 +105,32 @@ async function json<T>(response: Response): Promise<T> {
 }
 
 describe('plugin', () => {
+  it('syncs each repository once at startup and again when dsh-repo reloads', async () => {
+    const { dir, cleanup } = await tempDir()
+    cleanups.push(cleanup)
+    const origin = await createAppRepo(join(dir, 'order-service'))
+    const h = await harness()
+    cleanups.push(h.dispose)
+    h.repos.setCatalog([{ url: origin }])
+    const injected: ((child: HostContext) => void)[] = []
+    let current: FakeRepos = h.repos
+    const { inject, get } = h.ctx
+    h.ctx = {
+      ...h.ctx,
+      get: name => name === 'dshRepos' ? current : get?.(name),
+      inject: (deps, callback) => { if (deps.includes('dshRepos')) injected.push(callback); return inject?.(deps, callback) },
+    }
+    apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
+    const ready = async (): Promise<boolean> => (await json<StateWire>(await fetch(`${h.base}/logalyze/state`))).repos[0]?.phase === 'ready'
+    await waitFor(ready)
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(h.repos.acquires.map(call => call.repo)).toEqual([origin])
+    // A reloaded dsh-repo is a new service instance.
+    current = Object.create(h.repos) as FakeRepos
+    for (const callback of injected) callback(h.ctx)
+    await waitFor(async () => h.repos.acquires.length === 2 && await ready())
+  })
+
   it('registers the entry skill, clones repositories, and offers the dispatch tool to top-level agents only', async () => {
     const { dir, cleanup } = await tempDir()
     cleanups.push(cleanup)

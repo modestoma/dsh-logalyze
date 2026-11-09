@@ -19,7 +19,9 @@ import {
   ANALYZE_MAX_BODY_BYTES, ANALYZE_ROUTE, IDEMPOTENCY_KEY_PATTERN, parseAnalyzeRequest,
 } from './contract.ts'
 import type { AnalyzeRequest, AnalyzeResponse } from './contract.ts'
-import { FEISHU_TOPICS_SERVICE, launchAnalysis, lookupTopics } from './topics.ts'
+import { FEISHU_TOPICS_SERVICE, lookupTopics } from '../deps/topics.ts'
+import { HttpError, mediaTypeOf, readBody, sendJson } from '../util/http.ts'
+import { launchAnalysis } from './topics.ts'
 
 /** The plugin side of the route: switch and token, read per request. */
 export interface AnalyzeGate {
@@ -40,20 +42,8 @@ export type AnalyzeLaunch = (request: AnalyzeRequest, idempotencyKey: string) =>
 /** Receives every accepted (or replayed) request that carries `logId`. */
 export type AnalyzeAccepted = (request: AnalyzeRequest & { readonly logId: string }, idempotencyKey: string) => Promise<void>
 
-class HttpError extends Error {
-  constructor(readonly status: number, message: string) {
-    super(message)
-  }
-}
-
 function send(res: ServerResponse, response: AnalyzeResponse): void {
-  const body = JSON.stringify(response.body)
-  res.writeHead(response.status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-    'content-length': Buffer.byteLength(body),
-  })
-  res.end(body)
+  sendJson(res, response.status, response.body)
 }
 
 function refuse(res: ServerResponse, status: number, error: string, headers: Record<string, string> = {}): void {
@@ -74,23 +64,6 @@ function bearerOf(req: IncomingMessage): string | undefined {
   if (header === undefined) return undefined
   const match = /^Bearer[ \t]+(\S+)[ \t]*$/iu.exec(header)
   return match?.[1]
-}
-
-/** Read the body up to {@link ANALYZE_MAX_BODY_BYTES}; larger bodies fail with 413. */
-async function readBody(req: IncomingMessage): Promise<string> {
-  const declared = Number(req.headers['content-length'])
-  if (Number.isFinite(declared) && declared > ANALYZE_MAX_BODY_BYTES) {
-    throw new HttpError(413, `请求体超过 ${ANALYZE_MAX_BODY_BYTES} 字节`)
-  }
-  const chunks: Buffer[] = []
-  let size = 0
-  for await (const chunk of req) {
-    const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : chunk as Buffer
-    size += buffer.length
-    if (size > ANALYZE_MAX_BODY_BYTES) throw new HttpError(413, `请求体超过 ${ANALYZE_MAX_BODY_BYTES} 字节`)
-    chunks.push(buffer)
-  }
-  return Buffer.concat(chunks).toString('utf8')
 }
 
 /**
@@ -134,14 +107,13 @@ export async function handleAnalyzeHttp(
     refuse(res, 400, '缺少或不合法的 Idempotency-Key 请求头（1-200 个可见 ASCII 字符）')
     return
   }
-  const mediaType = (req.headers['content-type'] ?? '').split(';')[0]?.trim().toLowerCase()
-  if (mediaType !== 'application/json') {
+  if (mediaTypeOf(req) !== 'application/json') {
     refuse(res, 415, 'Content-Type 必须是 application/json')
     return
   }
   let raw: unknown
   try {
-    raw = JSON.parse(await readBody(req))
+    raw = JSON.parse(await readBody(req, ANALYZE_MAX_BODY_BYTES))
   } catch (error) {
     if (error instanceof HttpError) {
       refuse(res, error.status, error.message)

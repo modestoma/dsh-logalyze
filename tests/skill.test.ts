@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { abortable } from '../src/abort.ts'
+import { abortable } from '../src/util/abort.ts'
 import { createEntrySkillProvider, DESCRIPTION_MAX_CHARS, describeApps, renderCatalog, renderEntrySkill } from '../src/skill/entry.ts'
 import type { AppManifest } from '../src/settings/contract.ts'
 import { loadBundledSkills, parseBundledSkill } from '../src/skill/bundled.ts'

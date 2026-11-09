@@ -18,14 +18,14 @@
  * @module dsh-logalyze/onboard/add
  */
 
-import { abortable } from '../abort.ts'
-import type { AuthorizeEvent } from '../access.ts'
+import type { RepoRegistry } from '../apps/registry.ts'
 import { describeIssue, repoSchema } from '../config.ts'
-import { isDelegatedAgent } from '../dispatch/tool.ts'
+import type { AuthorizeEvent } from '../deps/access.ts'
 import type { ContentBlock, HostApproval, ToolDefinition, ToolRunContext } from '../host.ts'
-import type { RepoRegistry } from '../repos/registry.ts'
+import { topLevelAgent } from '../runs/run-dir.ts'
 import type { RepoSpec, RepoStatusWire } from '../settings/contract.ts'
-import { ADD_REPO_TOOL_NAME, INIT_REPO_TOOL_NAME } from './names.ts'
+import { ADD_REPO_TOOL_NAME, INIT_REPO_TOOL_NAME } from '../tool-names.ts'
+import { abortable } from '../util/abort.ts'
 
 /** How one call ended. */
 export type AddRepoStatus = 'added' | 'exists' | 'rejected' | 'cancelled' | 'unavailable'
@@ -145,9 +145,7 @@ export class RepoAdder {
     const parsed = repoSchema.safeParse(rawArgs)
     if (!parsed.success) throw new Error(`${ADD_REPO_TOOL_NAME} 参数不合法：${describeIssue(parsed.error)}`)
     const spec: RepoSpec = parsed.data.branch === undefined ? { url: parsed.data.url } : { url: parsed.data.url, branch: parsed.data.branch }
-    const agent = exec.agent
-    if (agent === undefined) throw new Error(`${ADD_REPO_TOOL_NAME} 需要由 Agent 调用`)
-    if (isDelegatedAgent(agent)) throw new Error(`${ADD_REPO_TOOL_NAME} 不能在子 Agent 中调用`)
+    const agent = topLevelAgent(exec, ADD_REPO_TOOL_NAME)
     const { registry } = this.deps
 
     const existing = registry.statusOf(spec.url)

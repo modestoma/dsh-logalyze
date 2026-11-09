@@ -6,10 +6,10 @@
  * means allowed. The event is declared here so the plugin does not depend on
  * the package of whoever answers it.
  *
- * @module dsh-logalyze/access
+ * @module dsh-logalyze/deps/access
  */
 
-import type { HostContext } from './host.ts'
+import type { HostContext } from '../host.ts'
 
 /** Cordis event name. */
 export const ACCESS_AUTHORIZE_EVENT = 'access/authorize'

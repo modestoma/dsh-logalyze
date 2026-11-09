@@ -1,10 +1,11 @@
 import { mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { RepoRegistry } from '../src/repos/registry.ts'
-import { MANIFEST_PATH } from '../src/repos/manifest.ts'
+import { RepoRegistry } from '../src/apps/registry.ts'
+import { MANIFEST_PATH } from '../src/apps/manifest.ts'
 import { FakeRepos, repoError } from './fake-repos.ts'
 import { commitFile, createAppRepo, git, tempDir } from './helpers.ts'
+import { ReposClient } from '../src/deps/repos.ts'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { await Promise.all(cleanups.splice(0).map(cleanup => cleanup())) })
@@ -16,7 +17,7 @@ async function setup(): Promise<{ root: string; registry: RepoRegistry; fake: Fa
   const now = { value: 1_000_000 }
   const fake = new FakeRepos(join(dir, 'mirrors'))
   const repos: { value: unknown } = { value: fake }
-  const registry = new RepoRegistry({ repos: () => repos.value, onChange: () => { changes += 1 }, now: () => now.value })
+  const registry = new RepoRegistry({ repos: new ReposClient(() => repos.value), onChange: () => { changes += 1 }, now: () => now.value })
   return { root: dir, registry, fake, repos, changes: () => changes, now }
 }
 
