@@ -21,7 +21,7 @@ import type { ReportTopics } from './report/tracker.ts'
 import { Dispatcher, inRunDirectory, isDelegatedAgent, isInside } from './dispatch/tool.ts'
 import { authorize } from './access.ts'
 import type { HostApproval, HostContext, HostCredentials, ToolActivationContext, WorkingDirectoryService } from './host.ts'
-import { DSH_REPOS_SERVICE, lookupRepos, messageOf } from './repos/lookup.ts'
+import { DSH_REPOS_SERVICE, LOG_ANALYSIS_FEATURE, lookupRepos, messageOf, requireRepos } from './repos/lookup.ts'
 import { RepoRegistry } from './repos/registry.ts'
 import { ANALYZE_ROUTE } from './settings/contract.ts'
 import type { AnalyzeWire, EditableSettings, RepoSpec, ReposWire, StateWire, TokenStatusWire } from './settings/contract.ts'
@@ -79,7 +79,6 @@ export class LogalyzeService {
   private readonly refreshWaitMs: number
   private readonly analyzeTokenRef: string
   private readonly booted = Promise.withResolvers<void>()
-  private additions: Promise<void> = Promise.resolve()
 
   /**
    * @param ctx - plugin context.
@@ -126,7 +125,7 @@ export class LogalyzeService {
       registry: this.registry,
       approval: () => ctx.get?.('approval') as HostApproval | undefined,
       authorize: event => authorize(ctx, event),
-      addRepo: spec => this.addRepo(spec),
+      addRepo: (spec, session) => this.addRepo(spec, session),
     })
     this.initializer = new RepoInitializer({
       registry: this.registry,
@@ -248,7 +247,8 @@ export class LogalyzeService {
   }
 
   /**
-   * Load the panel overlay, configure the registry, and sync every repository.
+   * Load the panel overlay, take the application repositories from the
+   * dsh-repo catalog, and sync every repository.
    * @returns when the first sync round settled.
    */
   async boot(): Promise<void> {
@@ -271,34 +271,60 @@ export class LogalyzeService {
     await this.reports.boot().catch((error: unknown) => {
       this.ctx.logger?.error?.('logalyze: 读取回传记录失败：%s', messageOf(error))
     })
-    this.registry.configure(this.current.repos)
+    this.registry.configure(this.catalogRepos())
     await this.registry.syncAll()
   }
 
   /**
-   * React to dsh-repo becoming available (or reloading): sync every
-   * repository again.
+   * The application repositories: the dsh-repo catalog repositories with the
+   * log analysis feature turned on, following the catalog branch. Empty while
+   * dsh-repo is missing or incompatible.
+   */
+  private catalogRepos(): RepoSpec[] {
+    const lookup = lookupRepos(this.ctx.get?.(DSH_REPOS_SERVICE))
+    if (lookup.availability !== 'ready') return []
+    return lookup.service.listRepos({ feature: LOG_ANALYSIS_FEATURE.id }).map(repo => repo.branch === undefined ? { url: repo.url } : { url: repo.url, branch: repo.branch })
+  }
+
+  /**
+   * React to dsh-repo becoming available (or reloading): take the application
+   * repositories from its catalog again and sync every repository.
    * @returns when the syncs settled.
    */
   async reposAvailable(): Promise<void> {
     await this.booted.promise
     if (!this.active) return
+    this.registry.configure(this.catalogRepos())
     await this.registry.resyncAll()
   }
 
   /**
-   * Re-sync every repository after each host or token change in dsh-repo, so a
-   * new token reaches the mirrors without a manual sync.
+   * Register the log analysis feature with dsh-repo, follow its catalog (new,
+   * removed, or re-branched repositories are configured and synced at once),
+   * and sync every repository again after each host or token change so a new
+   * token reaches the mirrors without a manual sync.
    * @param repos - the `dshRepos` service.
-   * @returns disposer that stops watching.
+   * @returns disposer that withdraws the feature and stops watching.
    */
-  watchHosts(repos: DshRepos): () => void {
-    return repos.onHostsChange(() => {
+  watchRepos(repos: DshRepos): () => void {
+    const unregister = repos.registerFeature(LOG_ANALYSIS_FEATURE)
+    const stopCatalog = repos.onReposChange(() => {
+      if (!this.active) return
+      void this.registry.syncUrls(this.registry.configure(this.catalogRepos())).catch((error: unknown) => {
+        this.ctx.logger?.error?.('logalyze: 仓库清单变更后同步仓库失败：%s', messageOf(error))
+      })
+    })
+    const stopHosts = repos.onHostsChange(() => {
       if (!this.active) return
       void this.registry.resyncAll().catch((error: unknown) => {
         this.ctx.logger?.error?.('logalyze: 主机变更后同步仓库失败：%s', messageOf(error))
       })
     })
+    return () => {
+      stopHosts()
+      stopCatalog()
+      unregister()
+    }
   }
 
   /** Stop registering tools and retrying uploads; in-flight syncs and uploads finish without side effects on the host. */
@@ -445,8 +471,7 @@ export class LogalyzeService {
   }
 
   /**
-   * Validate and persist a complete settings payload from the panel, then
-   * sync repositories whose address or branch changed.
+   * Validate and persist a complete settings payload from the panel.
    * @param raw - request body.
    * @returns the new panel state.
    * @throws SettingsError when the payload is invalid.
@@ -461,21 +486,23 @@ export class LogalyzeService {
   }
 
   /**
-   * Append one repository to the panel settings, as a panel save would, and
-   * start syncing it. Concurrent additions are applied in call order.
+   * Add one repository to the dsh-repo catalog with the log analysis feature
+   * turned on, or turn the feature on for the entry holding it. A new entry
+   * gets `write` access, which drafting setups and SKILL improvements push
+   * with; an existing entry keeps its access. dsh-repo asks `access/authorize`
+   * (level `admin`) for the Session before it changes the catalog, and the
+   * catalog change reconfigures the registry.
    * @param spec - validated repository.
-   * @returns `exists` without writing when the address is already configured.
-   * @throws SettingsError when the resulting settings are invalid.
+   * @param session - the calling Session.
+   * @returns `exists` when the catalog already had the feature on for it, and the address as the catalog stores it.
+   * @throws the dsh-repo failure (`conflict` for another branch, `forbidden`, `not-allowed`), or when dsh-repo is missing or incompatible.
    */
-  async addRepo(spec: RepoSpec): Promise<'added' | 'exists'> {
-    // Additions run one at a time so each one reads the settings the previous one saved.
-    const added = this.additions.then(async () => {
-      if (this.registry.has(spec.url)) return 'exists' as const
-      await this.save({ ...this.current, repos: [...this.current.repos, spec] })
-      return 'added' as const
-    })
-    this.additions = added.then(() => undefined, () => undefined)
-    return await added
+  async addRepo(spec: RepoSpec, session: string): Promise<{ readonly status: 'added' | 'exists'; readonly url: string }> {
+    const repos = requireRepos(this.ctx.get?.(DSH_REPOS_SERVICE))
+    const result = await repos.addRepo(spec.url, { ...spec.branch === undefined ? {} : { branch: spec.branch }, access: 'write', features: [LOG_ANALYSIS_FEATURE.id], session })
+    // The catalog listener has configured the registry already unless it was not subscribed yet.
+    if (!this.registry.has(result.repo.url)) this.registry.configure(this.catalogRepos())
+    return { status: result.status === 'unchanged' ? 'exists' : 'added', url: result.repo.url }
   }
 
   /**
@@ -489,21 +516,20 @@ export class LogalyzeService {
   }
 
   /**
-   * Re-sync one configured repository, or all of them.
+   * Re-sync one application repository, or all of them.
    * @param url - address to sync; omitted syncs every repository.
    * @throws SettingsError when the address is not configured.
    */
   sync(url?: string): void {
-    if (url !== undefined && !this.registry.has(url)) throw new SettingsError(`未配置的仓库：${url}`)
+    if (url !== undefined && !this.registry.has(url)) throw new SettingsError(`仓库清单中没有打开「${LOG_ANALYSIS_FEATURE.title}」的仓库：${url}`)
     void (url === undefined ? this.registry.syncAll() : this.registry.syncUrls([url]))
   }
 
-  /** Make an overlay effective and sync the repositories whose address or branch changed. */
+  /** Make an overlay effective. */
   private apply(overlay: SettingsOverlay): void {
     this.overlay = overlay
     this.overlayError = undefined
     this.current = applyOverlay(this.defaults, overlay)
-    void this.registry.syncUrls(this.registry.configure(this.current.repos))
   }
 
   private onRegistryChange(): void {

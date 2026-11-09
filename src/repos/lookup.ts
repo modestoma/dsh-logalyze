@@ -15,7 +15,10 @@ import type { DshRepos, DshReposVersion } from './contract.ts'
 export const DSH_REPOS_SERVICE = 'dshRepos'
 
 /** The `dshRepos` contract version this plugin speaks. */
-export const DSH_REPOS_VERSION: DshReposVersion = 4
+export const DSH_REPOS_VERSION: DshReposVersion = 5
+
+/** The feature this plugin registers; it uses the catalog repositories that have it turned on. */
+export const LOG_ANALYSIS_FEATURE = { id: 'log-analysis', title: '日志分析', description: '观象从这些仓库读取应用描述和日志分析 SKILL，并在派发时读取代码' } as const
 
 /** Result of looking the service up. */
 export type ReposLookup =

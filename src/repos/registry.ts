@@ -272,7 +272,7 @@ export class RepoRegistry {
    */
   branchOf(url: string): string {
     const entry = this.entries.find(item => item.spec.url === url)
-    if (entry === undefined) throw new Error(`仓库 ${url} 已不在配置中`)
+    if (entry === undefined) throw new Error(`仓库 ${url} 已不是观象的应用仓库`)
     if (entry.branch === undefined) throw new Error(`仓库 ${url} 还没有同步成功`)
     return entry.branch
   }

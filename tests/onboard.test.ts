@@ -67,10 +67,10 @@ describe('logalyze_add_repo', () => {
     const repos = new FakeRepos(join(root, 'mirrors'))
     const registry = new RepoRegistry({ repos: () => repos, onChange: () => {} })
     const configured: RepoSpec[] = []
-    const addRepo = vi.fn(async (spec: RepoSpec) => {
+    const addRepo = vi.fn(async (spec: RepoSpec, _session: string) => {
       configured.push(spec)
       void registry.syncUrls(registry.configure(configured))
-      return 'added' as const
+      return { status: 'added' as const, url: spec.url }
     })
     const answer = { value: 'allowed-once' as ApprovalOutcome }
     const approval = approvalWith(answer)
@@ -86,7 +86,7 @@ describe('logalyze_add_repo', () => {
     expect(approval.request).not.toHaveBeenCalled()
     expect(addRepo).not.toHaveBeenCalled()
     await adder.execute({ url: ready }, run())
-    expect(authorize).toHaveBeenLastCalledWith({ session: 'parent', level: 'admin', action: 'logalyze_add_repo', summary: expect.stringContaining(`把 ${ready}（远端默认分支）加入应用仓库列表`) })
+    expect(authorize).toHaveBeenLastCalledWith({ session: 'parent', level: 'admin', action: 'logalyze_add_repo', summary: expect.stringContaining(`把 ${ready}（远端默认分支）加入 dsh-repo 仓库清单`) })
     expect(approval.request).toHaveBeenCalledTimes(1)
     // A repository already in the list is re-synced without asking anyone.
     await adder.execute({ url: ready }, run())
@@ -99,11 +99,11 @@ describe('logalyze_add_repo', () => {
     expect(await adder.execute({ url: ready }, run())).toEqual({ status: 'rejected', url: ready })
     expect(addRepo).not.toHaveBeenCalled()
     expect(approval.requests[0]).toMatchObject({ agent: parent, toolName: 'logalyze_add_repo', callId: 'call-1' })
-    expect(approval.requests[0]?.displayReason?.zh).toContain(`把 ${ready}（远端默认分支）加入应用仓库列表`)
+    expect(approval.requests[0]?.displayReason?.zh).toContain(`把 ${ready}（远端默认分支）加入 dsh-repo 仓库清单`)
 
     answer.value = 'allowed-once'
     const added = await adder.execute({ url: ready }, run())
-    expect(addRepo).toHaveBeenCalledWith({ url: ready })
+    expect(addRepo).toHaveBeenCalledWith({ url: ready }, 'parent')
     expect(added).toMatchObject({ status: 'added', setup: 'ready', repo: { phase: 'ready', app: { id: 'order-service' } } })
     expect(renderAddRepoValue(added)[0]?.text).toContain('应用「订单服务」（id: order-service）可用')
 
@@ -111,7 +111,7 @@ describe('logalyze_add_repo', () => {
     const again = await adder.execute({ url: ready }, run())
     expect(again).toMatchObject({ status: 'exists', setup: 'ready' })
     expect(approval.request).toHaveBeenCalledTimes(2)
-    expect(renderAddRepoValue(again)[0]?.text).toContain('已在观象的应用仓库列表中')
+    expect(renderAddRepoValue(again)[0]?.text).toContain('已是观象的应用仓库')
   })
 
   it('points to drafting when the repository synced without a description, and to tokens when the sync failed', async () => {
@@ -128,7 +128,7 @@ describe('logalyze_add_repo', () => {
   it('refuses invalid calls before asking', async () => {
     const { ready, adder, approval } = await setup()
     await adder.execute({ url: ready }, run())
-    await expect(adder.execute({ url: ready, branch: 'release' }, run())).rejects.toThrow('改分支请在设置面板')
+    await expect(adder.execute({ url: ready, branch: 'release' }, run())).rejects.toThrow('改分支请在 dsh-repo')
     await expect(adder.execute({ url: 'ext::sh -c id' }, run())).rejects.toThrow('不支持的 git 地址')
     await expect(adder.execute({ url: 'git@github.com:example/order-service.git' }, run())).rejects.toThrow('不支持 ssh')
     await expect(adder.execute({ url: '/a', extra: 1 }, run())).rejects.toThrow('参数不合法')
@@ -232,9 +232,9 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     const createChange = vi.fn(async (_repo: string, _change: ChangeCreate) => ({ webUrl: MR_URL }))
     Object.assign(repos, { createChange })
     const pushWorkspace = vi.spyOn(repos, 'pushWorkspace')
-    const settings: EditableSettings = { ...defaultsOf(resolveConfig({})), repos: [{ url: origin }, { url: other }, ...duplicates], skillUpdates: { enabled: false, maxFiles: 8, maxFileBytes: 65536 } }
+    const settings: EditableSettings = { ...defaultsOf(resolveConfig({})), skillUpdates: { enabled: false, maxFiles: 8, maxFileBytes: 65536 } }
     const registry = new RepoRegistry({ repos: () => repos, onChange: () => {} })
-    registry.configure(settings.repos)
+    registry.configure([{ url: origin }, { url: other }, ...duplicates])
     await registry.syncAll()
     const answer = { value: 'allowed-once' as ApprovalOutcome }
     const approval = approvalWith(answer)

@@ -4,7 +4,11 @@ import { access, mkdir } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
 import type {
+  CatalogRepo,
   DshRepos,
+  RepoAddOptions,
+  RepoAddResult,
+  RepoFeature,
   MirrorState,
   MirrorTreeEntry,
   SnapshotLease,
@@ -85,10 +89,20 @@ function acceptedAddress(url: string): boolean {
  * remote, which must be a local repository; a remote branch that already
  * exists makes the first push reject with `conflict`. Switches cover host
  * changes, stalled fetches, and snapshot failures. `createChange` rejects
- * unless a test replaces it.
+ * unless a test replaces it. The catalog is {@link catalog}; {@link addRepo}
+ * matches addresses exactly and records each call.
  */
 export class FakeRepos implements DshRepos {
-  readonly version = 4 as const
+  readonly version = 5 as const
+  /** Catalog repositories; change it with {@link setCatalog} to notify observers. */
+  catalog: CatalogRepo[] = []
+  /** Registered features by id. */
+  readonly features = new Map<string, RepoFeature>()
+  /** Every {@link addRepo} call, oldest first. */
+  readonly addRepoCalls: { readonly url: string; readonly options: RepoAddOptions }[] = []
+  /** When set, {@link addRepo} rejects with it. */
+  addRepoError: Error | undefined
+  private readonly catalogListeners = new Set<() => void>()
   /** While true, `syncMirror` never settles. */
   stalled = false
   /** While true, the provider reports no mirror directory and every mirror call rejects, as dsh-repo does before one is chosen. */
@@ -111,6 +125,59 @@ export class FakeRepos implements DshRepos {
   onHostsChange(listener: () => void): () => void {
     this.listeners.add(listener)
     return () => { this.listeners.delete(listener) }
+  }
+
+  listRepos(options: { readonly feature?: string } = {}): readonly CatalogRepo[] {
+    return this.catalog.filter(repo => options.feature === undefined || repo.features.includes(options.feature))
+  }
+
+  registerFeature(feature: RepoFeature): () => void {
+    this.features.set(feature.id, feature)
+    this.emitReposChange()
+    return () => {
+      this.features.delete(feature.id)
+      this.emitReposChange()
+    }
+  }
+
+  onReposChange(listener: () => void): () => void {
+    this.catalogListeners.add(listener)
+    return () => { this.catalogListeners.delete(listener) }
+  }
+
+  /** Report a catalog change to every observer. */
+  emitReposChange(): void {
+    for (const listener of [...this.catalogListeners]) listener()
+  }
+
+  /**
+   * Replace the catalog with repositories that have the given features, and notify observers.
+   * @param repos - addresses with an optional branch.
+   * @param features - feature ids every repository has.
+   */
+  setCatalog(repos: readonly { readonly url: string; readonly branch?: string }[], features: readonly string[] = ['log-analysis']): void {
+    this.catalog = repos.map((repo, index) => ({ id: index.toString(16).padStart(12, '0'), url: repo.url, ...repo.branch === undefined ? {} : { branch: repo.branch }, access: 'write', features: [...features] }))
+    this.emitReposChange()
+  }
+
+  async addRepo(url: string, options: RepoAddOptions = {}): Promise<RepoAddResult> {
+    this.addRepoCalls.push({ url, options })
+    if (this.addRepoError !== undefined) throw this.addRepoError
+    const features = options.features ?? []
+    const existing = this.catalog.find(repo => repo.url === url)
+    if (existing !== undefined) {
+      if (options.branch !== undefined && options.branch !== existing.branch) throw repoError('conflict', `${url} 已在仓库清单中，跟随其他分支`)
+      const missing = features.filter(id => !existing.features.includes(id))
+      if (missing.length === 0) return { status: 'unchanged', repo: existing }
+      const updated = { ...existing, features: [...existing.features, ...missing] }
+      this.catalog = this.catalog.map(repo => repo === existing ? updated : repo)
+      this.emitReposChange()
+      return { status: 'updated', repo: updated }
+    }
+    const added: CatalogRepo = { id: this.catalog.length.toString(16).padStart(12, '0'), url, ...options.branch === undefined ? {} : { branch: options.branch }, access: options.access ?? 'read', features: [...features] }
+    this.catalog = [...this.catalog, added]
+    this.emitReposChange()
+    return { status: 'added', repo: added }
   }
 
   /** Report a host or token change to every observer. */

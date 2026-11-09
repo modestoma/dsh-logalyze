@@ -174,12 +174,11 @@ async function setup(endTurn = true): Promise<Setup> {
   const origin = await createAppRepo(join(root, 'order-service'))
   const settings: EditableSettings = {
     ...defaultsOf(resolveConfig({})),
-    repos: [{ url: origin }],
     skillUpdates: { enabled: true, maxFiles: 4, maxFileBytes: 65536 },
   }
   const repos = fakeRepos(join(root, 'mirrors'))
   const registry = new RepoRegistry({ repos: () => repos.service, onChange: () => {} })
-  registry.configure(settings.repos)
+  registry.configure([{ url: origin }])
   await registry.syncAll()
   const [ready] = registry.readyApps()
   const { service, started } = fakeSubagents()

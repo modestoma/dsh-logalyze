@@ -8,10 +8,10 @@
  * 工具：`logalyze_show_skill` 只读查看应用 SKILL；`logalyze_improve_skill` 在
  * 用户于分析结论之后的消息中同意改进时，由一个改进子 Agent 把该应用的所有改进点
  * 在运行目录的可写工作区里按 `/logalyze-improve` 改进 SKILL 并沉淀案例，经
- * `dshRepos` 服务推送到新分支并创建合并请求。应用仓库在设置面板中只填
- * https 地址，由插件拉取；应用描述来自各仓库的
+ * `dshRepos` 服务推送到新分支并创建合并请求。应用仓库是 dsh-repo 仓库清单中
+ * 打开了「日志分析」功能的仓库，由插件拉取；应用描述来自各仓库的
  * `.agents/logalyze.yaml`。顶层 Agent 还可以用 `logalyze_add_repo` 在对话中
- * 添加仓库，并用 `logalyze_init_repo` / `logalyze_submit_init` 为缺少应用描述
+ * 把仓库加入 dsh-repo 的仓库清单，并用 `logalyze_init_repo` / `logalyze_submit_init` 为缺少应用描述
  * 的仓库在工作区里起草并推送接入合并请求。另提供日志平台分析接口 `POST /open-api/logalyze`，
  * 经飞书渠道插件的 `feishuTopics` 服务在飞书群话题中开始分析；带 `logId` 的请求在
  * 话题每轮结束后把报告目录交给回传命令。
@@ -77,8 +77,9 @@ export interface LogalyzePluginOptions extends ServiceOptions {
  * Install the entry skill, the bundled guide skills, the dispatch, SKILL
  * view and improvement, and repository
  * onboarding tools, the settings routes, and the analyze route, then mirror
- * or update the configured repositories in the background and again after
- * each dsh-repo host change.
+ * or update the application repositories (the dsh-repo catalog repositories
+ * with the log analysis feature) in the background, again after each catalog
+ * or host change in dsh-repo.
  * @param ctx - plugin context.
  * @param config - loader-validated configuration.
  * @param options - test seams.
@@ -102,13 +103,14 @@ export function apply(ctx: HostContext, config?: unknown, options: LogalyzePlugi
       ctx.logger?.error?.('logalyze: 核对分析报告失败：%s', error instanceof Error ? error.message : String(error))
     })
   })
-  // Sync again whenever dsh-repo's service appears, including after it reloads,
-  // and after every host or token change made in it.
+  // Whenever dsh-repo's service appears, including after it reloads: register
+  // the log analysis feature, follow its catalog and host changes, and take the
+  // application repositories from the catalog again.
   ctx.inject?.([DSH_REPOS_SERVICE], (child) => {
+    const lookup = lookupRepos(child.get?.(DSH_REPOS_SERVICE))
+    if (lookup.availability === 'ready') child.effect(() => service.watchRepos(lookup.service), 'logalyze: dsh-repo catalog')
     void service.reposAvailable().catch((error: unknown) => {
       ctx.logger?.error?.('logalyze: 同步仓库失败：%s', error instanceof Error ? error.message : String(error))
     })
-    const lookup = lookupRepos(child.get?.(DSH_REPOS_SERVICE))
-    if (lookup.availability === 'ready') child.effect(() => service.watchHosts(lookup.service), 'logalyze: dsh-repo host changes')
   })
 }
