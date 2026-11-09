@@ -103,27 +103,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pnpm exec semantic-release
-
-  # semantic-release counts a dev beta from the newest tag in dev's history, so
-  # dev must contain every commit that main released; otherwise the next beta
-  # repeats the version just published. After a stable release this job
-  # fast-forwards dev to the released commit, or merges it into dev when dev
-  # has commits of its own.
-  sync-dev:
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || !inputs.dry_run)
-    needs: release
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    concurrency:
-      group: dsh-logalyze-release
-      cancel-in-progress: false
-      queue: max
-    steps:
+      # semantic-release counts a dev beta from the newest tag in dev's history,
+      # so dev must contain every commit that main released; otherwise the next
+      # beta repeats the version just published. This step fast-forwards dev to
+      # the released commit, or merges it into dev when dev has commits of its
+      # own. It runs inside this job so that no queued beta release can take
+      # the release lock between the stable publish and the sync.
       - name: Bring the released commit into dev
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || !inputs.dry_run)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
