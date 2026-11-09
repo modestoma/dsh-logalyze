@@ -14,6 +14,8 @@
  * - 同一份报告的上传串行执行；上传进行中又有新的轮次时，结束后再上传一次最新
  *   内容。命令失败按退避重试；目录里有符号链接或超过文件数、总大小上限时不上传，
  *   等内容变化或在面板手动重传。
+ * - 启动时和每接受一份新报告时按存储的保留规则清理旧记录；正在上传或更新的
+ *   记录这次不清理。
  *
  * @module dsh-logalyze/report/tracker
  */
@@ -135,6 +137,7 @@ export class ReportTracker {
   /** Load stored records and resume uploads that had not finished. */
   async boot(): Promise<void> {
     await this.deps.store.load()
+    await this.prune()
     for (const record of this.deps.store.all()) {
       if (record.uploadedRevision < record.revision && record.blocked !== true) this.schedule(record.id)
     }
@@ -158,8 +161,14 @@ export class ReportTracker {
         id, key, logId: request.logId, app: request.app, errorCode: request.errorCode, triggeredAt: request.triggeredAt,
         acceptedAt: this.now(), sections: [], turns: {}, snapshot: {}, warnings: [], revision: 0, uploadedRevision: 0,
       })
+      await this.prune()
     }
     await this.reconcileOne(id)
+  }
+
+  /** Drop expired and excess records that no upload or update is using. */
+  private async prune(): Promise<void> {
+    await this.deps.store.prune(this.now(), id => this.workers.has(id) || this.locks.has(id))
   }
 
   /**

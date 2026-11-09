@@ -20,6 +20,12 @@ export const DSH_REPOS_VERSION: DshReposVersion = 6
 /** The feature this plugin registers; it uses the catalog repositories that have it turned on. */
 export const LOG_ANALYSIS_FEATURE = { id: 'log-analysis', title: '日志分析', description: '观象从这些仓库读取应用描述和日志分析 SKILL，并在派发时读取代码' } as const
 
+/** A catalog repository with the log analysis feature, as the registry follows it. */
+export interface AppRepo extends RepoSpec {
+  /** Whether the catalog entry's access lets drafting setups and SKILL improvements push (`write` or `merge`). */
+  readonly writable: boolean
+}
+
 /** Result of looking the service up. */
 export type ReposLookup =
   | { readonly availability: 'ready'; readonly service: DshRepos }
@@ -96,11 +102,11 @@ export class ReposClient {
    * analysis feature turned on, following the catalog branch.
    * @returns them in catalog order; empty while the service is missing or incompatible.
    */
-  async appRepos(): Promise<RepoSpec[]> {
+  async appRepos(): Promise<AppRepo[]> {
     const lookup = this.lookup()
     if (lookup.availability !== 'ready') return []
     const repos = await lookup.service.repoList({ feature: LOG_ANALYSIS_FEATURE.id })
-    return repos.map(repo => repo.branch === undefined ? { url: repo.url } : { url: repo.url, branch: repo.branch })
+    return repos.map(repo => ({ url: repo.url, ...repo.branch === undefined ? {} : { branch: repo.branch }, writable: repo.access !== 'read' }))
   }
 
   /** @returns the provider's mirror directory, or undefined while the service or the directory is unavailable. */

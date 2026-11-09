@@ -183,15 +183,24 @@ export interface CatalogRepo {
   readonly features: readonly string[]
 }
 
-/** Parameters of {@link DshRepos.repoAdd}. Without an Agent the provider asks nothing: this plugin authorizes and approves the change itself. */
+/**
+ * Parameters of {@link DshRepos.repoAdd}. With an Agent the provider asks
+ * `access/authorize` (level `admin`) for its Session and, while its settings
+ * say so, shows its approval card (a refusal rejects with `declined`, writes
+ * turned off with `forbidden`).
+ */
 export interface RepoAddParams extends CallOptions {
-  /** HTTPS address on a configured host, `file:` URL, or absolute local path. */
+  /** HTTPS address on a configured host. */
   readonly repo: string
   readonly branch?: string
   /** Access of a new entry; an existing entry keeps its access. Default `read`. */
   readonly access?: RepoAccess
   /** Feature ids to turn on. */
   readonly features?: readonly string[]
+  /** The Agent the change is made for. */
+  readonly agent?: CallerAgent
+  /** The calling tool call, so the approval card shows that call. */
+  readonly callId?: string
 }
 
 /** Outcome of {@link DshRepos.repoAdd}. */
@@ -223,7 +232,7 @@ export interface DshRepos {
   /**
    * Add a repository to the catalog, or turn features on for the entry holding it.
    * @returns the outcome and the entry.
-   * @throws `conflict` when the entry follows another branch; `not-allowed` for an address on an unconfigured host.
+   * @throws `conflict` when the entry follows another branch; `not-allowed` for an address on an unconfigured host; with an Agent, `declined` when the user did not approve and `forbidden` when writes are off or `access/authorize` refused.
    */
   repoAdd(params: RepoAddParams): Promise<RepoAddResult>
   /** @returns the settings this plugin reads. */

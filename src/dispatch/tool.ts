@@ -7,9 +7,10 @@
  *   `<父会话目录>/.logalyze/runs/<runId>/<序号>-<应用 id>/`，该目录也是子 Agent
  *   解压日志的可写目录。
  * - 超时（`dispatchTimeoutMs`）或调用被取消时停止全部仍在运行的子 Agent。
- * - 开启 SKILL 改进时，子 Agent 在 SKILL 不足时于运行目录写 `skill-gap.md`；派发
- *   结束后检查已完成任务的记录，并在结果中标出 SKILL 不足，供父 Agent 在汇总回复
- *   末尾给出改进建议，用户在之后的消息里同意后再改进。
+ * - 开启 SKILL 改进时，可写仓库（dsh-repo 权限「可改代码」或「可合并」）的子 Agent
+ *   在 SKILL 不足时于运行目录写 `skill-gap.md`；派发结束后检查已完成任务的记录，
+ *   并在结果中标出 SKILL 不足，供父 Agent 在汇总回复末尾给出改进建议，用户在之后
+ *   的消息里同意后再改进。只读仓库的子 Agent 不记录。
  * - 每个任务的结果带上应用仓库地址和分析的提交，后续修复代码可以从同一仓库和
  *   提交开始。
  * - 子会话（委派深度大于 0）中不提供本工具。
@@ -20,7 +21,7 @@
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { z } from 'zod'
-import type { RepoRegistry } from '../apps/registry.ts'
+import type { LeasedApp, RepoRegistry } from '../apps/registry.ts'
 import { describeIssue } from '../config.ts'
 import type { ContentBlock, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
 import type { GapCheck } from '../improve/gap.ts'
@@ -63,7 +64,7 @@ export interface TaskResult {
   workDir: string
   /** Absolute log paths handed to the child. */
   logs: string[]
-  /** The SKILL gap record the child wrote, when SKILL improvement is enabled and it wrote one. */
+  /** The SKILL gap record the child wrote, when SKILL improvement is enabled, the repository is writable, and the child wrote one. */
   skillGap?: GapCheck
 }
 
@@ -272,6 +273,8 @@ export class Dispatcher {
         return { task, ready, workDir, logs }
       }))
       const gaps = this.deps.gaps?.enabled() === true ? this.deps.gaps : undefined
+      // Read-only repositories cannot take a SKILL improvement, so their children record no gaps.
+      const recordsGaps = (ready: LeasedApp): boolean => gaps !== undefined && ready.writable
       const results = await Promise.all(prepared.map(async ({ task, ready, workDir, logs }): Promise<TaskResult> => {
         const outcome = await runChild({
           subagents: this.deps.subagents,
@@ -279,7 +282,7 @@ export class Dispatcher {
           parent,
           label: `${ready.app.name}分析`,
           cwd: ready.dir,
-          prompt: renderChildPrompt({ app: ready.app, commit: ready.commit, question: task.question, logs, workDir, gaps: gaps !== undefined }),
+          prompt: renderChildPrompt({ app: ready.app, commit: ready.commit, question: task.question, logs, workDir, gaps: recordsGaps(ready) }),
           timeoutMs: settings.dispatchTimeoutMs,
           signal: exec.signal,
         })
@@ -289,7 +292,7 @@ export class Dispatcher {
       if (gaps !== undefined) {
         await Promise.all(results.map(async (result, index) => {
           const item = prepared[index]
-          if (result.status !== 'completed' || item === undefined) return
+          if (result.status !== 'completed' || item === undefined || !recordsGaps(item.ready)) return
           const check = await gaps.inspect({
             workDir: result.workDir,
             sessionId: parent.session.header.id,

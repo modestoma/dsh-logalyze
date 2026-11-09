@@ -4,7 +4,7 @@
  * 只声明本插件实际调用的字段，不在运行时 import 任何 `@deepseek-ai/dsh-*`
  * 包；字段含义以 DSH 源码为准（`packages/core/tools`、`packages/skill/skill`、
  * `packages/subagent/subagent`、`packages/session/working-directory`、
- * `packages/credentials/credentials`、`packages/interaction/user-approval`）。
+ * `packages/credentials/credentials`）。
  *
  * @module dsh-logalyze/host
  */
@@ -212,36 +212,6 @@ export interface HostCredentials {
   unset(ref: string): Promise<void>
 }
 
-/**
- * Closed approval outcomes of `@deepseek-ai/dsh-user-approval`; only
- * `allowed-once` grants the action.
- */
-export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
-
-/** One decision request; DSH requires an open turn of the agent's session. */
-export interface ApprovalRequest {
-  readonly agent: Agent
-  /** Tool the question is about. */
-  readonly toolName: string
-  /** The exact tool call being decided. */
-  readonly callId?: string
-  /** Audit-logged explanation of what will happen. */
-  readonly reason?: string
-  /** Localized presentation-only text; answerers prefer it over `reason`. */
-  readonly displayReason?: { readonly en: string; readonly [locale: string]: string }
-  /** Aborting withdraws the question (`cancelled`). */
-  readonly signal?: AbortSignal
-}
-
-/**
- * The optional `ctx.approval` slice. Answerers such as the Feishu channel
- * plugin's decision cards or the DSH Web prompt claim the request; without an answerer
- * the outcome is `unavailable`.
- */
-export interface HostApproval {
-  request(req: ApprovalRequest): Promise<ApprovalOutcome>
-}
-
 /** Cordis logger slice. */
 export interface HostLogger {
   info?(message: string, ...args: unknown[]): void
@@ -270,11 +240,6 @@ export interface HostContext {
    * @returns the disposer.
    */
   on(name: typeof FEISHU_TOPICS_STATUS_EVENT, listener: (state: TopicLaunchState) => void): () => unknown
-  /**
-   * Run every listener of a Cordis event concurrently and wait for all of
-   * them; rejects with an `AggregateError` of the listeners that threw.
-   */
-  parallel?(name: string, ...args: unknown[]): Promise<void>
   effect(callback: () => (() => void) | void, label?: string): () => unknown
   inject?(dependencies: string[], callback: (child: HostContext) => void): unknown
 }

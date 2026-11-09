@@ -6,7 +6,7 @@
  */
 
 import { homedir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { join } from 'node:path'
 import { z } from 'zod'
 import { TOKEN_ENV_PATTERN, UPLOAD_PLACEHOLDERS } from './settings/contract.ts'
 import type { EditableKey, EditableSettings } from './settings/contract.ts'
@@ -14,23 +14,21 @@ import type { EditableKey, EditableSettings } from './settings/contract.ts'
 /** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
 
-const URL_SCHEMES = new Set(['https:', 'file:'])
 const HOST_NAME = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]*[a-z0-9])?$/
 
 /**
- * Whether a string is a repository address the `dshRepos` service mirrors: an
- * `https` or `file` URL, or an absolute local path. SSH, scp-like
- * `user@host:path`, `git://`, and other transports are refused.
+ * Whether a string is a repository address the `dshRepos` service mirrors:
+ * an `https` URL. SSH, scp-like `user@host:path`, `git://`, `file:`, local
+ * paths, and other transports are refused.
  * @param value - candidate repository address.
  * @returns whether it is accepted.
  */
 export function isAcceptedGitUrl(value: string): boolean {
   if (value.startsWith('-') || /\s/.test(value)) return false
-  if (isAbsolute(value)) return true
   try {
-    return URL_SCHEMES.has(new URL(value).protocol)
+    return new URL(value).protocol === 'https:'
   } catch {
-    // Not a URL and not scp-like: refused.
+    // Not a URL (an scp-like address or a local path): refused.
     return false
   }
 }
@@ -51,7 +49,7 @@ export function isAcceptedBranch(value: string): boolean {
 
 /** Arguments of `logalyze_add_repo`: git address and optional branch. */
 export const repoSchema = z.object({
-  url: z.string().trim().min(1, 'git 地址不能为空').refine(isAcceptedGitUrl, '不支持的 git 地址（支持 https URL、file URL 或本机绝对路径，不支持 ssh 和 user@host:path）'),
+  url: z.string().trim().min(1, 'git 地址不能为空').refine(isAcceptedGitUrl, '不支持的 git 地址（只支持 https 地址，不支持 ssh、user@host:path 和本机路径）'),
   branch: z.string().trim().optional().transform(value => value === '' ? undefined : value)
     .refine(value => value === undefined || isAcceptedBranch(value), '分支名不合法'),
 }).strict()

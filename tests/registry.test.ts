@@ -25,7 +25,7 @@ describe('repository registry', () => {
   it('clones a repository and exposes its application', async () => {
     const { root, registry } = await setup()
     const origin = await createAppRepo(join(root, 'origin'))
-    registry.configure([{ url: origin }])
+    registry.configure([{ url: origin, writable: true }])
     expect(registry.status()[0]?.phase).toBe('pending')
     await registry.syncAll()
     const [status] = registry.status()
@@ -34,10 +34,26 @@ describe('repository registry', () => {
     expect(registry.readyApps().map(app => app.app.id)).toEqual(['order-service'])
   })
 
+  it('records catalog access without syncing again and offers only writable repositories for drafting', async () => {
+    const { root, registry } = await setup()
+    const origin = await createAppRepo(join(root, 'origin'))
+    const bare = await createAppRepo(join(root, 'bare'))
+    git(bare, 'rm', '-q', '.agents/logalyze.yaml')
+    git(bare, 'commit', '-qm', 'drop manifest')
+    registry.configure([{ url: origin, writable: false }, { url: bare, writable: false }])
+    await registry.syncAll()
+    expect(registry.status()).toMatchObject([{ url: origin, available: true, writable: false }, { url: bare, available: false, writable: false }])
+    expect(registry.readyApp('order-service').writable).toBe(false)
+    expect(registry.setupPending()).toEqual([])
+    expect(registry.configure([{ url: origin, writable: true }, { url: bare, writable: true }])).toEqual([])
+    expect(registry.readyApp('order-service').writable).toBe(true)
+    expect(registry.setupPending()).toEqual([bare])
+  })
+
   it('updates to the remote head and follows a configured branch', async () => {
     const { root, registry, now } = await setup()
     const origin = await createAppRepo(join(root, 'origin'))
-    registry.configure([{ url: origin }])
+    registry.configure([{ url: origin, writable: true }])
     await registry.syncAll()
     const head = await commitFile(origin, 'NOTES.md', 'v2\n')
     now.value += 1
@@ -47,7 +63,7 @@ describe('repository registry', () => {
     git(origin, 'checkout', '-qb', 'release')
     const release = await commitFile(origin, 'NOTES.md', 'release\n')
     git(origin, 'checkout', '-q', 'main')
-    const changed = registry.configure([{ url: origin, branch: 'release' }])
+    const changed = registry.configure([{ url: origin, branch: 'release', writable: true }])
     expect(changed).toEqual([origin])
     await registry.syncUrls(changed)
     expect(registry.status()[0]).toMatchObject({ phase: 'ready', branch: 'release', commit: release })
@@ -56,7 +72,7 @@ describe('repository registry', () => {
   it('keeps the existing checkout usable when an update fails', async () => {
     const { root, registry } = await setup()
     const origin = await createAppRepo(join(root, 'origin'))
-    registry.configure([{ url: origin }])
+    registry.configure([{ url: origin, writable: true }])
     await registry.syncAll()
     await rm(origin, { recursive: true })
     await registry.syncAll()
@@ -69,7 +85,7 @@ describe('repository registry', () => {
     const { root, registry, fake } = await setup()
     const origin = await createAppRepo(join(root, 'origin'))
     fake.mirrorUnset = true
-    registry.configure([{ url: origin }])
+    registry.configure([{ url: origin, writable: true }])
     await registry.syncAll()
     expect(registry.status()[0]).toMatchObject({ phase: 'failed', available: false, error: expect.stringContaining('镜像目录未设置') })
     await expect(registry.acquire(['order-service'])).rejects.toThrow()
@@ -86,7 +102,7 @@ describe('repository registry', () => {
     git(origin, 'init', '-q', '-b', 'main')
     git(origin, 'add', '-A')
     git(origin, '-c', 'user.name=t', '-c', 'user.email=t@e', 'commit', '-qm', 'init')
-    registry.configure([{ url: origin }])
+    registry.configure([{ url: origin, writable: true }])
     await registry.syncAll()
     expect(registry.status()[0]).toMatchObject({ phase: 'failed', available: false, error: '仓库缺少应用描述 .agents/logalyze.yaml' })
     expect(registry.readyApps()).toEqual([])
@@ -94,7 +110,7 @@ describe('repository registry', () => {
 
   it('reports clone failures', async () => {
     const { root, registry } = await setup()
-    registry.configure([{ url: join(root, 'missing') }])
+    registry.configure([{ url: join(root, 'missing'), writable: true }])
     await registry.syncAll()
     expect(registry.status()[0]).toMatchObject({ phase: 'failed', available: false })
     expect(registry.status()[0]?.error).toContain('同步镜像')
@@ -105,7 +121,7 @@ describe('repository registry', () => {
     const origin = await createAppRepo(join(root, 'origin'))
     const service = repos.value
     repos.value = undefined
-    registry.configure([{ url: origin }])
+    registry.configure([{ url: origin, writable: true }])
     await registry.syncAll()
     expect(registry.status()[0]).toMatchObject({ phase: 'failed', available: false })
     expect(registry.status()[0]?.error).toContain('请安装 dsh-repo')
@@ -124,7 +140,7 @@ describe('repository registry', () => {
     const { root, registry } = await setup()
     const first = await createAppRepo(join(root, 'one'))
     const second = await createAppRepo(join(root, 'two'))
-    registry.configure([{ url: first }, { url: second }])
+    registry.configure([{ url: first, writable: true }, { url: second, writable: true }])
     await registry.syncAll()
     expect(registry.readyApps()).toEqual([])
     expect(registry.status().map(repo => repo.available)).toEqual([false, false])
@@ -134,7 +150,7 @@ describe('repository registry', () => {
   it('updates the catalog while a lease holds an unchanged snapshot, and releases each snapshot once', async () => {
     const { root, registry, fake } = await setup()
     const origin = await createAppRepo(join(root, 'origin'))
-    registry.configure([{ url: origin }])
+    registry.configure([{ url: origin, writable: true }])
     await registry.syncAll()
     const first = registry.status()[0]?.commit as string
 
@@ -169,7 +185,7 @@ describe('repository registry', () => {
   it('refreshes only repositories whose last sync is old enough', async () => {
     const { root, registry, now } = await setup()
     const origin = await createAppRepo(join(root, 'origin'))
-    registry.configure([{ url: origin }])
+    registry.configure([{ url: origin, writable: true }])
     await registry.refresh(60_000)
     const first = registry.status()[0]?.commit
     expect(first).toBeDefined()
@@ -188,7 +204,7 @@ describe('repository registry', () => {
     await symlink('real.yaml', join(origin, MANIFEST_PATH))
     git(origin, 'add', '-A')
     git(origin, 'commit', '-qm', 'link')
-    registry.configure([{ url: origin }])
+    registry.configure([{ url: origin, writable: true }])
     await registry.syncAll()
     expect(registry.status()[0]).toMatchObject({ phase: 'failed', error: `无法读取 ${MANIFEST_PATH}：${MANIFEST_PATH} 不是普通文件（不接受符号链接等）` })
   })
@@ -197,7 +213,7 @@ describe('repository registry', () => {
     const { root, registry, fake } = await setup()
     const origin = await createAppRepo(join(root, 'origin'))
     const second = await createAppRepo(join(root, 'pay'), { '.agents/logalyze.yaml': 'id: pay-service\nname: 支付服务\ndescription: 支付\nskill: log-analysis\n' })
-    registry.configure([{ url: origin }, { url: second }])
+    registry.configure([{ url: origin, writable: true }, { url: second, writable: true }])
     await registry.syncAll()
     fake.snapshotError = repoError('unavailable', '检出失败')
     await expect(registry.acquire(['order-service', 'pay-service'])).rejects.toThrow('应用「order-service」的代码快照创建失败：检出失败')
@@ -212,7 +228,7 @@ describe('repository registry', () => {
   it('rejects unknown application ids with the available ones', async () => {
     const { root, registry } = await setup()
     const origin = await createAppRepo(join(root, 'origin'))
-    registry.configure([{ url: origin }])
+    registry.configure([{ url: origin, writable: true }])
     await registry.syncAll()
     await expect(registry.acquire(['pay-service'])).rejects.toThrow('「pay-service」不在应用注册表中。可用的应用 id：order-service')
     expect(registry.status()[0]?.activeRuns).toBe(0)

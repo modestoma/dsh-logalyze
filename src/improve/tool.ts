@@ -1,8 +1,9 @@
 /**
  * `logalyze_improve_skill`：用户在对话中同意改进某个应用的日志分析 SKILL 后，
  * 派一个改进子 Agent 把该应用的所有改进点一次改进完（需要时把问题整理为案例），
- * 再提交到新分支、创建合并请求供用户评审。调用本身就代表用户已经同意，工具不再
- * 询问。改进的依据有两种，至少要有一种：
+ * 再提交到新分支、创建合并请求供用户评审。父 Agent 只在用户于对话中同意后调用；
+ * 推送前 dsh-repo 按它的写操作设置可能再请用户批准一次。只改进仓库清单中可写
+ * （权限「可改代码」或「可合并」）的应用。改进的依据有两种，至少要有一种：
  *
  * - 分析：本进程中同一会话派发并已完成的该应用的任务。默认取其中记录了
  *   `skill-gap.md`、还没有被改进过的全部任务；参数 `workDirs` 给出时只用这些任务。
@@ -350,7 +351,7 @@ export class SkillImprover {
     return {
       name: IMPROVE_TOOL_NAME,
       description: '观象：改进某个应用的日志分析 SKILL。派一个子 Agent 把该应用的所有改进点一次改完（需要时把问题整理为案例写入 SKILL 的 cases/ 目录），推送到新分支并创建合并请求供用户评审，不会改动默认分支，需要几分钟。'
-        + '调用即视为用户已同意，工具不再询问，所以只在用户于对话中明确同意改进后调用。分析结果标出「SKILL 不足」的那一回合不要调用（工具会拒绝）：先写完分析结论，在回复末尾给出 SKILL 改进建议并问用户是否改进。'
+        + '只在用户于对话中明确同意改进后调用；推送前 dsh-repo 可能再请用户批准一次。仓库在 dsh-repo 中为只读的应用不能改进（工具会拒绝）。分析结果标出「SKILL 不足」的那一回合不要调用（工具会拒绝）：先写完分析结论，在回复末尾给出 SKILL 改进建议并问用户是否改进。'
         + `每个应用每回合只调用一次，把该应用的所有改进点放进同一次调用。用户主动纠正 SKILL 时，先用 ${SHOW_TOOL_NAME} 查看现有 SKILL，和用户确认哪部分不对、正确做法是什么、有没有样例日志，问清后再调用，并把用户的纠正写进 feedback。不要自己修改或推送 SKILL 文件。`,
       parameters: PARAMETERS,
       output: {
@@ -395,7 +396,8 @@ export class SkillImprover {
     const sessionId = agent.session.header.id
     const settings = this.deps.settings()
     const { feedback } = args
-    const { app, url } = this.deps.registry.readyApp(args.app)
+    const { app, url, writable } = this.deps.registry.readyApp(args.app)
+    if (!writable) throw new Error(`应用「${app.id}」的仓库在 dsh-repo 仓库清单中的权限是「只读」，观象不能推送 SKILL 改进；请在 dsh-repo「代码仓库 → 仓库」把权限改为「可改代码」，或由仓库维护者自己修改 SKILL`)
     const turn = this.turnOf(sessionId)
     const analyzed = [...this.tasks.values()].filter(record => record.task.sessionId === sessionId && record.task.app.id === app.id)
     if (analyzed.some(record => record.turn === turn)) {

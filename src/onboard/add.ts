@@ -4,15 +4,15 @@
  *
  * - 仓库清单归 dsh-repo 所有：工具调用 `dshRepos.repoAdd`，新条目的权限为
  *   「可改代码」（起草接入和改进 SKILL 要推送分支），已有条目只打开功能、权限
- *   不变。调用前先发 `access/authorize`（级别 `admin`）问其他插件这个会话能不能
- *   改仓库清单，被拒绝时工具报错、不问用户；再经 DSH 审批服务请求一次性授权，
- *   只有 `allowed-once` 才调用，没有审批服务时工具报错。授权和审批都由本工具
- *   完成，调用 dsh-repo 时不带 Agent，dsh-repo 不再询问。
- * - 地址已是应用仓库时不请求授权、不调用，只重新拉取并报告状态；分支不同时报错，
+ *   不变。调用带上当前 Agent：dsh-repo 发 `access/authorize`（级别 `admin`），
+ *   按它的写操作设置弹出审批卡片；用户没有批准时报告审批结果，dsh-repo 关闭写
+ *   操作或授权被拒绝时工具报错。
+ * - 只接受 https 地址。
+ * - 地址已是应用仓库时不调用 dsh-repo，只重新拉取并报告状态；分支不同时报错，
  *   改分支在 dsh-repo 的仓库清单中完成。
  * - 取消调用只停止等待，拉取在后台继续。
  * - 结果说明下一步：应用可用；仓库已拉取但缺少应用描述或 SKILL 时用
- *   `logalyze_init_repo` 起草；拉取失败时给出原因。
+ *   `logalyze_init_repo` 起草（只读仓库提示在 dsh-repo 改权限）；拉取失败时给出原因。
  * - 子会话中不提供本工具。
  *
  * @module dsh-logalyze/onboard/add
@@ -20,8 +20,8 @@
 
 import type { RepoRegistry } from '../apps/registry.ts'
 import { describeIssue, repoSchema } from '../config.ts'
-import type { AuthorizeEvent } from '../deps/access.ts'
-import type { ContentBlock, HostApproval, ToolDefinition, ToolRunContext } from '../host.ts'
+import { declinedOutcome } from '../deps/repos.ts'
+import type { Agent, ContentBlock, ToolDefinition, ToolRunContext } from '../host.ts'
 import { topLevelAgent } from '../runs/run-dir.ts'
 import type { RepoSpec, RepoStatusWire } from '../settings/contract.ts'
 import { ADD_REPO_TOOL_NAME, INIT_REPO_TOOL_NAME } from '../tool-names.ts'
@@ -32,10 +32,11 @@ export type AddRepoStatus = 'added' | 'exists' | 'rejected' | 'cancelled' | 'una
 
 /**
  * Where the repository stands after the sync: `ready` offers its application,
- * `needs-setup` synced without a usable description or SKILL, `failed` did not
- * sync or its application id conflicts with another repository.
+ * `needs-setup` synced without a usable description or SKILL, `read-only`
+ * synced without one while its catalog access forbids pushing a draft,
+ * `failed` did not sync or its application id conflicts with another repository.
  */
-export type RepoSetup = 'ready' | 'needs-setup' | 'failed'
+export type RepoSetup = 'ready' | 'needs-setup' | 'read-only' | 'failed'
 
 /** Canonical tool value. */
 export interface AddRepoValue {
@@ -52,7 +53,7 @@ const PARAMETERS: Record<string, unknown> = {
   additionalProperties: false,
   required: ['url'],
   properties: {
-    url: { type: 'string', description: '应用代码仓库的 https 地址（例如 https://github.com/example/order-service.git），主机须已在 dsh-repo 中配置；也接受 file URL 或本机绝对路径，不接受 ssh 地址。' },
+    url: { type: 'string', description: '应用代码仓库的 https 地址（例如 https://github.com/example/order-service.git），主机须已在 dsh-repo 中配置；不接受 ssh 地址和本机路径。' },
     branch: { type: 'string', description: '要跟踪的远端分支；省略时跟随远端默认分支。' },
   },
 }
@@ -64,7 +65,7 @@ const OUTPUT_SCHEMA = {
   properties: {
     status: { type: 'string', enum: ['added', 'exists', 'rejected', 'cancelled', 'unavailable'] },
     url: { type: 'string' },
-    setup: { type: 'string', enum: ['ready', 'needs-setup', 'failed'] },
+    setup: { type: 'string', enum: ['ready', 'needs-setup', 'read-only', 'failed'] },
     repo: { type: 'object' },
   },
 } as const
@@ -88,31 +89,26 @@ export function renderAddRepoValue(value: AddRepoValue): ContentBlock[] {
     ? `应用「${repo.app.name}」（id: ${repo.app.id}）可用${commit}，可以用 /logalyze 分析它的日志。`
     : value.setup === 'needs-setup'
       ? `仓库已拉取${commit}，但还不能用：${repo?.error ?? '缺少应用描述'}。调用 ${INIT_REPO_TOOL_NAME} 起草应用描述和日志分析 SKILL；用户提供了样例日志时一并传入。`
-      : `仓库还不能用：${repo?.error ?? '拉取没有完成'}。https 私有仓库需要在 dsh-repo 插件页为该主机配置令牌，配置后观象自动重新拉取。`
+      : value.setup === 'read-only'
+        ? `仓库已拉取${commit}，但还不能用：${repo?.error ?? '缺少应用描述'}。它在 dsh-repo 仓库清单中的权限是「只读」，观象不能为它起草；请在 dsh-repo「代码仓库 → 仓库」把权限改为「可改代码」后再起草，或由仓库维护者自己添加应用描述和 SKILL。`
+        : `仓库还不能用：${repo?.error ?? '拉取没有完成'}。https 私有仓库需要在 dsh-repo 插件页为该主机配置令牌，配置后观象自动重新拉取。`
   return [{ type: 'text', text: `${head}${next}` }]
 }
 
 /** Collaborators of the tool. */
 export interface AddRepoDeps {
   readonly registry: RepoRegistry
-  /** DSH's approval service, when the composition has one. */
-  approval(): HostApproval | undefined
   /**
-   * Ask the `access/authorize` listeners whether the calling Session may
-   * change the repository catalog; rejects with the reason. Absent means every
-   * Session may.
-   */
-  authorize?(event: AuthorizeEvent): Promise<void>
-  /**
-   * Add the repository to the dsh-repo catalog with the log analysis feature, after this tool authorized and approved it.
+   * Add the repository to the dsh-repo catalog with the log analysis feature; dsh-repo authorizes and approves it for the Agent.
    * @returns `exists` when the feature was already on, and the address as the catalog stores it.
+   * @throws the dsh-repo failure, `declined` when the user did not approve.
    */
-  addRepo(spec: RepoSpec): Promise<{ readonly status: 'added' | 'exists'; readonly url: string }>
+  addRepo(spec: RepoSpec, caller: { readonly agent: Agent; readonly callId?: string; readonly signal: AbortSignal }): Promise<{ readonly status: 'added' | 'exists'; readonly url: string }>
 }
 
 /** Adds repositories from a conversation. */
 export class RepoAdder {
-  /** @param deps - registry, approval, and settings access. */
+  /** @param deps - registry and the catalog write. */
   constructor(private readonly deps: AddRepoDeps) {}
 
   /**
@@ -123,7 +119,7 @@ export class RepoAdder {
     return {
       name: ADD_REPO_TOOL_NAME,
       description: '观象：把一个应用代码仓库加入 dsh-repo 仓库清单、打开日志分析并等待拉取完成。用户要把仓库接入观象、用观象分析某个仓库的日志而它还没接入时使用。'
-        + '工具先请求用户授权；结果说明应用是否可用，缺少应用描述或 SKILL 时提示起草。',
+        + '只接受 https 地址；dsh-repo 可能先请用户批准。结果说明应用是否可用，缺少应用描述或 SKILL 时提示起草。',
       parameters: PARAMETERS,
       output: {
         schema: OUTPUT_SCHEMA,
@@ -139,7 +135,7 @@ export class RepoAdder {
    * @param rawArgs - model arguments.
    * @param exec - execution context of the calling agent.
    * @returns how the call ended and where the repository stands.
-   * @throws when the arguments are invalid, the address is configured with another branch, an `access/authorize` listener refused, no approval service is loaded, or dsh-repo refused the addition; nothing is written then.
+   * @throws when the arguments are invalid, the address is configured with another branch, or dsh-repo refused the addition (writes turned off, `access/authorize` refused, no approval service); nothing is written then.
    */
   async execute(rawArgs: unknown, exec: ToolRunContext): Promise<AddRepoValue> {
     const parsed = repoSchema.safeParse(rawArgs)
@@ -156,24 +152,15 @@ export class RepoAdder {
       return await this.settle('exists', spec.url, exec.signal)
     }
 
-    const branch = spec.branch === undefined ? '远端默认分支' : `分支 ${spec.branch}`
-    const zh = `观象将把 ${spec.url}（${branch}）加入 dsh-repo 仓库清单（新加入时权限为可改代码）并打开日志分析，之后派发的子 Agent 会读取它的代码。`
-    const en = `Logalyze will add ${spec.url} (${spec.branch ?? 'default branch'}) to the dsh-repo catalog (write access when new) with log analysis turned on; dispatched agents will read its code.`
-    await this.deps.authorize?.({ session: agent.session.header.id, level: 'admin', action: ADD_REPO_TOOL_NAME, summary: zh })
-    const approval = this.deps.approval()
-    if (approval === undefined) throw new Error('当前 DSH 组合没有审批服务（@deepseek-ai/dsh-user-approval），观象不会在未经授权时添加仓库')
-    const outcome = await approval.request({
-      agent,
-      toolName: ADD_REPO_TOOL_NAME,
-      ...exec.callId === undefined ? {} : { callId: exec.callId },
-      reason: zh,
-      displayReason: { en, zh },
-      signal: exec.signal,
-    })
-    if (outcome === 'cancelled') exec.signal.throwIfAborted()
-    if (outcome !== 'allowed-once') return { status: outcome, url: spec.url }
-    exec.signal.throwIfAborted()
-    const added = await this.deps.addRepo(spec)
+    let added: { readonly status: 'added' | 'exists'; readonly url: string }
+    try {
+      added = await this.deps.addRepo(spec, { agent, ...exec.callId === undefined ? {} : { callId: exec.callId }, signal: exec.signal })
+    } catch (error) {
+      const declined = declinedOutcome(error)
+      if (declined === 'cancelled') exec.signal.throwIfAborted()
+      if (declined !== undefined) return { status: declined, url: spec.url }
+      throw error
+    }
     return await this.settle(added.status, added.url, exec.signal)
   }
 
@@ -182,7 +169,9 @@ export class RepoAdder {
     await abortable(registry.syncUrls([url]), signal)
     const repo = registry.statusOf(url)
     if (repo === undefined) throw new Error(`仓库 ${url} 已不在 dsh-repo 仓库清单中，或没有打开日志分析`)
-    const setup: RepoSetup = repo.available ? 'ready' : registry.setupPending().includes(url) ? 'needs-setup' : 'failed'
+    const setup: RepoSetup = repo.available
+      ? 'ready'
+      : registry.setupPending().includes(url) ? 'needs-setup' : !repo.writable && repo.commit !== undefined && repo.phase !== 'syncing' ? 'read-only' : 'failed'
     return { status, url, setup, repo }
   }
 }

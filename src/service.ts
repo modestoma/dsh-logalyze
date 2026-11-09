@@ -12,13 +12,12 @@ import { CatalogFollower } from './apps/catalog.ts'
 import { RepoRegistry } from './apps/registry.ts'
 import type { LogalyzeConfig } from './config.ts'
 import { describeIssue } from './config.ts'
-import { authorize } from './deps/access.ts'
 import { DSH_REPOS_SERVICE, LOG_ANALYSIS_FEATURE, ReposClient } from './deps/repos.ts'
 import type { DshRepos } from './deps/repos-contract.ts'
 import { FEISHU_TOPICS_STATUS_EVENT } from './deps/topics-contract.ts'
 import { FEISHU_TOPICS_SERVICE, lookupTopics } from './deps/topics.ts'
 import { Dispatcher } from './dispatch/tool.ts'
-import type { HostApproval, HostContext, HostCredentials, ToolActivationContext, ToolDefinition, WorkingDirectoryService } from './host.ts'
+import type { HostContext, HostCredentials, ToolActivationContext, ToolDefinition, WorkingDirectoryService } from './host.ts'
 import { SkillViewer } from './improve/show.ts'
 import { SkillImprover } from './improve/tool.ts'
 import { RepoAdder } from './onboard/add.ts'
@@ -106,12 +105,7 @@ export class LogalyzeService {
     this.improver = new SkillImprover({ ...children, repos: this.repos })
     this.viewer = new SkillViewer({ registry: this.registry, repos: this.repos })
     this.dispatcher = new Dispatcher({ ...children, gaps: this.improver })
-    this.adder = new RepoAdder({
-      registry: this.registry,
-      approval: () => ctx.get?.('approval') as HostApproval | undefined,
-      authorize: event => authorize(ctx, event),
-      addRepo: spec => this.catalog.add(spec),
-    })
+    this.adder = new RepoAdder({ registry: this.registry, addRepo: (spec, caller) => this.catalog.add(spec, caller) })
     this.initializer = new RepoInitializer({ ...children, repos: this.repos })
     this.reports = new ReportTracker({
       store: new ReportStore(options.reportsDir ?? defaultReportsDir(), warn),
@@ -157,7 +151,7 @@ export class LogalyzeService {
       this.ctx.effect(() => this.ctx.tools.register(definition, { when: context => this.offers(context, condition) }), `logalyze: ${label} tool`)
     }
     register(this.dispatcher.definition(), hasApps, 'dispatch')
-    register(this.improver.definition(), () => this.settings.get().skillUpdates.enabled && hasApps(), 'skill improvement')
+    register(this.improver.definition(), () => this.settings.get().skillUpdates.enabled && this.registry.readyApps().some(ready => ready.writable), 'skill improvement')
     register(this.viewer.definition(), hasApps, 'skill view')
     register(this.adder.definition(), () => true, 'add repository')
     register(this.initializer.initDefinition(), () => this.registry.setupPending().length > 0, 'draft repository setup')

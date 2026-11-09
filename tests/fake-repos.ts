@@ -82,7 +82,7 @@ function acceptedAddress(url: string): boolean {
 /**
  * A local stand-in for the `dshRepos` service: bare git mirrors and
  * plain-file snapshots under `root`, and workspaces that are ordinary clones
- * of the remote, which must be a local repository. Switches cover host
+ * of the remote, which must be a local repository or stand in {@link origins}. Switches cover host
  * changes, stalled fetches, snapshot failures, declined or failing pushes,
  * and merge requests (none open unless {@link openMr} is set). The catalog is
  * {@link catalog}; {@link repoAdd} matches addresses exactly and records each
@@ -94,6 +94,8 @@ export class FakeRepos implements DshRepos {
   catalog: CatalogRepo[] = []
   /** Registered features by id. */
   readonly features = new Map<string, RepoFeature>()
+  /** Local repositories that stand in for remote addresses, by address; an address not listed is cloned as given. */
+  readonly origins = new Map<string, string>()
   /** Every {@link repoAdd} call, oldest first. */
   readonly addRepoCalls: RepoAddParams[] = []
   /** When set, {@link repoAdd} rejects with it. */
@@ -246,7 +248,7 @@ export class FakeRepos implements DshRepos {
     if ((await git(mirror, ['for-each-ref', `refs/heads/${branch}`])).trim() !== '') throw repoError('invalid', `远端已有分支 ${branch}，不能指定起始提交`)
     const baseCommit = await this.resolve(mirror, params.commit ?? base)
     await mkdir(dirname(path), { recursive: true })
-    await git(dirname(path), ['clone', '-q', '--no-checkout', repo, path])
+    await git(dirname(path), ['clone', '-q', '--no-checkout', this.origins.get(repo) ?? repo, path])
     await git(path, ['checkout', '-q', '-b', branch, baseCommit])
     const info: WorkspaceInfo = { repo, path, base, baseCommit, branch }
     this.workspaces.set(path, info)
@@ -329,7 +331,7 @@ export class FakeRepos implements DshRepos {
       if (await exists(dir)) await git(dir, ['fetch', '-q', '--prune', 'origin', '+refs/heads/*:refs/heads/*'])
       else {
         await mkdir(this.root, { recursive: true })
-        await git(this.root, ['clone', '-q', '--bare', url, dir])
+        await git(this.root, ['clone', '-q', '--bare', this.origins.get(url) ?? url, dir])
       }
     } catch (error) {
       throw repoError('unavailable', `同步镜像失败：${(error as Error).message}`)

@@ -1,4 +1,4 @@
-import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AnalyzeRequest } from '../src/analyze/contract.ts'
@@ -8,7 +8,8 @@ import type { SessionEventEnvelope } from '../src/host.ts'
 import { runCommand, uploadArgv } from '../src/report/command.ts'
 import type { CommandRunner } from '../src/report/command.ts'
 import { questionOf, renderReport, rewriteReply } from '../src/report/render.ts'
-import { reportIdOf, ReportStore } from '../src/report/store.ts'
+import { MAX_REPORT_RECORDS, REPORT_RETENTION_MS, reportIdOf, ReportStore } from '../src/report/store.ts'
+import type { ReportRecord } from '../src/report/store.ts'
 import { INTERRUPTED_REASON, ReportTracker, statusOfTurnEnd } from '../src/report/tracker.ts'
 import type { UploadSettings } from '../src/settings/contract.ts'
 import { tempDir } from './helpers.ts'
@@ -259,5 +260,54 @@ describe('report tracking', () => {
     await next.uploads(1)
     expect(next.runs[0]!.argv[6]).toBe(join(h.workDir, 'report'))
     expect(next.tracker.list()).toHaveLength(1)
+  })
+})
+
+describe('report retention', () => {
+  const DAY = 24 * 60 * 60 * 1000
+  const exists = async (path: string): Promise<boolean> => await access(path).then(() => true, () => false)
+  function record(key: string, acceptedAt: number, sectionAt?: number): ReportRecord {
+    return {
+      id: reportIdOf(key), key, logId: key, app: 'order-service', errorCode: 'E1', triggeredAt: '2026-10-28 09:30', acceptedAt,
+      sections: sectionAt === undefined ? [] : [{ kind: 'analysis', status: 'done', reply: '结论', files: [], at: sectionAt }],
+      turns: {}, snapshot: {}, warnings: [], revision: 0, uploadedRevision: 0,
+    }
+  }
+
+  it('drops records inactive past the retention period with their store-local report directories, and keeps busy ones', async () => {
+    const { dir, cleanup } = await tempDir()
+    cleanups.push(cleanup)
+    const store = new ReportStore(dir, () => {})
+    const now = 100 * DAY
+    await store.put(record('old', now - REPORT_RETENTION_MS - DAY))
+    await store.put(record('followed-up', now - REPORT_RETENTION_MS - DAY, now - DAY))
+    await store.put(record('busy', now - REPORT_RETENTION_MS - DAY))
+    await mkdir(join(dir, reportIdOf('old'), 'report'), { recursive: true })
+    expect(await store.prune(now, id => id === reportIdOf('busy'))).toEqual([reportIdOf('old')])
+    expect(store.all().map(item => item.key).sort()).toEqual(['busy', 'followed-up'])
+    expect(await exists(join(dir, `${reportIdOf('old')}.json`))).toBe(false)
+    expect(await exists(join(dir, reportIdOf('old')))).toBe(false)
+    const reloaded = new ReportStore(dir, () => {})
+    await reloaded.load()
+    expect(reloaded.all()).toHaveLength(2)
+  })
+
+  it('keeps the most recently active records up to the limit', async () => {
+    const { dir, cleanup } = await tempDir()
+    cleanups.push(cleanup)
+    const store = new ReportStore(dir, () => {})
+    for (let index = 0; index <= MAX_REPORT_RECORDS; index += 1) await store.put(record(`r${index}`, DAY + index))
+    expect(await store.prune(2 * DAY, () => false)).toEqual([reportIdOf('r0')])
+    expect(store.all()).toHaveLength(MAX_REPORT_RECORDS)
+  })
+
+  it('prunes when the tracker boots and when it accepts a new report', async () => {
+    const h = await harness()
+    await h.store.put(record('stale', Date.now() - REPORT_RETENTION_MS - DAY))
+    await h.tracker.boot()
+    expect(h.store.get(reportIdOf('stale'))).toBeUndefined()
+    await h.store.put(record('stale', Date.now() - REPORT_RETENTION_MS - DAY))
+    await h.tracker.track(REQUEST, 'req-1')
+    expect(h.store.all().map(item => item.key)).toEqual(['req-1'])
   })
 })

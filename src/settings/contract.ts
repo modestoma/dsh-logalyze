@@ -146,6 +146,8 @@ export interface RepoStatusWire {
   error?: string
   /** Whether the application is offered to intent recognition and dispatch. */
   available: boolean
+  /** Whether the catalog entry's access lets setups and SKILL improvements push; a read-only repository is only analyzed. */
+  writable: boolean
   /** Child analyses currently running in snapshots of this repository. */
   activeRuns: number
 }

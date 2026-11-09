@@ -1,7 +1,7 @@
 /**
  * 仓库接入初稿的起草与提交：
  *
- * - `logalyze_init_repo` 只接受已拉取但还没有可用应用的仓库：在运行目录
+ * - `logalyze_init_repo` 只接受已拉取但还没有可用应用、且在仓库清单中可写的仓库：在运行目录
  *   `.logalyze/runs/<runId>/init/repo/` 从最新同步提交创建工作区，推送分支为
  *   新的 `logalyze/init-<runId>`；以工作区为工作目录启动一个起草子 Agent，等待
  *   它结束后检查初稿并写出 diff，不推送任何东西。超时（`dispatchTimeoutMs`）或
@@ -285,6 +285,7 @@ export class RepoInitializer {
     const status = registry.statusOf(url)
     if (status === undefined) throw new Error(`${url} 不在观象的应用仓库列表中，先用 ${ADD_REPO_TOOL_NAME} 添加`)
     if (status.available) throw new Error(`${url} 的应用「${status.app?.id ?? ''}」已经可用；改进它的 SKILL 走派发结果中的 SKILL 改进`)
+    if (!status.writable) throw new Error(`${url} 在 dsh-repo 仓库清单中的权限是「只读」，不能推送接入草稿；请在 dsh-repo「代码仓库 → 仓库」把权限改为「可改代码」`)
     if (!registry.setupPending().includes(url)) throw new Error(`${url} 还不能起草：${status.error ?? status.phase}`)
     this.deps.repos.require()
     const settings = this.deps.settings()

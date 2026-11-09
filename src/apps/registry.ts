@@ -9,11 +9,13 @@
  * - dsh-repo 不可用或更新失败时继续使用已有提交，并在状态里给出原因；应用描述
  *   或 SKILL 不合法时该应用不可用。
  * - 多个仓库声明同一个应用 id 时，这些仓库全部不可用。
+ * - 记录每个仓库在清单中是否可写（权限「可改代码」或「可合并」）；只读仓库
+ *   照常分析，但不起草接入、不改进 SKILL。
  *
  * @module dsh-logalyze/apps/registry
  */
 
-import type { ReposClient } from '../deps/repos.ts'
+import type { AppRepo, ReposClient } from '../deps/repos.ts'
 import type { SnapshotLease } from '../deps/repos-contract.ts'
 import type { AppManifest, RepoSpec, RepoStatusWire } from '../settings/contract.ts'
 import { messageOf } from '../util/errors.ts'
@@ -35,6 +37,8 @@ export interface ReadyApp {
   readonly app: AppManifest
   readonly url: string
   readonly commit: string
+  /** Whether drafting setups and SKILL improvements may push to the repository. */
+  readonly writable: boolean
 }
 
 /** An application held by one dispatch, with the snapshot its child works in. */
@@ -51,6 +55,7 @@ export interface RepoLease {
 
 interface RepoEntry {
   readonly spec: RepoSpec
+  writable: boolean
   /** Commit the last successful sync read. */
   commit?: string
   app?: AppManifest
@@ -74,21 +79,22 @@ export class RepoRegistry {
 
   /**
    * Replace the configured repositories. An address keeps its status when its
-   * branch is unchanged.
+   * branch is unchanged; a change of access alone needs no sync.
    * @param repos - configured repositories.
    * @returns addresses that are new or changed and therefore need a sync.
    */
-  configure(repos: readonly RepoSpec[]): string[] {
+  configure(repos: readonly AppRepo[]): string[] {
     const previous = new Map(this.entries.map(entry => [entry.spec.url, entry]))
     const changed: string[] = []
-    this.entries = repos.map((spec) => {
+    this.entries = repos.map(({ writable, ...spec }) => {
       const kept = previous.get(spec.url)
       if (kept !== undefined && kept.spec.branch === spec.branch) {
         previous.delete(spec.url)
+        kept.writable = writable
         return kept
       }
       changed.push(spec.url)
-      return { spec: { ...spec }, activeRuns: 0, retired: false }
+      return { spec, writable, activeRuns: 0, retired: false }
     })
     for (const entry of previous.values()) entry.retired = true
     this.deps.onChange()
@@ -168,6 +174,7 @@ export class RepoRegistry {
         ...entry.app === undefined ? {} : { app: entry.app },
         ...error === undefined ? {} : { error },
         available: entry.app !== undefined && conflict === undefined,
+        writable: entry.writable,
         activeRuns: entry.activeRuns,
       }
     })
@@ -184,7 +191,7 @@ export class RepoRegistry {
     for (const entry of this.entries) {
       if (entry.app === undefined || entry.commit === undefined) continue
       if ((duplicates.get(entry.app.id)?.length ?? 0) > 1) continue
-      ready.push({ entry, ready: { app: entry.app, url: entry.spec.url, commit: entry.commit } })
+      ready.push({ entry, ready: { app: entry.app, url: entry.spec.url, commit: entry.commit, writable: entry.writable } })
     }
     return ready
   }
@@ -252,12 +259,13 @@ export class RepoRegistry {
   }
 
   /**
-   * Addresses that synced but have no application: the description or its
-   * SKILL is missing or invalid at the latest synced commit.
+   * Writable addresses that synced but have no application: the description
+   * or its SKILL is missing or invalid at the latest synced commit, and a
+   * drafted setup can be pushed.
    * @returns those addresses, ordered as configured.
    */
   setupPending(): string[] {
-    return this.entries.filter(entry => entry.commit !== undefined && entry.app === undefined && entry.syncing === undefined).map(entry => entry.spec.url)
+    return this.entries.filter(entry => entry.writable && entry.commit !== undefined && entry.app === undefined && entry.syncing === undefined).map(entry => entry.spec.url)
   }
 
   /**

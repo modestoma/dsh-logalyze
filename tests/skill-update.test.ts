@@ -176,7 +176,7 @@ async function setup(endTurn = true): Promise<Setup> {
   }
   const repos = fakeRepos(join(root, 'mirrors'))
   const registry = new RepoRegistry({ repos: new ReposClient(() => repos.service), onChange: () => {} })
-  registry.configure([{ url: origin }])
+  registry.configure([{ url: origin, writable: true }])
   await registry.syncAll()
   const [ready] = registry.readyApps()
   const { service, started } = fakeSubagents()
@@ -468,6 +468,9 @@ describe('logalyze_improve_skill', () => {
     await rm(join(task.workDir, 'skill-gap.md'))
     await expect(improver.execute(args, exec)).rejects.toThrow('本会话中应用「order-service」没有待改进的 skill-gap.md 记录，需要在 feedback 中写明')
     await expect(improver.execute({ ...args, workDirs: [task.workDir] }, exec)).rejects.toThrow('没有待改进的 skill-gap.md 记录')
+    // A repository the catalog lists as read-only takes no improvement.
+    registry.configure([{ url: task.url, writable: false }])
+    await expect(improver.execute({ ...args, feedback: 'x' }, exec)).rejects.toThrow('权限是「只读」')
     expect(started).toHaveLength(0)
     expect(repos.workspacePush).not.toHaveBeenCalled()
   })

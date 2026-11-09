@@ -56,7 +56,7 @@ function cell(text: string): string {
  */
 export function renderCatalog(apps: readonly AppManifest[]): string {
   if (apps.length === 0) {
-    return `当前没有可用的应用，不要自行分析日志。用户给出了应用代码仓库的 https 地址时，用 \`${ADD_REPO_TOOL_NAME}\` 添加并按工具结果继续；否则请用户提供仓库的 https 地址（不支持 ssh 地址），或在 DSH Web 左侧栏「观象」面板的「应用仓库」中添加，然后结束本次回复。`
+    return `当前没有可用的应用，不要自行分析日志。用户给出了应用代码仓库的 https 地址时，用 \`${ADD_REPO_TOOL_NAME}\` 添加并按工具结果继续；否则请用户提供仓库的 https 地址（不支持 ssh 地址和本机路径），或在 dsh-repo 的「代码仓库 → 仓库」中添加仓库并打开「日志分析」，然后结束本次回复。`
   }
   const rows = apps.map(app => `| \`${app.id}\` | ${cell(app.name)} | ${cell(app.description)} | ${cell(app.aliases.join('、') || '—')} | ${cell(app.logHints.map(hint => `\`${hint}\``).join(' ') || '—')} |`)
   return ['| 应用 id | 名称 | 描述 | 别名 | 日志特征 |', '| --- | --- | --- | --- | --- |', ...rows].join('\n')
@@ -64,7 +64,7 @@ export function renderCatalog(apps: readonly AppManifest[]): string {
 
 function improveStep(): string {
   return `
-5. **SKILL 改进。** 改进由 \`${IMPROVE_TOOL_NAME}\` 完成：改进子 Agent 修改 SKILL（需要时把问题整理为案例写入 SKILL 的 \`cases/\` 目录），观象推送到新分支并创建合并请求，整个过程需要几分钟。调用工具即视为用户已同意，工具不再询问，所以只在用户明确同意后调用。SKILL 改进一律通过这个工具，不要自己修改或推送 SKILL 文件。
+5. **SKILL 改进。** 改进由 \`${IMPROVE_TOOL_NAME}\` 完成：改进子 Agent 修改 SKILL（需要时把问题整理为案例写入 SKILL 的 \`cases/\` 目录），观象推送到新分支并创建合并请求，整个过程需要几分钟。只在用户于对话中明确同意后调用；推送前可能还会弹出审批请用户再批准一次，用户在那里拒绝时如实说明没有提交。仓库为只读的应用不能改进（工具会拒绝并说明原因）。SKILL 改进一律通过这个工具，不要自己修改或推送 SKILL 文件。
    - **先给结论，改进放到下一回合。** 派发结果中某个应用标出「SKILL 不足」时，照常写完汇总回复，在末尾另起一节「SKILL 改进建议」：每个这样的应用用一两句说明子 Agent 认为 SKILL 哪里不足、建议怎么改，然后问用户是否改进，结束本回合。这一回合不要调用工具（工具会拒绝）。
    - **用户同意后，每个应用调用一次。** 用户在之后的消息里同意时，为每个要改的应用调用一次工具，传 \`app\`；工具会自动带上本会话中该应用记录了不足、还没改进过的全部分析，所以同一应用的多个改进点只调用一次。用户同时补充了纠正或要求时写进 \`feedback\`。用户只同意其中一部分应用时，只为这些应用调用。
    - **用户主动纠正 SKILL 时**（不论本会话是否分析过）：先用 \`${SHOW_TOOL_NAME}\` 查看现有 SKILL 的相关内容，和用户确认哪部分不对、正确的做法是什么、有没有样例日志；信息不足时追问，一次只问最关键的一两点。问清并且用户同意改进后调用工具：传 \`app\` 和 \`feedback\`（用户的纠正，尽量保留原话）；纠正针对的是某次没有标出不足的分析时，把那次的运行目录放进 \`workDirs\`；用户给了日志时放进 \`logs\`。

@@ -6,8 +6,6 @@ describe('git address policy', () => {
   it.each([
     'https://github.com/example/pay-service.git',
     'https://gitlab.example.com:8443/team/app.git',
-    'file:///srv/git/app.git',
-    '/srv/git/app',
   ])('accepts %s', (url) => {
     expect(isAcceptedGitUrl(url)).toBe(true)
   })
@@ -21,6 +19,8 @@ describe('git address policy', () => {
     '--upload-pack=touch /tmp/x',
     'relative/path',
     'ftp://example.com/a.git',
+    'file:///srv/git/app.git',
+    '/srv/git/app',
     '',
   ])('refuses %s', (url) => {
     expect(isAcceptedGitUrl(url)).toBe(false)

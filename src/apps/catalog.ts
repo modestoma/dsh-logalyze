@@ -5,14 +5,14 @@
  *   时重新读清单并全部重新拉取，启动时已经拉取过的同一个实例不再重拉。
  * - 清单变化时只拉取新增或改了分支的仓库；主机、令牌或镜像目录变化时全部
  *   重新拉取，新令牌不用手动同步就能生效。
- * - 在对话中添加仓库经 dsh-repo 写入清单，新条目权限为「可改代码」。
+ * - 在对话中添加仓库经 dsh-repo 写入清单（由 dsh-repo 授权和审批），新条目权限为「可改代码」。
  *
  * @module dsh-logalyze/apps/catalog
  */
 
 import { LOG_ANALYSIS_FEATURE } from '../deps/repos.ts'
 import type { ReposClient } from '../deps/repos.ts'
-import type { DshRepos } from '../deps/repos-contract.ts'
+import type { CallerAgent, DshRepos } from '../deps/repos-contract.ts'
 import type { RepoSpec } from '../settings/contract.ts'
 import { messageOf } from '../util/errors.ts'
 import type { RepoRegistry } from './registry.ts'
@@ -91,14 +91,23 @@ export class CatalogFollower {
    * Add one repository to the dsh-repo catalog with the log analysis feature
    * turned on, or turn the feature on for the entry holding it. A new entry
    * gets `write` access, which drafting setups and SKILL improvements push
-   * with; an existing entry keeps its access. The caller has authorized and
-   * approved the change, so dsh-repo is called without an Agent and asks nothing.
+   * with; an existing entry keeps its access. dsh-repo authorizes and, while
+   * its settings say so, asks the Agent's user to approve.
    * @param spec - validated repository.
+   * @param caller - the Agent the change is made for, its tool call, and cancellation.
    * @returns `exists` when the catalog already had the feature on for it, and the address as the catalog stores it.
-   * @throws the dsh-repo failure (`conflict` for another branch, `not-allowed`), or when dsh-repo is missing or incompatible.
+   * @throws the dsh-repo failure (`declined`, `forbidden`, `conflict` for another branch, `not-allowed`), or when dsh-repo is missing or incompatible.
    */
-  async add(spec: RepoSpec): Promise<{ readonly status: 'added' | 'exists'; readonly url: string }> {
-    const result = await this.deps.repos.require().repoAdd({ repo: spec.url, ...spec.branch === undefined ? {} : { branch: spec.branch }, access: 'write', features: [LOG_ANALYSIS_FEATURE.id] })
+  async add(spec: RepoSpec, caller: { readonly agent: CallerAgent; readonly callId?: string; readonly signal: AbortSignal }): Promise<{ readonly status: 'added' | 'exists'; readonly url: string }> {
+    const result = await this.deps.repos.require().repoAdd({
+      repo: spec.url,
+      ...spec.branch === undefined ? {} : { branch: spec.branch },
+      access: 'write',
+      features: [LOG_ANALYSIS_FEATURE.id],
+      agent: caller.agent,
+      ...caller.callId === undefined ? {} : { callId: caller.callId },
+      signal: caller.signal,
+    })
     // The catalog listener has configured the registry already unless it was not subscribed yet.
     if (!this.deps.registry.has(result.repo.url)) this.deps.registry.configure(await this.deps.repos.appRepos())
     return { status: result.status === 'unchanged' ? 'exists' : 'added', url: result.repo.url }

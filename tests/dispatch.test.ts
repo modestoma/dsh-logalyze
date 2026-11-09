@@ -64,7 +64,7 @@ async function setup(overrides: Partial<EditableSettings> = {}, gaps = false) {
     download: { allowedHosts: ['127.0.0.1'], maxBytes: 1024, timeoutMs: 5000 },
     ...overrides,
   }
-  registry.configure([{ url: origin }])
+  registry.configure([{ url: origin, writable: true }])
   await registry.syncAll()
   const { service, started } = fakeSubagents()
   const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: new ReposClient(() => repos) })
@@ -153,6 +153,17 @@ describe('logalyze_dispatch', () => {
     const text = renderDispatchValue(value)[0]?.text
     expect(text).toContain(`SKILL 不足（记录在 ${join(workDir, 'skill-gap.md')}）：SKILL 没写 traceId 字段 靠 grep 找到的`)
     expect(text).toContain('在汇总回复末尾的「SKILL 改进建议」中用一两句说明，并问用户是否改进。本回合不要调用 logalyze_improve_skill（工具会拒绝）；用户同意后再调用，app 为 order-service。')
+  })
+
+  it('does not ask children of read-only repositories to record SKILL gaps', async () => {
+    const { project, dispatcher, started, parent, registry } = await setup({ skillUpdates: { enabled: true, maxFiles: 4, maxFileBytes: 65536 } }, true)
+    const { url } = registry.status()[0]!
+    registry.configure([{ url, writable: false }])
+    const running = dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ path: join(project, 'sample-logs', 'order-service.log') }] }] }, { signal: new AbortController().signal, agent: parent })
+    await waitForStarts(started, 1)
+    expect(started[0]?.spec.prompt[0]?.text).not.toContain('skill-gap.md')
+    started[0]?.settle({ stopReason: 'completed', output: [{ type: 'text', text: '结论' }] })
+    expect((await running).results[0]?.skillGap).toBeUndefined()
   })
 
   it('reports a gap record that cannot be read instead of offering it', async () => {

@@ -321,6 +321,7 @@ function ReposTab({ state, busy, openRepoSettings, onSync }: LogalyzePageProps &
                 <span className="lz__mono">{repo.url}</span>
                 {repo.branch === undefined ? null : <span className="lz__tag">{repo.branch}</span>}
                 {phasePill(repo)}
+                {repo.writable ? null : <span className="lz__pill" title="dsh-repo 中权限为只读：只分析，不起草接入、不改进 SKILL">只读</span>}
               </div>
               {repo.app !== undefined
                 ? <div className="lz__rowSummary">{repo.app.name}（<span className="lz__mono">{repo.app.id}</span>）· SKILL <span className="lz__mono">/{repo.app.skill}</span>{repo.activeRuns > 0 ? ` · ${repo.activeRuns} 个分析进行中` : ''}</div>
