@@ -165,10 +165,10 @@ export interface SubagentStartRequest {
 export interface SubagentService {
   getProvider(name: string): unknown
   resolveMaxDepth(configured?: number | 'provider-managed'): number | undefined
-  startActivation(spec: {
+  /** Starts one child; the start request fields sit beside `provider` and `label` in one flat spec. */
+  startActivation(spec: SubagentStartRequest & {
     readonly provider: string
     readonly label: string
-    readonly request: SubagentStartRequest
     readonly signal: AbortSignal
     readonly delivery: 'parent' | 'caller'
   }): Promise<SubagentActivation>

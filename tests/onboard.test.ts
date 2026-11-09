@@ -211,7 +211,7 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
       startActivation: async (spec) => {
         const dispose = vi.fn(async () => {})
         started.push({ spec, dispose })
-        const result = work(dirname(spec.request.cwd)).then((): SubagentResult => ({ stopReason: 'completed', output: [{ type: 'text', text: '应用 order-service，SKILL order-logs' }], ...outcome }))
+        const result = work(dirname(spec.cwd)).then((): SubagentResult => ({ stopReason: 'completed', output: [{ type: 'text', text: '应用 order-service，SKILL order-logs' }], ...outcome }))
         const activation: SubagentActivation = { childId: 'child-1', result, dispose }
         return activation
       },
@@ -273,10 +273,10 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     })
     expect(await readFile(join(workDir, 'changes.diff'), 'utf8')).toContain('+skill: order-logs')
     const [started] = children.started
-    expect(started?.spec).toMatchObject({ provider: 'spawn', label: '观象接入起草', delivery: 'caller', request: { parent: agent, maxDepth: 1 } })
-    expect(started?.spec.request.cwd).toBe(join(workDir, 'repo'))
+    expect(started?.spec).toMatchObject({ provider: 'spawn', label: '观象接入起草', delivery: 'caller', parent: agent, maxDepth: 1 })
+    expect(started?.spec.cwd).toBe(join(workDir, 'repo'))
     expect(repos.creates).toEqual([{ repo: origin, path: join(workDir, 'repo'), commit: value.commit, branch: `logalyze/init-${workDir.split('/').at(-2)}`, agent, callId: 'call-2', signal: exec.signal }])
-    expect(started?.spec.request.prompt[0]?.text).toContain('支付回调最常出问题')
+    expect(started?.spec.prompt[0]?.text).toContain('支付回调最常出问题')
     expect(started?.dispose).toHaveBeenCalled()
     expect(renderInitRepoValue(value)[0]?.text).toContain(`调用 logalyze_submit_init（workDir 为 ${workDir}）`)
     expect(initializer.hasDraft('parent')).toBe(true)
