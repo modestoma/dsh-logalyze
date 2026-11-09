@@ -8,10 +8,9 @@ import { renderAddRepoValue, RepoAdder } from '../src/onboard/add.ts'
 import { checkInitDraft } from '../src/onboard/draft.ts'
 import { renderInitRepoValue, renderSubmitInitValue, RepoInitializer } from '../src/onboard/init.ts'
 import { renderInitPrompt } from '../src/onboard/prompt.ts'
-import type { ChangeCreate } from '../src/repos/contract.ts'
 import { RepoRegistry } from '../src/repos/registry.ts'
 import type { EditableSettings, RepoSpec } from '../src/settings/contract.ts'
-import { FakeRepos } from './fake-repos.ts'
+import { declinedError, FakeRepos } from './fake-repos.ts'
 import { createAppRepo, EXAMPLE_APP, git, tempDir } from './helpers.ts'
 
 const cleanups: (() => Promise<void>)[] = []
@@ -67,7 +66,7 @@ describe('logalyze_add_repo', () => {
     const repos = new FakeRepos(join(root, 'mirrors'))
     const registry = new RepoRegistry({ repos: () => repos, onChange: () => {} })
     const configured: RepoSpec[] = []
-    const addRepo = vi.fn(async (spec: RepoSpec, _session: string) => {
+    const addRepo = vi.fn(async (spec: RepoSpec) => {
       configured.push(spec)
       void registry.syncUrls(registry.configure(configured))
       return { status: 'added' as const, url: spec.url }
@@ -103,7 +102,7 @@ describe('logalyze_add_repo', () => {
 
     answer.value = 'allowed-once'
     const added = await adder.execute({ url: ready }, run())
-    expect(addRepo).toHaveBeenCalledWith({ url: ready }, 'parent')
+    expect(addRepo).toHaveBeenCalledWith({ url: ready })
     expect(added).toMatchObject({ status: 'added', setup: 'ready', repo: { phase: 'ready', app: { id: 'order-service' } } })
     expect(renderAddRepoValue(added)[0]?.text).toContain('应用「订单服务」（id: order-service）可用')
 
@@ -155,9 +154,8 @@ describe('init drafts', () => {
       git(origin, 'commit', '-qm', 'ignore')
     }
     const repos = new FakeRepos(join(root, 'mirrors'))
-    const head = await repos.syncMirror(origin)
     const workDir = join(root, 'project', '.logalyze', 'runs', 'r1', 'init')
-    await repos.openWorkspace(origin, { dir: join(workDir, 'repo'), baseBranch: head.branch, commit: head.commit })
+    await repos.workspaceCreate({ repo: origin, path: join(workDir, 'repo'), branch: 'logalyze/init-r1', agent: parent })
     return { repos, workDir }
   }
 
@@ -229,15 +227,13 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     const project = join(root, 'project')
     await mkdir(project, { recursive: true })
     const repos = new FakeRepos(join(root, 'mirrors'))
-    const createChange = vi.fn(async (_repo: string, _change: ChangeCreate) => ({ webUrl: MR_URL }))
-    Object.assign(repos, { createChange })
-    const pushWorkspace = vi.spyOn(repos, 'pushWorkspace')
+    const openMr = vi.fn(async (_input: Parameters<NonNullable<FakeRepos['openMr']>>[0]) => ({ number: 3, webUrl: MR_URL }))
+    repos.openMr = openMr
+    const workspacePush = vi.spyOn(repos, 'workspacePush')
     const settings: EditableSettings = { ...defaultsOf(resolveConfig({})), skillUpdates: { enabled: false, maxFiles: 8, maxFileBytes: 65536 } }
     const registry = new RepoRegistry({ repos: () => repos, onChange: () => {} })
     registry.configure([{ url: origin }, { url: other }, ...duplicates])
     await registry.syncAll()
-    const answer = { value: 'allowed-once' as ApprovalOutcome }
-    const approval = approvalWith(answer)
     const children = subagents(work, outcome)
     const initializer = new RepoInitializer({
       registry,
@@ -245,18 +241,17 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
       provider: 'spawn',
       settings: () => settings,
       workingDirectory: () => undefined,
-      approval: () => approval,
       repos: () => repos,
       now: () => new Date(2026, 9, 31, 21, 0, 0),
     })
     const agent: Agent = { id: 'parent', session: { header: { id: 'parent', cwd: project } } }
-    return { origin, other, project, repos, createChange, pushWorkspace, registry, answer, approval, children, initializer, agent }
+    return { origin, other, project, repos, openMr, workspacePush, registry, children, initializer, agent }
   }
 
   const goodDraft = (workDir: string) => writeDraft(workDir, { '.agents/logalyze.yaml': MANIFEST, '.agents/skills/order-logs/SKILL.md': SKILL, '.agents/skills/order-logs/references/payment.md': '# 支付回调\n' })
 
-  it('drafts in a workspace, checks the draft, then pushes it to a new branch and opens a merge request after approval', async () => {
-    const { origin, project, repos, createChange, pushWorkspace, registry, answer, approval, children, initializer, agent } = await setup(goodDraft)
+  it('drafts in a workspace, checks the draft, then pushes it to a new branch with a merge request through dsh-repo', async () => {
+    const { origin, project, repos, openMr, workspacePush, registry, children, initializer, agent } = await setup(goodDraft)
     const exec = { signal: new AbortController().signal, agent, callId: 'call-2' }
     expect(registry.setupPending()).toEqual([origin])
     expect(initializer.hasDraft('parent')).toBe(false)
@@ -280,24 +275,25 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     const [started] = children.started
     expect(started?.spec).toMatchObject({ provider: 'spawn', label: '观象接入起草', delivery: 'caller', request: { parent: agent, maxDepth: 1 } })
     expect(started?.spec.request.cwd).toBe(join(workDir, 'repo'))
+    expect(repos.creates).toEqual([{ repo: origin, path: join(workDir, 'repo'), commit: value.commit, branch: `logalyze/init-${workDir.split('/').at(-2)}`, agent, callId: 'call-2', signal: exec.signal }])
     expect(started?.spec.request.prompt[0]?.text).toContain('支付回调最常出问题')
     expect(started?.dispose).toHaveBeenCalled()
     expect(renderInitRepoValue(value)[0]?.text).toContain(`调用 logalyze_submit_init（workDir 为 ${workDir}）`)
     expect(initializer.hasDraft('parent')).toBe(true)
 
-    answer.value = 'rejected'
+    // dsh-repo asks the user; a declined push pushes nothing and can be submitted again.
+    repos.pushError = declinedError('rejected')
     const rejected = await initializer.submit({ workDir }, exec)
-    expect(rejected).toMatchObject({ status: 'rejected', app: 'billing-service', target: 'main' })
-    expect(rejected.branch).toMatch(/^logalyze\/init-billing-service-[0-9a-f]{10}$/)
-    expect(approval.requests[0]?.displayReason?.zh).toContain('接入应用「订单服务」（billing-service）')
-    expect(pushWorkspace).not.toHaveBeenCalled()
+    expect(rejected).toMatchObject({ status: 'rejected', app: 'billing-service', target: 'main', branch: repos.creates[0]?.branch })
+    expect(repos.pushes).toEqual([])
     expect(renderSubmitInitValue(rejected)[0]?.text).toContain('可以手动提交')
 
-    answer.value = 'allowed-once'
+    repos.pushError = undefined
     const opened = await initializer.submit({ workDir }, exec)
     expect(opened).toMatchObject({ status: 'opened', mergeRequestUrl: MR_URL, branch: rejected.branch })
-    expect(pushWorkspace).toHaveBeenCalledWith(join(workDir, 'repo'), expect.objectContaining({ branch: opened.branch, session: 'parent' }))
+    expect(workspacePush).toHaveBeenLastCalledWith({ path: join(workDir, 'repo'), message: expect.any(String), mr: { title: 'chore: 接入观象日志分析：订单服务（billing-service）', body: expect.stringContaining('合并后观象下一次加载 /logalyze 时启用该应用') }, agent, callId: 'call-2', signal: exec.signal })
     const [push] = repos.pushes
+    expect(push?.session).toBe('parent')
     expect(push?.files).toEqual({
       '.agents/logalyze.yaml': MANIFEST,
       '.agents/skills/order-logs/SKILL.md': SKILL,
@@ -305,34 +301,16 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     })
     expect(push?.message).toMatch(new RegExp(`^chore: 接入观象日志分析：订单服务（billing-service）\\n\\n按 Controller[\\s\\S]*Base-commit: ${value.commit}\\n`))
     expect(git(origin, 'rev-parse', `${opened.branch}^`).trim()).toBe(value.commit)
-    expect(createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ title: 'chore: 接入观象日志分析：订单服务（billing-service）', sourceBranch: opened.branch, targetBranch: 'main' }))
+    expect(openMr).toHaveBeenCalledWith(expect.objectContaining({ repo: origin, branch: opened.branch, base: 'main', title: 'chore: 接入观象日志分析：订单服务（billing-service）' }))
     expect(renderSubmitInitValue(opened)[0]?.text).toContain('合并后观象下一次加载 /logalyze 时启用应用 billing-service')
 
-    // The workspace already pushed its branch; submitting again neither asks nor pushes.
+    // The draft was pushed; submitting again does not push.
     const again = await initializer.submit({ workDir }, exec)
     expect(again).toMatchObject({ status: 'exists', branch: opened.branch })
-    expect(approval.request).toHaveBeenCalledTimes(2)
-    expect(pushWorkspace).toHaveBeenCalledTimes(1)
+    expect(workspacePush).toHaveBeenCalledTimes(2)
+    expect(repos.pushes).toHaveLength(1)
     await expect(initializer.submit({ workDir }, { ...exec, agent: { id: 'x', session: { header: { id: 'other' } } } })).rejects.toThrow('不是当前会话起草的任务')
     await expect(initializer.submit({ workDir: join(project, 'nope') }, exec)).rejects.toThrow('不是本次 DSH 运行中观象起草任务的运行目录')
-  })
-
-  it('does not push when the workspace changed while the user was deciding', async () => {
-    const { origin, pushWorkspace, approval, initializer, agent } = await setup(goodDraft)
-    const exec = { signal: new AbortController().signal, agent, callId: 'call-3' }
-    const { workDir } = await initializer.draft({ url: origin }, exec)
-    approval.request.mockImplementationOnce(async () => {
-      await writeFile(join(workDir, 'repo', 'pom.xml'), '<project/>')
-      return 'allowed-once'
-    })
-    await expect(initializer.submit({ workDir }, exec)).rejects.toThrow('工作区改动了 pom.xml')
-    await rm(join(workDir, 'repo', 'pom.xml'))
-    approval.request.mockImplementationOnce(async () => {
-      await writeFile(join(workDir, 'repo', '.agents', 'skills', 'order-logs', 'references', 'payment.md'), '# 支付回调（改）\n')
-      return 'allowed-once'
-    })
-    await expect(initializer.submit({ workDir }, exec)).rejects.toThrow('等待授权期间工作区的改动变了')
-    expect(pushWorkspace).not.toHaveBeenCalled()
   })
 
   it('reports a draft that cannot be submitted', async () => {

@@ -125,7 +125,7 @@ export class LogalyzeService {
       registry: this.registry,
       approval: () => ctx.get?.('approval') as HostApproval | undefined,
       authorize: event => authorize(ctx, event),
-      addRepo: (spec, session) => this.addRepo(spec, session),
+      addRepo: spec => this.addRepo(spec),
     })
     this.initializer = new RepoInitializer({
       registry: this.registry,
@@ -133,7 +133,6 @@ export class LogalyzeService {
       provider: config.subagentProvider,
       settings: () => this.current,
       workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
-      approval: () => ctx.get?.('approval') as HostApproval | undefined,
       repos: () => ctx.get?.(DSH_REPOS_SERVICE),
       ...options.fetch === undefined ? {} : { fetch: options.fetch },
     })
@@ -155,7 +154,7 @@ export class LogalyzeService {
         if (inRunDirectory(cwd)) return true
         const lookup = lookupRepos(ctx.get?.(DSH_REPOS_SERVICE))
         if (lookup.availability !== 'ready') return false
-        const mirrors = lookup.service.mirrorSettings().dir
+        const mirrors = lookup.service.settingsGet().mirrorDir
         return mirrors !== undefined && isInside(cwd, mirrors)
       },
     })
@@ -271,7 +270,7 @@ export class LogalyzeService {
     await this.reports.boot().catch((error: unknown) => {
       this.ctx.logger?.error?.('logalyze: 读取回传记录失败：%s', messageOf(error))
     })
-    this.registry.configure(this.catalogRepos())
+    this.registry.configure(await this.catalogRepos())
     await this.registry.syncAll()
   }
 
@@ -280,10 +279,10 @@ export class LogalyzeService {
    * log analysis feature turned on, following the catalog branch. Empty while
    * dsh-repo is missing or incompatible.
    */
-  private catalogRepos(): RepoSpec[] {
+  private async catalogRepos(): Promise<RepoSpec[]> {
     const lookup = lookupRepos(this.ctx.get?.(DSH_REPOS_SERVICE))
     if (lookup.availability !== 'ready') return []
-    return lookup.service.listRepos({ feature: LOG_ANALYSIS_FEATURE.id }).map(repo => repo.branch === undefined ? { url: repo.url } : { url: repo.url, branch: repo.branch })
+    return (await lookup.service.repoList({ feature: LOG_ANALYSIS_FEATURE.id })).map(repo => repo.branch === undefined ? { url: repo.url } : { url: repo.url, branch: repo.branch })
   }
 
   /**
@@ -294,7 +293,7 @@ export class LogalyzeService {
   async reposAvailable(): Promise<void> {
     await this.booted.promise
     if (!this.active) return
-    this.registry.configure(this.catalogRepos())
+    this.registry.configure(await this.catalogRepos())
     await this.registry.resyncAll()
   }
 
@@ -307,14 +306,14 @@ export class LogalyzeService {
    * @returns disposer that withdraws the feature and stops watching.
    */
   watchRepos(repos: DshRepos): () => void {
-    const unregister = repos.registerFeature(LOG_ANALYSIS_FEATURE)
-    const stopCatalog = repos.onReposChange(() => {
+    const unregister = repos.featureRegister(LOG_ANALYSIS_FEATURE)
+    const stopCatalog = repos.repoOnChange(() => {
       if (!this.active) return
-      void this.registry.syncUrls(this.registry.configure(this.catalogRepos())).catch((error: unknown) => {
+      void this.catalogRepos().then(specs => this.active ? this.registry.syncUrls(this.registry.configure(specs)) : undefined).catch((error: unknown) => {
         this.ctx.logger?.error?.('logalyze: 仓库清单变更后同步仓库失败：%s', messageOf(error))
       })
     })
-    const stopHosts = repos.onHostsChange(() => {
+    const stopHosts = repos.hostOnChange(() => {
       if (!this.active) return
       void this.registry.resyncAll().catch((error: unknown) => {
         this.ctx.logger?.error?.('logalyze: 主机变更后同步仓库失败：%s', messageOf(error))
@@ -431,8 +430,8 @@ export class LogalyzeService {
   private reposState(): ReposWire {
     const lookup = lookupRepos(this.ctx.get?.(DSH_REPOS_SERVICE))
     if (lookup.availability !== 'ready') return { availability: lookup.availability }
-    const mirror = lookup.service.mirrorSettings()
-    return { availability: 'ready', ...mirror.dir === undefined ? {} : { mirrorDir: mirror.dir }, ...mirror.problem === undefined ? {} : { mirrorProblem: mirror.problem } }
+    const settings = lookup.service.settingsGet()
+    return { availability: 'ready', ...settings.mirrorDir === undefined ? {} : { mirrorDir: settings.mirrorDir }, ...settings.mirrorProblem === undefined ? {} : { mirrorProblem: settings.mirrorProblem } }
   }
 
   /**
@@ -489,19 +488,18 @@ export class LogalyzeService {
    * Add one repository to the dsh-repo catalog with the log analysis feature
    * turned on, or turn the feature on for the entry holding it. A new entry
    * gets `write` access, which drafting setups and SKILL improvements push
-   * with; an existing entry keeps its access. dsh-repo asks `access/authorize`
-   * (level `admin`) for the Session before it changes the catalog, and the
-   * catalog change reconfigures the registry.
+   * with; an existing entry keeps its access. The caller has authorized and
+   * approved the change, so dsh-repo is called without an Agent and asks
+   * nothing; the catalog change reconfigures the registry.
    * @param spec - validated repository.
-   * @param session - the calling Session.
    * @returns `exists` when the catalog already had the feature on for it, and the address as the catalog stores it.
-   * @throws the dsh-repo failure (`conflict` for another branch, `forbidden`, `not-allowed`), or when dsh-repo is missing or incompatible.
+   * @throws the dsh-repo failure (`conflict` for another branch, `not-allowed`), or when dsh-repo is missing or incompatible.
    */
-  async addRepo(spec: RepoSpec, session: string): Promise<{ readonly status: 'added' | 'exists'; readonly url: string }> {
+  async addRepo(spec: RepoSpec): Promise<{ readonly status: 'added' | 'exists'; readonly url: string }> {
     const repos = requireRepos(this.ctx.get?.(DSH_REPOS_SERVICE))
-    const result = await repos.addRepo(spec.url, { ...spec.branch === undefined ? {} : { branch: spec.branch }, access: 'write', features: [LOG_ANALYSIS_FEATURE.id], session })
+    const result = await repos.repoAdd({ repo: spec.url, ...spec.branch === undefined ? {} : { branch: spec.branch }, access: 'write', features: [LOG_ANALYSIS_FEATURE.id] })
     // The catalog listener has configured the registry already unless it was not subscribed yet.
-    if (!this.registry.has(result.repo.url)) this.registry.configure(this.catalogRepos())
+    if (!this.registry.has(result.repo.url)) this.registry.configure(await this.catalogRepos())
     return { status: result.status === 'unchanged' ? 'exists' : 'added', url: result.repo.url }
   }
 

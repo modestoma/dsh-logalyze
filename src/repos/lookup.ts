@@ -1,7 +1,7 @@
 /**
- * `dshRepos` 服务的查找。观象经它维护应用仓库的本地镜像和只读快照、在主机或
- * 令牌变更后重新拉取，并在可写工作区中起草 SKILL 改进与接入初稿、推送到新分支、
- * 创建合并请求（GitLab MR 或 GitHub PR）。
+ * `dshRepos` 服务的查找。观象经它读取应用仓库的只读快照、在主机或令牌变更后
+ * 重新拉取，并在工作区中起草 SKILL 改进与接入初稿、推送到新分支并创建合并请求
+ * （GitLab MR 或 GitHub PR）。
  *
  * 观象需要的方法见 `./contract.ts`；服务在运行时经 `ctx.get('dshRepos')`
  * 取得，服务版本不符时不调用。
@@ -15,7 +15,7 @@ import type { DshRepos, DshReposVersion } from './contract.ts'
 export const DSH_REPOS_SERVICE = 'dshRepos'
 
 /** The `dshRepos` contract version this plugin speaks. */
-export const DSH_REPOS_VERSION: DshReposVersion = 5
+export const DSH_REPOS_VERSION: DshReposVersion = 6
 
 /** The feature this plugin registers; it uses the catalog repositories that have it turned on. */
 export const LOG_ANALYSIS_FEATURE = { id: 'log-analysis', title: '日志分析', description: '观象从这些仓库读取应用描述和日志分析 SKILL，并在派发时读取代码' } as const
@@ -69,6 +69,17 @@ export function requireRepos(value: unknown): DshRepos {
   const lookup = lookupRepos(value)
   if (lookup.availability !== 'ready') throw new Error(unavailableMessage(lookup.availability))
   return lookup.service
+}
+
+/**
+ * The approval outcome of a `declined` rejection: the user refused, withdrew the request, or no interface could answer it.
+ * @param error - the rejection.
+ * @returns the outcome, or undefined for any other failure.
+ */
+export function declinedOutcome(error: unknown): 'rejected' | 'cancelled' | 'unavailable' | undefined {
+  if (repoErrorCode(error) !== 'declined') return undefined
+  const outcome = (error as Error & { outcome?: unknown }).outcome
+  return outcome === 'cancelled' || outcome === 'unavailable' ? outcome : 'rejected'
 }
 
 /**

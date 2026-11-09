@@ -171,7 +171,7 @@ describe('plugin', () => {
     expect(await init!.when?.(step)).toBe(false)
     const value = await add!.definition.execute({ url: origin }, step)
     expect(value).toMatchObject({ status: 'added', setup: 'needs-setup' })
-    expect(h.repos.addRepoCalls).toEqual([{ url: origin, options: { access: 'write', features: ['log-analysis'], session: 'a' } }])
+    expect(h.repos.addRepoCalls).toEqual([{ repo: origin, access: 'write', features: ['log-analysis'] }])
     expect(h.repos.catalog).toMatchObject([{ url: origin, access: 'write', features: ['log-analysis'] }])
     const state = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
     expect(state.repos).toMatchObject([{ url: origin, available: false }])
@@ -228,6 +228,8 @@ describe('plugin', () => {
     const provider = h.skills[0]!
     const [candidate] = await provider.list({})
     expect((await provider.get(candidate!, {}))?.content).not.toContain('PushedHint')
+    // A sync still running from startup would be joined instead of fetching the new commit.
+    await waitFor(async () => (await json<StateWire>(await fetch(`${h.base}/logalyze/state`))).repos[0]?.phase === 'ready')
 
     await addHint('PushedHint')
     expect((await provider.get(candidate!, {}))?.content).toContain('`PushedHint`')

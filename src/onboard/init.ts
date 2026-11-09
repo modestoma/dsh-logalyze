@@ -2,12 +2,13 @@
  * 仓库接入初稿的起草与提交：
  *
  * - `logalyze_init_repo` 只接受已拉取但还没有可用应用的仓库：在运行目录
- *   `.logalyze/runs/<runId>/init/repo/` 打开最新同步提交的可写工作区，以它为
- *   工作目录启动一个起草子 Agent，等待它结束后检查初稿并写出 diff，不推送任何
- *   东西。超时（`dispatchTimeoutMs`）或调用被取消时停止子 Agent。
- * - `logalyze_submit_init` 只接受本进程中同一会话起草过的运行目录：在其中找到
- *   工作区，推送前重新检查初稿；经用户一次性授权后推送到新分支
- *   `logalyze/init-<应用 id>-<改动摘要前缀>` 并创建合入跟踪分支的合并请求。
+ *   `.logalyze/runs/<runId>/init/repo/` 从最新同步提交创建工作区，推送分支为
+ *   新的 `logalyze/init-<runId>`；以工作区为工作目录启动一个起草子 Agent，等待
+ *   它结束后检查初稿并写出 diff，不推送任何东西。超时（`dispatchTimeoutMs`）或
+ *   调用被取消时停止子 Agent。
+ * - `logalyze_submit_init` 只接受本进程中同一会话起草过的运行目录：推送前重新
+ *   检查初稿，再经 dsh-repo 的审批推送到工作区的分支并创建合入跟踪分支的合并
+ *   请求。同一份初稿只提交一次。
  * - 初稿的文件数和大小上限沿用 SKILL 改进的设置；工作区、推送和合并请求经
  *   `dshRepos` 服务完成。子会话中不提供这两个工具。
  *
@@ -20,12 +21,13 @@ import { z } from 'zod'
 import { describeIssue } from '../config.ts'
 import { admitLogs, isDelegatedAgent, logSchema, materializeLogs, newRunId, resolveRunBase, RUNS_SEGMENTS } from '../dispatch/tool.ts'
 import { runChild } from '../dispatch/child.ts'
-import type { Agent, ContentBlock, HostApproval, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
+import type { Agent, ContentBlock, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
 import { messageOf, requireRepos } from '../repos/lookup.ts'
 import type { RepoRegistry } from '../repos/registry.ts'
+import type { WorkspaceInfo } from '../repos/contract.ts'
 import type { AppManifest, EditableSettings } from '../settings/contract.ts'
-import { SKILL_COMMIT_PREFIX, submitChange } from '../skill-update/commit.ts'
-import type { SubmitStatus } from '../skill-update/commit.ts'
+import { pushChange, SKILL_COMMIT_PREFIX } from '../skill-update/commit.ts'
+import type { PushStatus } from '../skill-update/commit.ts'
 import { replaceFile } from '../skill-update/files.ts'
 import { describeFiles, DIFF_FILE, WORKSPACE_DIR } from '../skill-update/workspace.ts'
 import type { FileStat } from '../skill-update/workspace.ts'
@@ -36,9 +38,6 @@ import { renderInitPrompt } from './prompt.ts'
 
 /** Drafts remembered for submission; older ones are forgotten first. */
 const MAX_REMEMBERED_DRAFTS = 64
-
-/** Characters of the explanation shown on an approval prompt. */
-const REASON_PREVIEW_CHARS = 300
 
 /** Characters of the explanation sent as the merge request description; the commit message keeps all of it. */
 const REASON_DESCRIPTION_CHARS = 2000
@@ -58,6 +57,12 @@ interface DraftTask {
   readonly workDir: string
   readonly sessionId: string
   readonly url: string
+  /** Branch the workspace pushes to. */
+  readonly branch: string
+  /** Branch the merge request targets: the workspace's base. */
+  readonly target: string
+  /** Whether a push of this draft succeeded. */
+  submitted: boolean
 }
 
 /** A task's draft as the init result reports it. */
@@ -81,7 +86,7 @@ export interface InitRepoValue {
 
 /** Canonical value of the submission tool. */
 export interface SubmitInitValue {
-  status: SubmitStatus
+  status: PushStatus
   app: string
   repo: string
   branch: string
@@ -183,7 +188,7 @@ export function renderInitRepoValue(value: InitRepoValue): ContentBlock[] {
     ? `\n\n起草没有完成（${value.status}），没有可提交的初稿。`
     : draft.ok
       ? `\n\n初稿可提交：应用「${draft.app.name}」（id: ${draft.app.id}），SKILL /${draft.app.skill}。改动：${describeFiles(draft.files)}。diff 文件：${draft.diffPath}。`
-        + `先向用户说明模块划分和需要确认的要点，附上 diff 中的关键内容；然后调用 ${SUBMIT_INIT_TOOL_NAME}（workDir 为 ${value.workDir}），工具会请求授权，批准后推送新分支并创建合并请求。`
+        + `先向用户说明模块划分和需要确认的要点，附上 diff 中的关键内容；然后调用 ${SUBMIT_INIT_TOOL_NAME}（workDir 为 ${value.workDir}），dsh-repo 会请求授权，批准后推送新分支并创建合并请求。`
       : `\n\n初稿不可提交：${draft.error}`
   return [{ type: 'text', text: `观象接入起草 ${value.url}（提交 ${value.commit.slice(0, 12)}）结束，运行目录 ${value.workDir}。\n\n${body}${diagnostic}${next}` }]
 }
@@ -198,7 +203,7 @@ export function renderSubmitInitValue(value: SubmitInitValue): ContentBlock[] {
   const text = {
     opened: `已提交到 ${where} 并创建合并请求：${value.mergeRequestUrl ?? ''}。合并后观象下一次加载 /logalyze 时启用应用 ${value.app}。`,
     pushed: `已提交到 ${where}，但创建合并请求失败（${value.mergeRequestError ?? '未知原因'}）；请在代码托管平台上从该分支手动创建。`,
-    exists: `${where} 已存在，同一初稿可能已经提交过，本次没有提交。`,
+    exists: `${where} 在远端已有其他提交，或这份初稿已经提交过，本次没有提交。`,
     rejected: '授权被拒绝，没有提交：用户拒绝了，或会话的审批策略为 never（例如「完全访问」权限模式）。初稿文件仍在运行目录中，可以手动提交。',
     cancelled: '授权请求被撤回，没有提交。',
     unavailable: '当前没有可以回答授权请求的界面，没有提交。',
@@ -214,8 +219,6 @@ export interface RepoInitializerDeps {
   readonly provider: string
   settings(): EditableSettings
   workingDirectory(): WorkingDirectoryService | undefined
-  /** DSH's approval service, when the composition has one. */
-  approval(): HostApproval | undefined
   /** What `ctx.get('dshRepos')` returns now. */
   repos(): unknown
   readonly fetch?: typeof fetch
@@ -233,7 +236,7 @@ function topLevelAgent(exec: ToolRunContext, tool: string): Agent {
 export class RepoInitializer {
   private readonly drafts = new Map<string, DraftTask>()
 
-  /** @param deps - registry, subagents, settings, approval, and `dshRepos` access. */
+  /** @param deps - registry, subagents, settings, and `dshRepos` access. */
   constructor(private readonly deps: RepoInitializerDeps) {}
 
   /**
@@ -271,7 +274,7 @@ export class RepoInitializer {
   submitDefinition(): ToolDefinition<SubmitInitValue> {
     return {
       name: SUBMIT_INIT_TOOL_NAME,
-      description: `观象：把 ${INIT_REPO_TOOL_NAME} 起草的应用描述和 SKILL 提交为合并请求。工具先请求用户授权，批准后推送到新分支并创建合并请求，不会直接改动默认分支。不要自己修改或推送初稿文件。`,
+      description: `观象：把 ${INIT_REPO_TOOL_NAME} 起草的应用描述和 SKILL 提交为合并请求。dsh-repo 先请求用户授权，批准后推送到新分支并创建合并请求，不会直接改动默认分支。不要自己修改或推送初稿文件。`,
       parameters: SUBMIT_PARAMETERS,
       output: {
         schema: SUBMIT_OUTPUT_SCHEMA,
@@ -306,11 +309,14 @@ export class RepoInitializer {
 
     // `setupPending` lists only repositories with a synced commit.
     const commit = status.commit as string
-    const workDir = join(baseDir, ...RUNS_SEGMENTS, newRunId(this.deps.now?.() ?? new Date()), 'init')
+    const runId = newRunId(this.deps.now?.() ?? new Date())
+    const workDir = join(baseDir, ...RUNS_SEGMENTS, runId, 'init')
     const repoDir = join(workDir, WORKSPACE_DIR)
     await mkdir(workDir, { recursive: true })
+    const base = registry.branchOf(url)
+    let workspace: WorkspaceInfo
     try {
-      await repos.openWorkspace(url, { dir: repoDir, baseBranch: registry.branchOf(url), commit, signal: exec.signal })
+      workspace = await repos.workspaceCreate({ repo: url, path: repoDir, ...base === undefined ? {} : { base }, commit, branch: `logalyze/init-${runId}`, agent: parent, ...exec.callId === undefined ? {} : { callId: exec.callId }, signal: exec.signal })
     } catch (error) {
       exec.signal.throwIfAborted()
       throw new Error(`仓库 ${url} 的工作区创建失败：${messageOf(error)}`)
@@ -328,7 +334,7 @@ export class RepoInitializer {
     const outcome = await runChild({ subagents: this.deps.subagents, provider: this.deps.provider, parent, label: '观象接入起草', cwd: repoDir, prompt, timeoutMs: settings.dispatchTimeoutMs, signal: exec.signal })
     const value: InitRepoValue = { url, commit, workDir, ...outcome }
     if (outcome.status !== 'completed') return value
-    const task: DraftTask = { workDir, sessionId: parent.session.header.id, url }
+    const task: DraftTask = { workDir, sessionId: parent.session.header.id, url, branch: workspace.branch, target: workspace.base, submitted: false }
     this.remember(task)
     try {
       const prepared = await this.prepare(task, exec.signal)
@@ -378,10 +384,8 @@ export class RepoInitializer {
     const task = this.drafts.get(resolve(parsed.data.workDir))
     if (task === undefined) throw new Error(`${parsed.data.workDir} 不是本次 DSH 运行中观象起草任务的运行目录；DSH 重启后需要重新起草`)
     if (task.sessionId !== agent.session.header.id) throw new Error(`${parsed.data.workDir} 不是当前会话起草的任务`)
-    const approval = this.deps.approval()
-    if (approval === undefined) throw new Error('当前 DSH 组合没有审批服务（@deepseek-ai/dsh-user-approval），观象不会在未经授权时提交')
     const repos = requireRepos(this.deps.repos())
-    const target = this.deps.registry.branchOf(task.url)
+    const { branch, target } = task
 
     let prepared: Awaited<ReturnType<RepoInitializer['prepare']>>
     try {
@@ -393,33 +397,19 @@ export class RepoInitializer {
     const { draft, diffPath } = prepared
     const { app, reason, changes } = draft
     const files = [...changes.files]
-    const base = { app: app.id, repo: task.url, target, files, diffPath }
-    // A workspace pushes to one branch; once pushed, the draft has been submitted.
-    if (changes.pushedBranch !== undefined) return { ...base, status: 'exists', branch: changes.pushedBranch }
-    const branch = `logalyze/init-${app.id}-${changes.digest.slice(0, 10)}`
+    const base = { app: app.id, repo: task.url, branch, target, files, diffPath }
+    if (task.submitted) return { ...base, status: 'exists' }
     const title = `${SKILL_COMMIT_PREFIX}接入观象日志分析：${app.name}（${app.id}）`
-    const preview = reason.replace(/\s+/g, ' ').slice(0, REASON_PREVIEW_CHARS)
-    const outcome = await submitChange({
-      digest: changes.digest,
-      recheck: async () => (await checkInitDraft(requireRepos(this.deps.repos()), task.workDir, this.deps.settings().skillUpdates, exec.signal)).changes.digest,
+    const outcome = await pushChange({
       repos,
-      approval,
-      agent,
       exec,
-      toolName: SUBMIT_INIT_TOOL_NAME,
-      url: task.url,
+      agent,
       dir: join(task.workDir, WORKSPACE_DIR),
-      branch,
-      target,
       message: `${title}\n\n${reason}\n\nProposed-by: 观象 Logalyze\nBase-commit: ${changes.base}\n`,
-      session: task.sessionId,
       title,
       body: `由观象起草的应用描述 ${AGENTS_DIR}/logalyze.yaml 与日志分析 SKILL ${AGENTS_DIR}/skills/${app.skill}/（基于提交 ${changes.base.slice(0, 12)}，会话 ${task.sessionId}）。合并后观象下一次加载 /logalyze 时启用该应用。说明：${reason.slice(0, REASON_DESCRIPTION_CHARS)}`,
-      prompt: {
-        zh: `观象将向 ${task.url} 推送新分支 ${branch}，并创建合并请求合入 ${target}，接入应用「${app.name}」（${app.id}）。改动：${describeFiles(files)}。说明：${preview}`,
-        en: `Logalyze will push branch ${branch} to ${task.url} and open a merge request into ${target} to onboard application ${app.id}. Files: ${files.map(file => file.path).join(', ')}`,
-      },
     })
-    return { ...base, branch, ...outcome }
+    if (outcome.status === 'opened' || outcome.status === 'pushed') task.submitted = true
+    return { ...base, ...outcome }
   }
 }

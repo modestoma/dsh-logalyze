@@ -1,8 +1,8 @@
 /**
- * `logalyze_show_skill`：从 `dshRepos` 镜像只读地读出某个可用应用的日志分析
+ * `logalyze_show_skill`：从 `dshRepos` 的只读快照读出某个可用应用的日志分析
  * SKILL（`.agents/skills/<skill>/`）在最新同步提交中的文件列表和一个文件的
  * 内容，默认是 `SKILL.md`。用户要纠正或改进 SKILL 时，顶层 Agent 先用它对照
- * 现有内容和用户讨论。不读取 SKILL 目录以外的文件，不改动任何镜像或快照。
+ * 现有内容和用户讨论。不读取 SKILL 目录以外的文件，不跟随符号链接。
  * 子会话中不提供本工具。
  *
  * @module dsh-logalyze/skill-update/show
@@ -14,6 +14,7 @@ import { isDelegatedAgent } from '../dispatch/tool.ts'
 import type { ContentBlock, ToolDefinition, ToolRunContext } from '../host.ts'
 import { requireRepos } from '../repos/lookup.ts'
 import { skillDir } from '../repos/manifest.ts'
+import { MAX_REPO_FILE_BYTES, treeFiles, treeReader, withSnapshot } from '../repos/snapshot.ts'
 import type { RepoRegistry } from '../repos/registry.ts'
 import { SHOW_TOOL_NAME } from './names.ts'
 
@@ -128,14 +129,12 @@ export class SkillViewer {
     const { app, url, commit } = this.deps.registry.readyApp(parsed.data.app)
     const repos = requireRepos(this.deps.repos())
     const dir = skillDir(app.skill)
-    const options = { signal: exec.signal }
-    const files = (await repos.listMirrorTree(url, commit, dir, options))
-      .filter(entry => entry.type === 'file')
-      .map(entry => entry.path.slice(dir.length + 1))
-      .sort()
     const path = parsed.data.path ?? 'SKILL.md'
-    if (!files.includes(path)) throw new Error(`${dir}/${path} 不存在；SKILL 目录中的文件：${files.join('、')}`)
-    const text = await repos.readMirrorFile(url, commit, `${dir}/${path}`, options) ?? ''
+    const { files, text } = await withSnapshot(repos, url, commit, exec.signal, async (lease) => {
+      const files = await treeFiles(lease.path, dir)
+      if (!files.includes(path)) throw new Error(`${dir}/${path} 不存在；SKILL 目录中的文件：${files.join('、')}`)
+      return { files, text: await treeReader(lease.path, MAX_REPO_FILE_BYTES)(`${dir}/${path}`) ?? '' }
+    })
     const truncated = text.length > MAX_SHOWN_CHARS
     return { app: app.id, repo: url, commit, dir, files, path, content: truncated ? text.slice(0, MAX_SHOWN_CHARS) : text, truncated }
   }

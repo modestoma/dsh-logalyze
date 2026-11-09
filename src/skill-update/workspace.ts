@@ -1,20 +1,22 @@
 /**
  * SKILL 改进与接入初稿共用的工作区布局和改动检查。观象在运行目录里经
- * `dshRepos` 打开一个可写工作区 `repo/`，子 Agent 在其中直接修改文件，改动说明
- * 写在工作区之外的 `reason.md`；子 Agent 结束后，观象读取工作区相对基准提交的
- * 改动，检查合格后写出 `changes.diff`，再推送到新分支。
+ * `dshRepos` 创建一个工作区 `repo/`（普通 git 克隆，推送到观象起好名字的新
+ * 分支），子 Agent 在其中直接修改文件，改动说明写在工作区之外的 `reason.md`；
+ * 子 Agent 结束后，观象读取工作区相对起始提交的改动（已提交和未提交的都算），
+ * 检查合格后写出 `changes.diff`，再推送。
  *
  * 工作区对 Agent 可写，改动按不可信输入检查：只接受允许范围内新增或修改的普通
  * 文件，文件名受限，内容是 UTF-8 文本，文件数与大小不超过上限；范围外的任何
- * 改动、删除、重命名或类型变化都让整份改动不合格。文件内容从工作区读取。
+ * 改动、删除、重命名或类型变化都让整份改动不合格。文件内容从工作区读取，不跟随
+ * 符号链接。
  *
  * @module dsh-logalyze/skill-update/workspace
  */
 
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
-import type { RepoFileReader } from '../repos/manifest.ts'
-import type { WorkspaceChanges } from '../repos/contract.ts'
+import type { WorkspaceStatus } from '../repos/contract.ts'
+import { treeReader } from '../repos/snapshot.ts'
 import type { SkillUpdateSettings } from '../settings/contract.ts'
 import { kindOf, ProposalError, readText } from './files.ts'
 
@@ -72,13 +74,11 @@ export interface ChangedFile {
 export interface CheckedChanges {
   /** Commit the workspace started from. */
   readonly base: string
-  /** Remote branch an earlier push fixed; absent before the first push. */
-  readonly pushedBranch?: string
   readonly files: readonly FileStat[]
   readonly contents: readonly ChangedFile[]
-  /** Hexadecimal digest of the base commit and the changed files; names the branch. */
+  /** Hexadecimal digest of the base commit and the changed files. */
   readonly digest: string
-  /** Unified diff from the base commit to the working tree. */
+  /** Unified diff from the base commit to the working tree; cut at dsh-repo's diff limit. */
   readonly diff: string
 }
 
@@ -91,7 +91,7 @@ export interface CheckedChanges {
  * @returns the checked changes.
  * @throws ProposalError when nothing changed, or any change is out of scope, not an added or modified regular UTF-8 file, or over a ceiling.
  */
-export async function checkChanges(changes: WorkspaceChanges, scope: ChangeScope, limits: Pick<SkillUpdateSettings, 'maxFiles' | 'maxFileBytes'>): Promise<CheckedChanges> {
+export async function checkChanges(changes: WorkspaceStatus, scope: ChangeScope, limits: Pick<SkillUpdateSettings, 'maxFiles' | 'maxFileBytes'>): Promise<CheckedChanges> {
   const { workspace } = changes
   const base = workspace.baseCommit
   if (changes.files.length === 0) throw new ProposalError(`工作区与提交 ${base.slice(0, 12)} 相比没有改动`)
@@ -115,7 +115,7 @@ export async function checkChanges(changes: WorkspaceChanges, scope: ChangeScope
   }
   if (sorted.length > limits.maxFiles) throw new ProposalError(`改动了 ${sorted.length} 个文件，超过上限 ${limits.maxFiles}`)
 
-  const reader = workspaceReader(workspace.dir, limits.maxFileBytes)
+  const reader = treeReader(workspace.path, limits.maxFileBytes)
   const digest = createHash('sha256').update(`${base}\n`)
   const contents: ChangedFile[] = []
   for (const file of sorted) {
@@ -126,27 +126,10 @@ export async function checkChanges(changes: WorkspaceChanges, scope: ChangeScope
   }
   return {
     base,
-    ...workspace.branch === undefined ? {} : { pushedBranch: workspace.branch },
     files: sorted.map(file => ({ path: file.path, added: file.additions ?? 0, removed: file.deletions ?? 0 })),
     contents,
     digest: digest.digest('hex'),
     diff: changes.diff,
-  }
-}
-
-/**
- * A reader of a workspace's files that accepts only regular UTF-8 files within a ceiling.
- * @param dir - workspace directory.
- * @param maxBytes - size ceiling.
- * @returns the reader; it yields undefined for a missing path.
- */
-export function workspaceReader(dir: string, maxBytes: number): RepoFileReader {
-  return async (path) => {
-    const absolute = join(dir, path)
-    const kind = await kindOf(absolute)
-    if (kind === 'missing') return undefined
-    if (kind !== 'file') throw new ProposalError(`${path} 不是普通文件（不接受符号链接等）`)
-    return await readText(absolute, path, maxBytes)
   }
 }
 

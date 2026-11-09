@@ -1,5 +1,5 @@
 /**
- * 观象对 `dshRepos` 服务（version 5）的需求：只声明观象调用的方法和读取的
+ * 观象对 `dshRepos` 服务（version 6）的需求：只声明观象调用的方法和读取的
  * 字段。服务在运行时经 `ctx.get('dshRepos')` 取得，由任何按这一约定提供该服务
  * 的插件实现；观象不依赖提供方的包。
  *
@@ -7,15 +7,17 @@
  * 合并）和其他插件注册的功能开关。观象注册「日志分析」功能，只使用打开了这个
  * 功能的仓库。
  *
- * 镜像和工作区只接受 HTTPS 地址、`file:` URL 和本机绝对路径。每个方法在预期内
- * 的失败时以 `name` 为 `RepoError`、带字符串 `code` 的错误拒绝（例如
- * `conflict` 表示远端分支已存在，`invalid` 表示参数违反约定）。
+ * 快照是某个提交的只读普通文件（没有 `.git`），每次取用前服务方先从远端拉取。
+ * 工作区是普通 git 克隆，`origin` 经服务方的本机 git 代理访问远端；推送和合并
+ * 请求由 {@link DshRepos.workspacePush} 一步完成。每个方法在预期内的失败时以
+ * `name` 为 `RepoError`、带字符串 `code` 的错误拒绝（例如 `conflict` 表示远端
+ * 分支已变，`declined` 表示用户没有批准，`invalid` 表示参数违反约定）。
  *
  * @module dsh-logalyze/repos/contract
  */
 
 /** The `dshRepos` service version this plugin calls. */
-export type DshReposVersion = 5
+export type DshReposVersion = 6
 
 /** Options every call accepts. */
 export interface CallOptions {
@@ -23,80 +25,87 @@ export interface CallOptions {
   readonly signal?: AbortSignal
 }
 
+/** The host Agent a write is made for: the `agent` a DSH tool's `execute` receives. */
+export interface CallerAgent {
+  readonly id: string
+  readonly session?: { readonly header: { readonly id: string } }
+}
+
 /**
- * Where the provider keeps local mirrors. The provider has no default
- * directory: while `dir` is undefined every mirror call rejects with
- * `unavailable` and a message saying where to choose one.
+ * Caller fields of a write made for an Agent: the provider asks
+ * `access/authorize` for its Session and, while its settings say so, shows
+ * the user the same approval card its own tool shows (a refusal rejects with
+ * `declined`, writes turned off with `forbidden`).
  */
-export interface MirrorSettings {
-  /** Absolute directory holding the mirrors and the snapshots; undefined while none is chosen or the stored choice is unusable. */
-  readonly dir: string | undefined
-  /** Why the provider's stored directory is not in use; absent otherwise. */
-  readonly problem?: string
-}
-
-/** A mirror after a successful clone or fetch. */
-export interface MirrorState {
-  /** Absolute directory of the fetch-only mirror. */
-  readonly dir: string
-  /** The requested branch, or the remote's default branch. */
-  readonly branch: string
-  /** Full commit id the branch points to after the fetch. */
-  readonly commit: string
-  /** Committer date of {@link commit}, ISO 8601. */
-  readonly commitTime: string
-}
-
-/** One entry of a mirror tree listing. */
-export interface MirrorTreeEntry {
-  /** Path from the repository root, `/`-separated. */
-  readonly path: string
-  readonly type: 'file' | 'dir' | 'symlink' | 'submodule'
+export interface AgentWriteOptions extends CallOptions {
+  readonly agent: CallerAgent
+  /** The calling tool call, so the approval card shows that call. */
+  readonly callId?: string
 }
 
 /**
- * A read-only checkout of one commit. The directory stays unchanged until
+ * The provider's settings this plugin reads. The provider has no default
+ * mirror directory: while `mirrorDir` is undefined every snapshot and
+ * workspace call rejects with `unavailable` and a message saying where to
+ * choose one.
+ */
+export interface RepoPublicSettings {
+  /** Absolute directory holding the mirrors and the snapshots; undefined while none is chosen or the stored choice is unusable. */
+  readonly mirrorDir: string | undefined
+  /** Why the provider's stored directory is not in use; absent otherwise. */
+  readonly mirrorProblem?: string
+}
+
+/**
+ * Read-only plain files of one commit (no `.git`), shared by every holder of
+ * the same repository and commit. The directory stays unchanged until
  * released; release exactly once.
  */
 export interface SnapshotLease {
-  /** Absolute directory of the checkout. */
-  readonly dir: string
+  /** Catalog address of the repository. */
+  readonly repo: string
+  /** Full commit id. */
+  readonly commit: string
+  /** Absolute directory of the files. */
+  readonly path: string
   release(): void
 }
 
-/** Fields of a new pull or merge request. */
-export interface ChangeCreate extends CallOptions {
-  /** Session the request is opened for; the provider asks `access/authorize` for it first and fails with `forbidden` when refused. */
-  readonly session: string
-  readonly title: string
-  readonly body: string
-  readonly sourceBranch: string
-  readonly targetBranch: string
+/** Parameters of {@link DshRepos.snapshotAcquire}. */
+export interface SnapshotAcquireParams extends CallOptions {
+  readonly repo: string
+  /** Branch, tag, or full commit id; default: the catalog entry's branch, or the remote's default branch. */
+  readonly ref?: string
 }
 
-/** Options of {@link DshRepos.openWorkspace}. */
-export interface WorkspaceOpenOptions extends CallOptions {
-  /** Absolute directory of the checkout; must not exist yet (its parent is created). */
-  readonly dir: string
-  /** Branch the work starts from and later merges into. */
-  readonly baseBranch: string
-  /** Full commit id to start from, fetched by an earlier {@link DshRepos.syncMirror}. */
-  readonly commit: string
+/** Parameters of {@link DshRepos.workspaceCreate}. */
+export interface WorkspaceCreateParams extends AgentWriteOptions {
+  readonly repo: string
+  /** Absolute directory of the new workspace: missing or empty (its parent is created). */
+  readonly path: string
+  /** Branch the work merges into; default: the remote's default branch. */
+  readonly base?: string
+  /** Full commit id on {@link base} to start from. */
+  readonly commit?: string
+  /** New remote branch the workspace pushes to; created by the first push. Never the default branch, {@link base}, or a protected branch. */
+  readonly branch: string
 }
 
-/** A writable checkout opened by {@link DshRepos.openWorkspace}. */
+/** A workspace: an ordinary git clone whose `origin` reaches the remote through the provider. */
 export interface WorkspaceInfo {
-  /** Repository address the workspace pushes to. */
-  readonly url: string
-  /** Absolute directory of the checkout. */
-  readonly dir: string
+  /** Catalog address of the repository. */
+  readonly repo: string
+  /** Absolute directory. */
+  readonly path: string
+  /** Branch the work merges into. */
+  readonly base: string
   /** Commit the work started from. */
   readonly baseCommit: string
-  /** Remote branch fixed by the first {@link DshRepos.pushWorkspace}; absent before it. */
-  readonly branch?: string
+  /** Remote branch the workspace pushes to. */
+  readonly branch: string
 }
 
-/** One file that differs from the workspace's base commit. */
+/** One file that differs from the workspace's start commit. */
 export interface WorkspaceFileChange {
   /** Path from the repository root, `/`-separated. */
   readonly path: string
@@ -109,35 +118,44 @@ export interface WorkspaceFileChange {
   readonly deletions?: number
 }
 
-/** Everything a workspace changed relative to its base commit, committed or not. */
-export interface WorkspaceChanges {
+/** What a workspace changed since its start commit, committed or not. */
+export interface WorkspaceStatus {
   readonly workspace: WorkspaceInfo
-  /** Files differing between the base commit and the working tree (untracked files included, ignored files excluded). */
+  /** Files differing between the start commit and the working tree (untracked included, ignored excluded). */
   readonly files: readonly WorkspaceFileChange[]
-  /** Unified diff from the base commit to the working tree. */
+  /** Unified diff from the start commit to the working tree. */
   readonly diff: string
+  /** Whether {@link diff} was cut at the provider's diff limit. */
+  readonly truncated: boolean
 }
 
-/** Options of {@link DshRepos.pushWorkspace}. */
-export interface WorkspacePushOptions extends CallOptions {
-  /** New remote branch; the first push fails with `conflict` when the remote already has it. */
-  readonly branch: string
-  /** Message of the commit recording the uncommitted changes. */
+/** Parameters of {@link DshRepos.workspacePush}. */
+export interface WorkspacePushParams extends AgentWriteOptions {
+  /** The workspace directory. */
+  readonly path: string
+  /** Message of the commit recording uncommitted changes; required when there are any. */
   readonly message: string
-  /**
-   * Session the push is made for: the provider asks `access/authorize` for
-   * it first (`forbidden` when refused), adds it to the commit message as a
-   * `DSH-Session:` trailer, and lets other plugins add trailers and name the
-   * author; otherwise the account that owns the host token authors the commit.
-   */
-  readonly session: string
+  /** Open a pull/merge request from the branch into the workspace's base unless one is open. */
+  readonly mr?: { readonly title: string; readonly body?: string }
 }
 
-/** Outcome of {@link DshRepos.pushWorkspace}. */
+/** A pull/merge request a push reported. */
+export interface MrSummary {
+  readonly number: number
+  readonly webUrl: string
+}
+
+/** Outcome of {@link DshRepos.workspacePush}. */
 export interface WorkspacePushResult {
   readonly branch: string
   /** Commit the remote branch points to after the push. */
   readonly commit: string
+  /** Open requests from the branch after the push, including one opened for {@link WorkspacePushParams.mr}; empty for a repository on no code host. */
+  readonly openMrs: readonly MrSummary[]
+  /** The request opened for {@link WorkspacePushParams.mr}; absent when one was already open or none was asked for. */
+  readonly createdMr?: MrSummary
+  /** Why listing or opening requests failed; the push itself succeeded. */
+  readonly mrError?: string
 }
 
 /** Access a catalog entry grants, from the least. */
@@ -153,7 +171,7 @@ export interface RepoFeature {
   readonly description?: string
 }
 
-/** One catalog repository, as {@link DshRepos.listRepos} returns it. */
+/** One catalog repository, as {@link DshRepos.repoList} returns it. */
 export interface CatalogRepo {
   readonly id: string
   /** Address as the catalog stores it. */
@@ -165,18 +183,18 @@ export interface CatalogRepo {
   readonly features: readonly string[]
 }
 
-/** Options of {@link DshRepos.addRepo}. */
-export interface RepoAddOptions extends CallOptions {
+/** Parameters of {@link DshRepos.repoAdd}. Without an Agent the provider asks nothing: this plugin authorizes and approves the change itself. */
+export interface RepoAddParams extends CallOptions {
+  /** HTTPS address on a configured host, `file:` URL, or absolute local path. */
+  readonly repo: string
   readonly branch?: string
   /** Access of a new entry; an existing entry keeps its access. Default `read`. */
   readonly access?: RepoAccess
   /** Feature ids to turn on. */
   readonly features?: readonly string[]
-  /** Session the change is made for: the provider asks `access/authorize` (level `admin`) before changing the catalog and fails with `forbidden` when refused. */
-  readonly session?: string
 }
 
-/** Outcome of {@link DshRepos.addRepo}. */
+/** Outcome of {@link DshRepos.repoAdd}. */
 export interface RepoAddResult {
   readonly status: 'added' | 'updated' | 'unchanged'
   readonly repo: CatalogRepo
@@ -187,77 +205,56 @@ export interface DshRepos {
   readonly version: DshReposVersion
   /**
    * The catalog repositories.
-   * @param options - `feature` lists only the repositories with that feature turned on.
+   * @param params - `feature` lists only the repositories with that feature turned on.
    * @returns the repositories in catalog order.
    */
-  listRepos(options?: { readonly feature?: string }): readonly CatalogRepo[]
+  repoList(params?: { readonly feature?: string } & CallOptions): Promise<readonly CatalogRepo[]>
   /**
    * Register a feature; the provider's settings page shows a switch for it on every repository.
    * @returns disposer that withdraws the registration.
    */
-  registerFeature(feature: RepoFeature): () => void
+  featureRegister(feature: RepoFeature): () => void
   /**
-   * Observe catalog changes and feature registrations.
+   * Observe catalog changes.
    * @param listener - runs after each change.
    * @returns disposer that stops the observation.
    */
-  onReposChange(listener: () => void): () => void
+  repoOnChange(listener: () => void): () => void
   /**
-   * Add a repository to the catalog, or turn features on for the entry holding it; nothing is asked or written when nothing changes.
-   * @param url - HTTPS address on a configured host, `file:` URL, or absolute local path.
+   * Add a repository to the catalog, or turn features on for the entry holding it.
    * @returns the outcome and the entry.
-   * @throws `conflict` when the entry follows another branch; `forbidden` when `access/authorize` refused; `not-allowed` for an address on an unconfigured host.
+   * @throws `conflict` when the entry follows another branch; `not-allowed` for an address on an unconfigured host.
    */
-  addRepo(url: string, options?: RepoAddOptions): Promise<RepoAddResult>
-  /** @returns where mirrors and snapshots live. */
-  mirrorSettings(): MirrorSettings
+  repoAdd(params: RepoAddParams): Promise<RepoAddResult>
+  /** @returns the settings this plugin reads. */
+  settingsGet(): RepoPublicSettings
   /**
-   * Observe host or token changes that can change what a sync can reach.
+   * Observe host, token, and mirror directory changes that can change what a snapshot can reach.
    * @param listener - runs after each change.
    * @returns disposer that stops the observation.
    */
-  onHostsChange(listener: () => void): () => void
+  hostOnChange(listener: () => void): () => void
   /**
-   * Clone the address as a fetch-only mirror, or fetch it, and resolve the branch head.
-   * @param url - HTTPS address, `file:` URL, or absolute local path.
-   * @returns the mirror and the branch head.
+   * Fetch the repository and hold read-only files of a commit.
+   * @returns the lease, naming the commit the ref resolved to.
+   * @throws `not-found` for a missing ref, `unavailable` while no mirror directory is set or git fails.
    */
-  syncMirror(url: string, options?: CallOptions & { readonly branch?: string }): Promise<MirrorState>
+  snapshotAcquire(params: SnapshotAcquireParams): Promise<SnapshotLease>
   /**
-   * Read one regular file of a fetched commit.
-   * @returns UTF-8 text, or undefined when the commit has no such path.
-   * @throws when the path is not a regular file.
-   */
-  readMirrorFile(url: string, commit: string, path: string, options?: CallOptions): Promise<string | undefined>
-  /**
-   * List the entries below a directory of a fetched commit, recursively.
-   * @returns entries, or an empty list when the path does not exist.
-   */
-  listMirrorTree(url: string, commit: string, path: string, options?: CallOptions): Promise<readonly MirrorTreeEntry[]>
-  /** @returns a held read-only checkout of the commit. */
-  acquireSnapshot(url: string, commit: string, options?: CallOptions): Promise<SnapshotLease>
-  /**
-   * Check out a commit as a writable working tree whose git metadata stays
-   * outside the checkout: agents edit files only, and {@link pushWorkspace}
-   * records and pushes the changes. The caller owns the directory.
-   * @param url - HTTPS address, `file:` URL, or absolute local path.
+   * Clone the repository into a new workspace and check out its branch at the start commit.
    * @returns the workspace.
-   * @throws `invalid` for an unsupported address or a directory that exists.
+   * @throws `invalid` for a bad path, branch, or commit; `not-found` for a missing base or commit.
    */
-  openWorkspace(url: string, options: WorkspaceOpenOptions): Promise<WorkspaceInfo>
+  workspaceCreate(params: WorkspaceCreateParams): Promise<WorkspaceInfo>
   /**
-   * Describe what a workspace changed since its base commit.
-   * @param dir - directory passed to {@link openWorkspace}.
-   * @returns the changes.
+   * Describe what a workspace changed since its start commit.
+   * @throws `not-found` when the path is not a workspace.
    */
-  workspaceChanges(dir: string, options?: CallOptions): Promise<WorkspaceChanges>
+  workspaceStatus(params: { readonly path: string } & CallOptions): Promise<WorkspaceStatus>
   /**
-   * Commit the uncommitted changes and push them to a new remote branch, never forcing.
-   * @param dir - directory passed to {@link openWorkspace}.
+   * Commit the uncommitted changes, push the workspace to its branch, and with `mr` open a request unless one is open; the provider authorizes and approves it for the Agent.
    * @returns the push outcome.
-   * @throws `conflict` when the remote branch exists before the first push; `invalid` for the base or default branch or nothing to push.
+   * @throws `declined` when the user did not approve; `conflict` when the remote branch moved; `invalid` for nothing to push; `forbidden` when the host or `access/authorize` refused.
    */
-  pushWorkspace(dir: string, options: WorkspacePushOptions): Promise<WorkspacePushResult>
-  /** @returns the new pull or merge request. */
-  createChange(repo: string, change: ChangeCreate): Promise<{ readonly webUrl: string }>
+  workspacePush(params: WorkspacePushParams): Promise<WorkspacePushResult>
 }
