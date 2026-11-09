@@ -49,7 +49,10 @@ export async function runChild(run: ChildRun): Promise<ChildOutcome> {
     activation = await run.subagents.startActivation({
       provider: run.provider,
       label: run.label,
-      request: { cwd: run.cwd, prompt: [{ type: 'text', text: run.prompt }], parent: run.parent, ...maxDepth === undefined ? {} : { maxDepth } },
+      cwd: run.cwd,
+      prompt: [{ type: 'text', text: run.prompt }],
+      parent: run.parent,
+      ...maxDepth === undefined ? {} : { maxDepth },
       signal: stop,
       delivery: 'caller',
     })

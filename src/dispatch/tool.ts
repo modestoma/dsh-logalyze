@@ -454,12 +454,10 @@ export class Dispatcher {
         activation = await this.deps.subagents.startActivation({
           provider: this.deps.provider,
           label: `${ready.app.name}分析`,
-          request: {
-            cwd: ready.dir,
-            prompt: [{ type: 'text', text: renderChildPrompt({ app: ready.app, commit: ready.commit, question: task.question, logs, workDir, gaps }) }],
-            parent,
-            ...maxDepth === undefined ? {} : { maxDepth },
-          },
+          cwd: ready.dir,
+          prompt: [{ type: 'text', text: renderChildPrompt({ app: ready.app, commit: ready.commit, question: task.question, logs, workDir, gaps }) }],
+          parent,
+          ...maxDepth === undefined ? {} : { maxDepth },
           signal: stop,
           delivery: 'caller',
         })

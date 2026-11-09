@@ -204,7 +204,7 @@ async function setup(endTurn = true): Promise<Setup> {
 
 /** The improvement run directory holding a child's workspace. */
 function improveDirOf(started: Started): string {
-  return dirname(started.spec.request.cwd)
+  return dirname(started.spec.cwd)
 }
 
 /**
@@ -214,7 +214,7 @@ function improveDirOf(started: Started): string {
 async function finishChild(started: Started[], index: number, files: Record<string, string | undefined>, reason: string | null = REASON, output = '- SKILL.md：补充 traceId\n- cases/2026-10-31-trace-id.md：新增案例'): Promise<string> {
   await waitForStarts(started, index + 1)
   const child = started[index]!
-  const repo = child.spec.request.cwd
+  const repo = child.spec.cwd
   for (const [path, content] of Object.entries(files)) {
     if (content === undefined) {
       await rm(join(repo, path))
@@ -241,15 +241,15 @@ describe('logalyze_improve_skill', () => {
 
     const [child] = started
     const status = registry.status()[0]!
-    expect(child?.spec).toMatchObject({ provider: 'spawn', label: '订单服务 SKILL 改进', delivery: 'caller', request: { parent: agent, maxDepth: 1 } })
+    expect(child?.spec).toMatchObject({ provider: 'spawn', label: '订单服务 SKILL 改进', delivery: 'caller', parent: agent, maxDepth: 1 })
     const improveDir = improveDirOf(child!)
     expect(improveDir).toMatch(new RegExp(`^${escape(join(agent.session.header.cwd as string, '.logalyze', 'runs'))}/20261031-220000-[0-9a-f]{6}/improve-[0-9a-f]{6}$`))
-    expect(child?.spec.request.cwd).toBe(join(improveDir, 'repo'))
+    expect(child?.spec.cwd).toBe(join(improveDir, 'repo'))
     // The workspace is a clone at the latest synced commit, pushing to a new branch named after the run.
     expect(await readFile(join(improveDir, 'repo', SKILL), 'utf8')).toBe(skill)
     expect(await stat(join(improveDir, 'repo', '.git')).then(() => true, () => false)).toBe(true)
     expect(repos.service.creates).toEqual([{ repo: origin, path: join(improveDir, 'repo'), commit: status.commit, branch: expect.stringMatching(/^logalyze\/skill-order-service-20261031-220000-[0-9a-f]{6}$/), agent, callId: 'call-1', signal: exec.signal }])
-    const prompt = child?.spec.request.prompt[0]?.text as string
+    const prompt = child?.spec.prompt[0]?.text as string
     expect(prompt.split('\n')[0]).toBe('/logalyze-improve')
     expect(prompt).toContain('本会话的一次日志分析之后，分析子 Agent 认为这个 SKILL 没能很好地覆盖遇到的问题，用户同意改进。下面列出的所有改进点都在这一次修改中完成。')
     expect(prompt).toContain(`## 分析 1\n\n运行目录：\`${task.workDir}\``)
@@ -321,7 +321,7 @@ describe('logalyze_improve_skill', () => {
     const feedback = '另外日志时间是 UTC'
     const running = improver.execute({ app: 'order-service', feedback }, { signal: new AbortController().signal, agent })
     await waitForStarts(started, 1)
-    const prompt = started[0]?.spec.request.prompt[0]?.text as string
+    const prompt = started[0]?.spec.prompt[0]?.text as string
     expect(prompt).toContain('本会话的 2 次日志分析之后')
     expect(prompt).toContain(`## 分析 1\n\n运行目录：\`${task.workDir}\``)
     expect(prompt).toContain(`## 分析 2\n\n运行目录：\`${second}\``)
@@ -364,7 +364,7 @@ describe('logalyze_improve_skill', () => {
     await expect(improver.execute({ app: 'order-service' }, exec)).rejects.toThrow('本会话中应用「order-service」没有待改进的 skill-gap.md 记录')
     const retry = improver.execute({ app: 'order-service', workDirs: [task.workDir] }, exec)
     await waitForStarts(started, 2)
-    expect(started[1]?.spec.request.prompt[0]?.text).toContain(`## 分析 1\n\n运行目录：\`${task.workDir}\``)
+    expect(started[1]?.spec.prompt[0]?.text).toContain(`## 分析 1\n\n运行目录：\`${task.workDir}\``)
     started[1]!.settle({ stopReason: 'completed', output: [] })
     expect((await retry).status).toBe('failed')
   })
@@ -480,7 +480,7 @@ describe('logalyze_improve_skill', () => {
     improver.turnEnded('parent')
     const running = improver.execute({ app: 'order-service' }, { signal: new AbortController().signal, agent })
     await waitForStarts(started, 1)
-    expect(started[0]?.spec.request.prompt[0]?.text).toContain(`这次分析时的提交是 \`${'a'.repeat(12)}\`，之后仓库有更新`)
+    expect(started[0]?.spec.prompt[0]?.text).toContain(`这次分析时的提交是 \`${'a'.repeat(12)}\`，之后仓库有更新`)
     started[0]?.settle({ stopReason: 'completed', output: [] })
     expect((await running).status).toBe('failed')
   })
@@ -491,7 +491,7 @@ describe('logalyze_improve_skill', () => {
     const feedback = 'SKILL 里说 503 是库存服务的问题，其实是网关限流，看 X-RateLimit 头'
     const running = improver.execute({ app: 'order-service', workDirs: [task.workDir], feedback }, { signal: new AbortController().signal, agent })
     await waitForStarts(started, 1)
-    const prompt = started[0]?.spec.request.prompt[0]?.text as string
+    const prompt = started[0]?.spec.prompt[0]?.text as string
     expect(prompt).toContain('本会话的一次日志分析之后，用户指出 SKILL 的记录有问题，用户同意改进。')
     expect(prompt).toContain('分析子 Agent 当时没有发现 SKILL 的不足，是按 SKILL 现有的记录分析的；改进的依据是下面的用户反馈。')
     expect(prompt).toContain(`## 用户反馈\n\n${feedback}`)
@@ -513,7 +513,7 @@ describe('logalyze_improve_skill', () => {
     const exec = { signal: new AbortController().signal, agent }
     const running = improver.execute({ app: 'order-service', feedback: '日志时间是 UTC，不是北京时间', logs: [{ path: 'sample.log' }] }, exec)
     await waitForStarts(started, 1)
-    const prompt = started[0]?.spec.request.prompt[0]?.text as string
+    const prompt = started[0]?.spec.prompt[0]?.text as string
     expect(prompt).toContain('用户要求改进这个 SKILL，用户的反馈见下文。')
     expect(prompt).not.toContain('## 分析 1')
     expect(prompt).toContain(`- \`${join(project, 'sample.log')}\``)
