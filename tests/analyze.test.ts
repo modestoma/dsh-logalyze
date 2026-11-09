@@ -2,10 +2,11 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { FeishuTopicService, TopicLaunchResult, TopicLaunchSpec } from '../src/analyze/feishu-topics.ts'
+import type { FeishuTopicService, TopicLaunchResult, TopicLaunchSpec, TopicLaunchState } from '../src/deps/topics-contract.ts'
 import { ANALYZE_MAX_PROMPT_CHARS, analyzeRequestHash, parseAnalyzeRequest, REPORT_PROMPT_RESERVE } from '../src/analyze/contract.ts'
 import type { AnalyzeRequest } from '../src/analyze/contract.ts'
-import { analyzeResponseOf, analyzeTopicSpec, lookupTopics, REPORT_PROMPT_SECTION } from '../src/analyze/topics.ts'
+import { analyzeResponseOf, analyzeTopicSpec, REPORT_PROMPT_SECTION } from '../src/analyze/topics.ts'
+import { lookupTopics, topicStatesOf } from '../src/deps/topics.ts'
 import { apply } from '../src/index.ts'
 import type { HostContext, HostCredentials } from '../src/host.ts'
 import type { StateWire } from '../src/settings/contract.ts'
@@ -32,6 +33,8 @@ function fakeTopics(result: TopicLaunchResult = { ok: true, replayed: false, cha
     specs: [] as TopicLaunchSpec[],
     next: result,
     launch: async (spec: TopicLaunchSpec) => { service.specs.push(spec); return service.next },
+    state: (_key: string): TopicLaunchState | undefined => undefined,
+    launchKeyOf: (_sessionId: string): string | undefined => undefined,
   }
   return service
 }
@@ -166,6 +169,14 @@ describe('analyze contract', () => {
     expect(lookupTopics({ version: 1, launch: () => undefined }).availability).toBe('incompatible')
     expect(lookupTopics(fakeTopics()).availability).toBe('ready')
   })
+
+  it('tracks reports only with a provider that reports launch states', () => {
+    expect(topicStatesOf(lookupTopics(fakeTopics()))).toBeDefined()
+    const { state: _state, launchKeyOf: _launchKeyOf, ...older } = fakeTopics()
+    expect(lookupTopics(older).availability).toBe('ready')
+    expect(topicStatesOf(lookupTopics(older))).toBeUndefined()
+    expect(topicStatesOf(lookupTopics(undefined))).toBeUndefined()
+  })
 })
 
 describe('analyze route', () => {
@@ -246,13 +257,12 @@ describe('analyze route', () => {
   it('tracks the report of every accepted request with logId', async () => {
     const credentials = fakeCredentials()
     credentials.stored.set('LOGALYZE_ANALYZE_TOKEN', 'secret-token')
-    const topics = Object.assign(fakeTopics(), { state: () => undefined, launchKeyOf: () => undefined })
+    const topics = fakeTopics()
     const h = await harness({ credentials, feishuTopics: topics }, { analyze: { enabled: true } })
     expect((await post(h.base, REQUEST)).status).toBe(202)
     expect((await post(h.base, { ...REQUEST, logId: 'L-1' }, { 'idempotency-key': 'req-2' })).status).toBe(202)
     expect(topics.specs.at(-1)?.prompt).toBe(`${REQUEST.prompt}${REPORT_PROMPT_SECTION}`)
     const state = await (await fetch(`${h.base}/logalyze/state`)).json() as StateWire
-    expect(state.analyze.reportsSupported).toBe(true)
     expect(state.analyze.reports).toEqual([expect.objectContaining({ logId: 'L-1', app: 'order-service', errorCode: 'E1001', phase: 'pending', followups: 0, warnings: [] })])
     const retried = await fetch(`${h.base}/logalyze/reports/upload`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'f'.repeat(24) }) })
     expect(retried.status).toBe(400)

@@ -146,6 +146,8 @@ export interface RepoStatusWire {
   error?: string
   /** Whether the application is offered to intent recognition and dispatch. */
   available: boolean
+  /** Whether the catalog entry's access lets setups and SKILL improvements push; a read-only repository is only analyzed. */
+  writable: boolean
   /** Child analyses currently running in snapshots of this repository. */
   activeRuns: number
 }
@@ -230,7 +232,7 @@ export interface AnalyzeWire {
   /** Token status; absent while the DSH composition has no credential store. */
   token?: TokenStatusWire
   topics: TopicsAvailability
-  /** Whether the loaded Feishu channel plugin reports launch states, which report upload needs. */
+  /** Whether the provider reports launch states, which report uploads need; older version-2 providers do not. */
   reportsSupported: boolean
   /** Most recently accepted reports, newest first. */
   reports: ReportWire[]

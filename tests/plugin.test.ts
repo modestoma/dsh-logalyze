@@ -105,6 +105,32 @@ async function json<T>(response: Response): Promise<T> {
 }
 
 describe('plugin', () => {
+  it('syncs each repository once at startup and again when dsh-repo reloads', async () => {
+    const { dir, cleanup } = await tempDir()
+    cleanups.push(cleanup)
+    const origin = await createAppRepo(join(dir, 'order-service'))
+    const h = await harness()
+    cleanups.push(h.dispose)
+    h.repos.setCatalog([{ url: origin }])
+    const injected: ((child: HostContext) => void)[] = []
+    let current: FakeRepos = h.repos
+    const { inject, get } = h.ctx
+    h.ctx = {
+      ...h.ctx,
+      get: name => name === 'dshRepos' ? current : get?.(name),
+      inject: (deps, callback) => { if (deps.includes('dshRepos')) injected.push(callback); return inject?.(deps, callback) },
+    }
+    apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
+    const ready = async (): Promise<boolean> => (await json<StateWire>(await fetch(`${h.base}/logalyze/state`))).repos[0]?.phase === 'ready'
+    await waitFor(ready)
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(h.repos.acquires.map(call => call.repo)).toEqual([origin])
+    // A reloaded dsh-repo is a new service instance.
+    current = Object.create(h.repos) as FakeRepos
+    for (const callback of injected) callback(h.ctx)
+    await waitFor(async () => h.repos.acquires.length === 2 && await ready())
+  })
+
   it('registers the entry skill, clones repositories, and offers the dispatch tool to top-level agents only', async () => {
     const { dir, cleanup } = await tempDir()
     cleanups.push(cleanup)
@@ -138,6 +164,11 @@ describe('plugin', () => {
     expect(h.statusListeners).toHaveLength(1)
     // The log analysis feature is registered with dsh-repo while the plugin runs.
     expect(h.repos.features.get('log-analysis')).toMatchObject({ id: 'log-analysis', title: '日志分析' })
+    // A repository the catalog lists as read-only is analyzed, but its SKILL cannot be improved.
+    h.repos.catalog = h.repos.catalog.map(repo => ({ ...repo, access: 'read' }))
+    h.repos.emitReposChange()
+    await waitFor(async () => await improve!.when?.(step()) === false)
+    expect(await tool!.when?.(step())).toBe(true)
   })
 
   it('mentions SKILL improvement in /logalyze unless it is turned off', async () => {
@@ -159,19 +190,20 @@ describe('plugin', () => {
   it('adds a repository from a conversation to the dsh-repo catalog and offers drafting while it lacks a description', async () => {
     const { dir, cleanup } = await tempDir()
     cleanups.push(cleanup)
-    const origin = await createAppRepo(join(dir, 'order-service'))
-    await commitFile(origin, '.agents/logalyze.yaml', 'not: [valid')
-    const approval = { request: vi.fn(async () => 'allowed-once' as const) }
-    const h = await harness({ approval })
+    const local = await createAppRepo(join(dir, 'order-service'))
+    await commitFile(local, '.agents/logalyze.yaml', 'not: [valid')
+    const origin = 'https://git.example.com/shop/order-service.git'
+    const h = await harness()
     cleanups.push(h.dispose)
+    h.repos.origins.set(origin, local)
     const overlayPath = join(dir, 'settings.json')
     apply(h.ctx, {}, { overlayPath })
     const [, , , add, init] = h.tools
-    const step = { agent: { id: 'a', session: { header: { id: 'a' } } }, signal: new AbortController().signal }
+    const step = { agent: { id: 'a', session: { header: { id: 'a' } } }, signal: new AbortController().signal, callId: 'call-1' }
     expect(await init!.when?.(step)).toBe(false)
     const value = await add!.definition.execute({ url: origin }, step)
     expect(value).toMatchObject({ status: 'added', setup: 'needs-setup' })
-    expect(h.repos.addRepoCalls).toEqual([{ repo: origin, access: 'write', features: ['log-analysis'] }])
+    expect(h.repos.addRepoCalls).toEqual([{ repo: origin, access: 'write', features: ['log-analysis'], agent: step.agent, callId: 'call-1', signal: step.signal }])
     expect(h.repos.catalog).toMatchObject([{ url: origin, access: 'write', features: ['log-analysis'] }])
     const state = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
     expect(state.repos).toMatchObject([{ url: origin, available: false }])
@@ -179,14 +211,15 @@ describe('plugin', () => {
     expect(await init!.when?.(step)).toBe(true)
 
     // A catalog entry without the feature gets it turned on and keeps its access.
-    const other = await createAppRepo(join(dir, 'other'))
+    const other = 'https://git.example.com/shop/other.git'
+    h.repos.origins.set(other, await createAppRepo(join(dir, 'other')))
     h.repos.catalog.push({ id: 'ffffffffffff', url: other, access: 'read', features: [] })
     expect(await add!.definition.execute({ url: other }, step)).toMatchObject({ status: 'added', setup: 'ready' })
     expect(h.repos.catalog.find(repo => repo.url === other)).toMatchObject({ access: 'read', features: ['log-analysis'] })
 
     // dsh-repo refusing the addition fails the call.
     h.repos.addRepoError = Object.assign(new Error('addRepo 未获授权，没有执行：不是管理员'), { name: 'RepoError', code: 'forbidden' })
-    await expect(add!.definition.execute({ url: join(dir, 'third') }, step)).rejects.toThrow('不是管理员')
+    await expect(add!.definition.execute({ url: 'https://git.example.com/shop/third.git' }, step)).rejects.toThrow('不是管理员')
   })
 
   it('follows the dsh-repo catalog: repositories with the log analysis feature are the application repositories', async () => {

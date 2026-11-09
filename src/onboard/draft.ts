@@ -12,14 +12,15 @@
  */
 
 import { join } from 'node:path'
-import type { DshRepos, WorkspaceStatus } from '../repos/contract.ts'
-import { checkAppManifest, skillNameOf, skillPath } from '../repos/manifest.ts'
-import type { RepoFileReader } from '../repos/manifest.ts'
-import { treeReader, withSnapshot } from '../repos/snapshot.ts'
+import { checkAppManifest, skillNameOf, skillPath } from '../apps/manifest.ts'
+import type { RepoFileReader } from '../apps/manifest.ts'
+import { treeReader } from '../apps/tree.ts'
+import type { ReposClient } from '../deps/repos.ts'
+import type { WorkspaceStatus } from '../deps/repos-contract.ts'
+import { checkChanges, readReason, WORKSPACE_DIR } from '../runs/changes.ts'
+import type { CheckedChanges } from '../runs/changes.ts'
 import type { AppManifest, SkillUpdateSettings } from '../settings/contract.ts'
-import { ProposalError } from '../skill-update/files.ts'
-import { checkChanges, readReason, WORKSPACE_DIR } from '../skill-update/workspace.ts'
-import type { CheckedChanges } from '../skill-update/workspace.ts'
+import { ProposalError } from '../util/files.ts'
 
 /** Repository directory the draft lives in. */
 export const AGENTS_DIR = '.agents'
@@ -72,10 +73,10 @@ function publishedReader(changes: WorkspaceStatus, baseDir: string, maxBytes: nu
  * @returns the draft.
  * @throws ProposalError when the application would not be usable or a change is not allowed; the service's error when it cannot report the changes.
  */
-export async function checkInitDraft(repos: DshRepos, workDir: string, limits: Pick<SkillUpdateSettings, 'maxFiles' | 'maxFileBytes'>, signal?: AbortSignal): Promise<InitDraft> {
+export async function checkInitDraft(repos: ReposClient, workDir: string, limits: Pick<SkillUpdateSettings, 'maxFiles' | 'maxFileBytes'>, signal?: AbortSignal): Promise<InitDraft> {
   const dir = join(workDir, WORKSPACE_DIR)
-  const changes = await repos.workspaceStatus({ path: dir, ...signal === undefined ? {} : { signal } })
-  const { app } = await withSnapshot(repos, changes.workspace.repo, changes.workspace.baseCommit, signal, async (lease) => {
+  const changes = await repos.require().workspaceStatus({ path: dir, ...signal === undefined ? {} : { signal } })
+  const { app } = await repos.withSnapshot(changes.workspace.repo, changes.workspace.baseCommit, signal, async (lease) => {
     const read = publishedReader(changes, lease.path, limits.maxFileBytes)
     const checked = await checkAppManifest(read)
     if (!checked.ok) throw new ProposalError(checked.error)

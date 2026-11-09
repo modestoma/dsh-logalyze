@@ -20,43 +20,19 @@
  */
 
 import { mountAnalyzeRoute } from './analyze/server.ts'
-import { FEISHU_TOPICS_SERVICE } from './analyze/topics.ts'
 import { resolveConfig } from './config.ts'
+import { DSH_REPOS_SERVICE, lookupRepos } from './deps/repos.ts'
+import { FEISHU_TOPICS_SERVICE } from './deps/topics.ts'
 import type { HostContext } from './host.ts'
-import { DSH_REPOS_SERVICE, lookupRepos } from './repos/lookup.ts'
 import { LogalyzeService } from './service.ts'
 import type { ServiceOptions } from './service.ts'
 import { defaultOverlayPath, OverlayStore } from './settings/overlay.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
 import { loadBundledSkills } from './skill/bundled.ts'
+import { messageOf } from './util/errors.ts'
 
 export type * from './settings/contract.ts'
-export type { LogalyzeConfig, SettingsOverlay } from './config.ts'
-export { pluginConfigSchema, resolveConfig } from './config.ts'
-export { DISPATCH_TOOL_NAME, Dispatcher } from './dispatch/tool.ts'
-export type { DispatchValue, TaskResult } from './dispatch/tool.ts'
-export { renderChildPrompt } from './dispatch/prompt.ts'
-export { IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from './skill-update/names.ts'
-export { SkillViewer } from './skill-update/show.ts'
-export type { ShowSkillValue } from './skill-update/show.ts'
-export { SkillImprover } from './skill-update/tool.ts'
-export type { AnalyzedTask, ImproveStatus, ImproveValue } from './skill-update/tool.ts'
-export type { GapCheck } from './skill-update/gap.ts'
-export { ADD_REPO_TOOL_NAME, INIT_REPO_TOOL_NAME, SUBMIT_INIT_TOOL_NAME } from './onboard/names.ts'
-export { RepoAdder } from './onboard/add.ts'
-export type { AddRepoStatus, AddRepoValue, RepoSetup } from './onboard/add.ts'
-export { RepoInitializer } from './onboard/init.ts'
-export type { DraftCheck, InitRepoValue, SubmitInitValue } from './onboard/init.ts'
-export { ENTRY_SKILL_NAME, renderEntrySkill } from './skill/entry.ts'
-export { IMPROVE_SKILL_NAME, KIT_SKILL_NAME } from './skill/bundled.ts'
-export { RepoRegistry } from './repos/registry.ts'
-export { readAppManifest, MANIFEST_PATH } from './repos/manifest.ts'
-export { LogalyzeService } from './service.ts'
-export { ANALYZE_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_ROUTE } from './settings/contract.ts'
-export { analyzeRequestHash, parseAnalyzeRequest } from './analyze/contract.ts'
-export { ReportTracker } from './report/tracker.ts'
-export type { CommandRunner } from './report/command.ts'
-export type { AnalyzeAccepted, AnalyzeRefused, AnalyzeRequest } from './analyze/contract.ts'
+export type { LogalyzeConfig } from './config.ts'
 
 /** Cordis plugin name. */
 export const name = 'logalyze'
@@ -88,19 +64,19 @@ export function apply(ctx: HostContext, config?: unknown, options: LogalyzePlugi
   const bundled = loadBundledSkills(new URL('../skills/', import.meta.url))
   const service = new LogalyzeService(ctx, resolveConfig(config), new OverlayStore(options.overlayPath ?? defaultOverlayPath()), { bundled }, options)
   service.registerSkill()
-  service.registerTool()
+  service.registerTools()
   mountSettingsRoutes(ctx, service)
   mountAnalyzeRoute(ctx, service.analyzeGate(), (request, key) => service.trackReport(request, key))
   ctx.effect(() => {
     void service.boot().catch((error: unknown) => {
-      ctx.logger?.error?.('logalyze: 启动失败：%s', error instanceof Error ? error.message : String(error))
+      ctx.logger?.error?.('logalyze: 启动失败：%s', messageOf(error))
     })
     return () => { service.shutdown() }
   }, 'logalyze: repositories')
   // Check reports waiting for their first turn whenever the Feishu channel plugin's service appears.
   ctx.inject?.([FEISHU_TOPICS_SERVICE], () => {
     void service.topicsAvailable().catch((error: unknown) => {
-      ctx.logger?.error?.('logalyze: 核对分析报告失败：%s', error instanceof Error ? error.message : String(error))
+      ctx.logger?.error?.('logalyze: 核对分析报告失败：%s', messageOf(error))
     })
   })
   // Whenever dsh-repo's service appears, including after it reloads: register
@@ -110,7 +86,7 @@ export function apply(ctx: HostContext, config?: unknown, options: LogalyzePlugi
     const lookup = lookupRepos(child.get?.(DSH_REPOS_SERVICE))
     if (lookup.availability === 'ready') child.effect(() => service.watchRepos(lookup.service), 'logalyze: dsh-repo catalog')
     void service.reposAvailable().catch((error: unknown) => {
-      ctx.logger?.error?.('logalyze: 同步仓库失败：%s', error instanceof Error ? error.message : String(error))
+      ctx.logger?.error?.('logalyze: 同步仓库失败：%s', messageOf(error))
     })
   })
 }

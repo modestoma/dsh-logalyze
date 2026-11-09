@@ -3,7 +3,7 @@ import type { Server } from 'node:http'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, beforeAll, afterAll, describe, expect, it } from 'vitest'
-import { admitUrl, downloadLog, fileNameFor, isHostAllowed } from '../src/dispatch/download.ts'
+import { admitUrl, downloadLog, fileNameFor, isHostAllowed } from '../src/runs/download.ts'
 import type { DownloadSettings } from '../src/settings/contract.ts'
 import { tempDir } from './helpers.ts'
 

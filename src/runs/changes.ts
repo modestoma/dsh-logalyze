@@ -10,15 +10,14 @@
  * 改动、删除、重命名或类型变化都让整份改动不合格。文件内容从工作区读取，不跟随
  * 符号链接。
  *
- * @module dsh-logalyze/skill-update/workspace
+ * @module dsh-logalyze/runs/changes
  */
 
-import { createHash } from 'node:crypto'
 import { join } from 'node:path'
-import type { WorkspaceStatus } from '../repos/contract.ts'
-import { treeReader } from '../repos/snapshot.ts'
+import { treeReader } from '../apps/tree.ts'
+import type { WorkspaceStatus } from '../deps/repos-contract.ts'
 import type { SkillUpdateSettings } from '../settings/contract.ts'
-import { kindOf, ProposalError, readText } from './files.ts'
+import { kindOf, ProposalError, readText } from '../util/files.ts'
 
 /** Workspace directory inside a run directory. */
 export const WORKSPACE_DIR = 'repo'
@@ -76,8 +75,6 @@ export interface CheckedChanges {
   readonly base: string
   readonly files: readonly FileStat[]
   readonly contents: readonly ChangedFile[]
-  /** Hexadecimal digest of the base commit and the changed files. */
-  readonly digest: string
   /** Unified diff from the base commit to the working tree; cut at dsh-repo's diff limit. */
   readonly diff: string
 }
@@ -116,19 +113,16 @@ export async function checkChanges(changes: WorkspaceStatus, scope: ChangeScope,
   if (sorted.length > limits.maxFiles) throw new ProposalError(`改动了 ${sorted.length} 个文件，超过上限 ${limits.maxFiles}`)
 
   const reader = treeReader(workspace.path, limits.maxFileBytes)
-  const digest = createHash('sha256').update(`${base}\n`)
   const contents: ChangedFile[] = []
   for (const file of sorted) {
     const content = await reader(file.path)
     if (content === undefined) throw new ProposalError(`${file.path} 已不在工作区中`)
     contents.push({ path: file.path, relative: file.path.slice(prefix.length), content })
-    digest.update(`${file.path}\0${content}\0`)
   }
   return {
     base,
     files: sorted.map(file => ({ path: file.path, added: file.additions ?? 0, removed: file.deletions ?? 0 })),
     contents,
-    digest: digest.digest('hex'),
     diff: changes.diff,
   }
 }

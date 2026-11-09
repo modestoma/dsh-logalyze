@@ -3,14 +3,13 @@
  * by repository path. Nothing is followed through a symbolic link, so a link
  * committed to the repository cannot make a read leave the tree.
  *
- * @module dsh-logalyze/repos/snapshot
+ * @module dsh-logalyze/apps/tree
  */
 
 import { lstat, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { DshRepos, SnapshotLease } from './contract.ts'
 import type { RepoFileReader } from './manifest.ts'
-import { ProposalError, readText } from '../skill-update/files.ts'
+import { ProposalError, readText } from '../util/files.ts'
 
 /** Largest repository file read from a snapshot (application descriptions and SKILL files). */
 export const MAX_REPO_FILE_BYTES = 1024 * 1024
@@ -85,22 +84,4 @@ export async function treeFiles(root: string, dir: string): Promise<string[]> {
   }
   await walk('')
   return found.sort()
-}
-
-/**
- * Hold a snapshot while `use` runs.
- * @param repos - the `dshRepos` service.
- * @param repo - catalog address.
- * @param ref - branch, tag, or commit; undefined: the catalog entry's branch.
- * @param signal - cancellation.
- * @param use - work on the held snapshot.
- * @returns what `use` returned; the snapshot is released afterwards.
- */
-export async function withSnapshot<T>(repos: DshRepos, repo: string, ref: string | undefined, signal: AbortSignal | undefined, use: (lease: SnapshotLease) => Promise<T>): Promise<T> {
-  const lease = await repos.snapshotAcquire({ repo, ...ref === undefined ? {} : { ref }, ...signal === undefined ? {} : { signal } })
-  try {
-    return await use(lease)
-  } finally {
-    lease.release()
-  }
 }

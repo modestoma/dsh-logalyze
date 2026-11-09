@@ -3,14 +3,19 @@
  * `$DSH_HOME/logalyze/reports/<id>.json`，写入先落临时文件再改名；读到的
  * 内容按 {@link reportRecordSchema} 校验，不合格的文件记日志后跳过。
  *
+ * 保留最近活动（接受请求或记录一轮）在 {@link REPORT_RETENTION_MS} 之内的记录，
+ * 最多 {@link MAX_REPORT_RECORDS} 份；清理时删除记录文件和存储目录下的报告目录
+ * `<id>/`，话题工作目录里的报告目录归话题所有，不删除。
+ *
  * @module dsh-logalyze/report/store
  */
 
 import { createHash } from 'node:crypto'
-import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { z } from 'zod'
 import { resolveDshHome } from '../config.ts'
+import { replaceFile } from '../util/files.ts'
 
 const STATUS = z.enum(['done', 'stopped', 'error', 'failed', 'interrupted'])
 
@@ -63,6 +68,21 @@ export const reportRecordSchema = z.object({
 /** One tracked report. */
 export type ReportRecord = z.infer<typeof reportRecordSchema>
 
+/** Most records kept; the least recently active are dropped first. */
+export const MAX_REPORT_RECORDS = 200
+
+/** Records with no activity for this long are dropped: 30 days. */
+export const REPORT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
+ * When a record last changed: its acceptance or its latest recorded turn.
+ * @param record - the record.
+ * @returns epoch milliseconds.
+ */
+export function lastActivityOf(record: ReportRecord): number {
+  return Math.max(record.acceptedAt, ...record.sections.map(section => section.at))
+}
+
 /**
  * Report id of one request.
  * @param key - the request's `Idempotency-Key`.
@@ -80,8 +100,6 @@ export function reportIdOf(key: string): string {
 export function defaultReportsDir(env: NodeJS.ProcessEnv = process.env): string {
   return join(resolveDshHome(env), 'logalyze', 'reports')
 }
-
-let writes = 0
 
 /** Reads and writes the report records of one directory. */
 export class ReportStore {
@@ -134,10 +152,29 @@ export class ReportStore {
   async put(record: ReportRecord): Promise<void> {
     this.records.set(record.id, record)
     await mkdir(this.dir, { recursive: true })
-    const path = join(this.dir, `${record.id}.json`)
-    writes += 1
-    const temporary = `${path}.${process.pid}.${writes}.tmp`
-    await writeFile(temporary, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 })
-    await rename(temporary, path)
+    await replaceFile(join(this.dir, `${record.id}.json`), `${JSON.stringify(record)}\n`, 0o600)
+  }
+
+  /**
+   * Drop the records past {@link REPORT_RETENTION_MS} of inactivity and the
+   * least recently active beyond {@link MAX_REPORT_RECORDS}, with their files
+   * and store-local report directories.
+   * @param now - epoch milliseconds.
+   * @param busy - whether a record is in use and must be kept this time.
+   * @returns the dropped ids; a file that cannot be removed is reported to the warning sink and its record is still forgotten.
+   */
+  async prune(now: number, busy: (id: string) => boolean): Promise<string[]> {
+    const ranked = this.all().sort((left, right) => lastActivityOf(right) - lastActivityOf(left))
+    const dropped = ranked.filter((record, index) => !busy(record.id) && (index >= MAX_REPORT_RECORDS || now - lastActivityOf(record) > REPORT_RETENTION_MS)).map(record => record.id)
+    for (const id of dropped) {
+      this.records.delete(id)
+      try {
+        await rm(join(this.dir, `${id}.json`), { force: true })
+        await rm(join(this.dir, id), { recursive: true, force: true })
+      } catch (error) {
+        this.warn(`logalyze: 删除过期回传记录 ${id} 失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return dropped
   }
 }

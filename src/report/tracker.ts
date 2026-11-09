@@ -14,16 +14,19 @@
  * - 同一份报告的上传串行执行；上传进行中又有新的轮次时，结束后再上传一次最新
  *   内容。命令失败按退避重试；目录里有符号链接或超过文件数、总大小上限时不上传，
  *   等内容变化或在面板手动重传。
+ * - 启动时和每接受一份新报告时按存储的保留规则清理旧记录；正在上传或更新的
+ *   记录这次不清理。
  *
  * @module dsh-logalyze/report/tracker
  */
 
-import { randomUUID } from 'node:crypto'
-import { lstat, mkdir, rename, writeFile } from 'node:fs/promises'
+import { lstat, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { AnalyzeRequest } from '../analyze/contract.ts'
-import type { TopicLaunchState } from '../analyze/feishu-topics.ts'
+import type { TopicLaunchState } from '../deps/topics-contract.ts'
+import type { TopicStates } from '../deps/topics.ts'
 import type { SessionEventEnvelope, SessionHeader } from '../host.ts'
+import { replaceFile } from '../util/files.ts'
 import { REPORT_DIR, REPORT_ENTRY } from '../settings/contract.ts'
 import type { ReportStatus, ReportWire, UploadPhase, UploadSettings } from '../settings/contract.ts'
 import { runCommand, uploadArgv } from './command.ts'
@@ -35,17 +38,11 @@ import type { ReportSection } from './render.ts'
 import { reportIdOf } from './store.ts'
 import type { ReportRecord, ReportStore } from './store.ts'
 
-/** The `feishuTopics` methods report tracking reads. */
-export interface ReportTopics {
-  state(key: string): TopicLaunchState | undefined
-  launchKeyOf(sessionId: string): string | undefined
-}
-
 /** Collaborators of the tracker. */
 export interface ReportTrackerDeps {
   readonly store: ReportStore
   /** The launch-state methods of the loaded `feishuTopics`, or undefined while unavailable. */
-  topics(): ReportTopics | undefined
+  topics(): TopicStates | undefined
   /** Current upload settings. */
   upload(): UploadSettings
   readonly warn: (message: string) => void
@@ -135,6 +132,7 @@ export class ReportTracker {
   /** Load stored records and resume uploads that had not finished. */
   async boot(): Promise<void> {
     await this.deps.store.load()
+    await this.prune()
     for (const record of this.deps.store.all()) {
       if (record.uploadedRevision < record.revision && record.blocked !== true) this.schedule(record.id)
     }
@@ -158,8 +156,14 @@ export class ReportTracker {
         id, key, logId: request.logId, app: request.app, errorCode: request.errorCode, triggeredAt: request.triggeredAt,
         acceptedAt: this.now(), sections: [], turns: {}, snapshot: {}, warnings: [], revision: 0, uploadedRevision: 0,
       })
+      await this.prune()
     }
     await this.reconcileOne(id)
+  }
+
+  /** Drop expired and excess records that no upload or update is using. */
+  private async prune(): Promise<void> {
+    await this.deps.store.prune(this.now(), id => this.workers.has(id) || this.locks.has(id))
   }
 
   /**
@@ -454,13 +458,8 @@ export class ReportTracker {
     try {
       await mkdir(dir, { recursive: true })
       if (!(await lstat(dir)).isDirectory()) return { ok: false, retryable: false, error: `报告目录 ${dir} 不是普通目录（可能是符号链接），没有上传` }
-      const entry = join(dir, REPORT_ENTRY)
-      // The directory is agent-writable: create the temporary file exclusively
-      // under a fresh name, so an existing entry (a symbolic link included) is never followed.
-      const temporary = join(dir, `.${REPORT_ENTRY}.${randomUUID()}.tmp`)
-      await writeFile(temporary, renderReport(record, record.sections), { encoding: 'utf8', flag: 'wx' })
-      // Renaming replaces whatever the agent left under the entry name, a symbolic link included.
-      await rename(temporary, entry)
+      // The directory is agent-writable; replacing never follows what the agent left under the entry name.
+      await replaceFile(join(dir, REPORT_ENTRY), renderReport(record, record.sections))
       const listing = await listReport(dir)
       if (listing.refused.length > 0) return { ok: false, retryable: false, error: `报告目录里有符号链接或特殊文件，没有上传：${listing.refused.slice(0, 5).join('、')}` }
       if (listing.count > settings.maxFiles) return { ok: false, retryable: false, error: `报告目录有 ${listing.count} 个文件，超过上限 ${settings.maxFiles}，没有上传` }

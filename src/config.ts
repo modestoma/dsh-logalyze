@@ -6,31 +6,29 @@
  */
 
 import { homedir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
+import { join } from 'node:path'
 import { z } from 'zod'
 import { TOKEN_ENV_PATTERN, UPLOAD_PLACEHOLDERS } from './settings/contract.ts'
-import type { EditableSettings } from './settings/contract.ts'
+import type { EditableKey, EditableSettings } from './settings/contract.ts'
 
 /** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
 
-const URL_SCHEMES = new Set(['https:', 'file:'])
 const HOST_NAME = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]*[a-z0-9])?$/
 
 /**
- * Whether a string is a repository address the `dshRepos` service mirrors: an
- * `https` or `file` URL, or an absolute local path. SSH, scp-like
- * `user@host:path`, `git://`, and other transports are refused.
+ * Whether a string is a repository address the `dshRepos` service mirrors:
+ * an `https` URL. SSH, scp-like `user@host:path`, `git://`, `file:`, local
+ * paths, and other transports are refused.
  * @param value - candidate repository address.
  * @returns whether it is accepted.
  */
 export function isAcceptedGitUrl(value: string): boolean {
   if (value.startsWith('-') || /\s/.test(value)) return false
-  if (isAbsolute(value)) return true
   try {
-    return URL_SCHEMES.has(new URL(value).protocol)
+    return new URL(value).protocol === 'https:'
   } catch {
-    // Not a URL and not scp-like: refused.
+    // Not a URL (an scp-like address or a local path): refused.
     return false
   }
 }
@@ -51,7 +49,7 @@ export function isAcceptedBranch(value: string): boolean {
 
 /** Arguments of `logalyze_add_repo`: git address and optional branch. */
 export const repoSchema = z.object({
-  url: z.string().trim().min(1, 'git 地址不能为空').refine(isAcceptedGitUrl, '不支持的 git 地址（支持 https URL、file URL 或本机绝对路径，不支持 ssh 和 user@host:path）'),
+  url: z.string().trim().min(1, 'git 地址不能为空').refine(isAcceptedGitUrl, '不支持的 git 地址（只支持 https 地址，不支持 ssh、user@host:path 和本机路径）'),
   branch: z.string().trim().optional().transform(value => value === '' ? undefined : value)
     .refine(value => value === undefined || isAcceptedBranch(value), '分支名不合法'),
 }).strict()
@@ -114,24 +112,30 @@ const analyzeSchema = z.object({
  */
 const retiredRepos = z.never({ error: '应用仓库已改在 dsh-repo 中配置：删除 repos，在「代码仓库 → 仓库」中添加这些仓库并打开「日志分析」功能' }).optional()
 
-/** Field validators shared by the cordis config and the panel overlay. */
+/**
+ * Field validators shared by the cordis config, the panel overlay, and the
+ * panel's save payload, with the defaults cordis.yml falls back to.
+ */
 export const editableFields = {
-  fetchIntervalMs: durationMs(0),
-  maxAppsPerRequest: z.number().int().min(1).max(32),
-  dispatchTimeoutMs: durationMs(1000),
-  download: downloadSchema,
-  skillUpdates: skillUpdatesSchema,
-  analyze: analyzeSchema,
-}
-
-const configSchema = z.object({
-  repos: retiredRepos,
-  fetchIntervalMs: editableFields.fetchIntervalMs.default(0),
-  maxAppsPerRequest: editableFields.maxAppsPerRequest.default(4),
-  dispatchTimeoutMs: editableFields.dispatchTimeoutMs.default(30 * 60 * 1000),
+  fetchIntervalMs: durationMs(0).default(0),
+  maxAppsPerRequest: z.number().int().min(1).max(32).default(4),
+  dispatchTimeoutMs: durationMs(1000).default(30 * 60 * 1000),
   download: downloadSchema.prefault({}),
   skillUpdates: skillUpdatesSchema.prefault({}),
   analyze: analyzeSchema.prefault({}),
+}
+
+/** A complete editable settings payload, as the panel saves it. */
+export const editableSettingsSchema = z.object(editableFields).strict()
+
+/** Compile-time check that the panel wire type and the validators name the same fields. */
+type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never
+const editableSettingsMatch: Same<z.output<typeof editableSettingsSchema>, EditableSettings> = true
+void editableSettingsMatch
+
+const configSchema = z.object({
+  repos: retiredRepos,
+  ...editableFields,
   /**
    * Credential reference (environment-variable name) whose value is the
    * analyze API's bearer token.
@@ -158,12 +162,12 @@ export type LogalyzeConfig = z.output<typeof configSchema>
 /** Standard Schema the Cordis loader validates `config` with before `apply()`. */
 export const pluginConfigSchema = configSchema.prefault({})
 
-/** Panel overlay: any subset of the editable settings. */
+/** Panel overlay: any subset of the editable settings; a stored key replaces its default wholesale. */
 export const overlaySchema = z.object({
   repos: retiredRepos,
-  fetchIntervalMs: editableFields.fetchIntervalMs.optional(),
-  maxAppsPerRequest: editableFields.maxAppsPerRequest.optional(),
-  dispatchTimeoutMs: editableFields.dispatchTimeoutMs.optional(),
+  fetchIntervalMs: editableFields.fetchIntervalMs.unwrap().optional(),
+  maxAppsPerRequest: editableFields.maxAppsPerRequest.unwrap().optional(),
+  dispatchTimeoutMs: editableFields.dispatchTimeoutMs.unwrap().optional(),
   download: downloadSchema.optional(),
   skillUpdates: skillUpdatesSchema.optional(),
   analyze: analyzeSchema.optional(),
@@ -172,8 +176,8 @@ export const overlaySchema = z.object({
 /** Validated panel overlay. */
 export type SettingsOverlay = z.output<typeof overlaySchema>
 
-/** A complete editable settings payload, as the panel saves it. */
-export const editableSettingsSchema = z.object(editableFields).strict()
+const overlayKeysMatch: Same<keyof SettingsOverlay, EditableKey | 'repos'> = true
+void overlayKeysMatch
 
 /**
  * Format the first validation issue as one panel/log line.
@@ -211,30 +215,13 @@ export function resolveDshHome(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /**
- * Expand `~` and make a configured directory absolute.
- * @param path - configured directory.
- * @returns absolute directory.
- */
-export function expandHome(path: string): string {
-  if (path === '~') return homedir()
-  if (path.startsWith('~/')) return join(homedir(), path.slice(2))
-  return resolve(path)
-}
-
-/**
  * The editable settings a configuration implies.
  * @param config - validated plugin configuration.
- * @returns complete editable settings.
+ * @returns complete editable settings, sharing nothing with `config`.
  */
 export function defaultsOf(config: LogalyzeConfig): EditableSettings {
-  return {
-    fetchIntervalMs: config.fetchIntervalMs,
-    maxAppsPerRequest: config.maxAppsPerRequest,
-    dispatchTimeoutMs: config.dispatchTimeoutMs,
-    download: { ...config.download, allowedHosts: [...config.download.allowedHosts] },
-    skillUpdates: { ...config.skillUpdates },
-    analyze: { ...config.analyze, upload: { ...config.analyze.upload, command: [...config.analyze.upload.command] } },
-  }
+  // Parsing without `strict` drops the other configuration keys and copies every value.
+  return z.object(editableFields).parse(config)
 }
 
 /**
@@ -245,12 +232,6 @@ export function defaultsOf(config: LogalyzeConfig): EditableSettings {
  * @returns effective settings.
  */
 export function applyOverlay(defaults: EditableSettings, overlay: SettingsOverlay): EditableSettings {
-  return {
-    fetchIntervalMs: overlay.fetchIntervalMs ?? defaults.fetchIntervalMs,
-    maxAppsPerRequest: overlay.maxAppsPerRequest ?? defaults.maxAppsPerRequest,
-    dispatchTimeoutMs: overlay.dispatchTimeoutMs ?? defaults.dispatchTimeoutMs,
-    download: overlay.download ?? defaults.download,
-    skillUpdates: overlay.skillUpdates ?? defaults.skillUpdates,
-    analyze: overlay.analyze ?? defaults.analyze,
-  }
+  const { repos: _retired, ...overrides } = overlay
+  return { ...defaults, ...overrides }
 }

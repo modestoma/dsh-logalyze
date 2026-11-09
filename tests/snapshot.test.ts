@@ -1,7 +1,7 @@
 import { mkdir, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { treeFiles, treeKind, treeReader } from '../src/repos/snapshot.ts'
+import { treeFiles, treeKind, treeReader } from '../src/apps/tree.ts'
 import { tempDir } from './helpers.ts'
 
 const cleanups: (() => Promise<void>)[] = []

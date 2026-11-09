@@ -321,6 +321,7 @@ function ReposTab({ state, busy, openRepoSettings, onSync }: LogalyzePageProps &
                 <span className="lz__mono">{repo.url}</span>
                 {repo.branch === undefined ? null : <span className="lz__tag">{repo.branch}</span>}
                 {phasePill(repo)}
+                {repo.writable ? null : <span className="lz__pill" title="dsh-repo 中权限为只读：只分析，不起草接入、不改进 SKILL">只读</span>}
               </div>
               {repo.app !== undefined
                 ? <div className="lz__rowSummary">{repo.app.name}（<span className="lz__mono">{repo.app.id}</span>）· SKILL <span className="lz__mono">/{repo.app.skill}</span>{repo.activeRuns > 0 ? ` · ${repo.activeRuns} 个分析进行中` : ''}</div>
@@ -469,6 +470,7 @@ function AnalyzeTab({ draft, setDraft, analyze, credentialsAvailable, overridden
               <div className="lz__rowLabel">开启接口 <Overridden keys={overridden} name="analyze" /><span className={`lz__pill ${topics.pill}`}><span className="lz__dot" />{topics.text}</span></div>
               <div className="lz__rowSummary">日志平台调用接口后，观象经飞书渠道（dsh-channels）在目标群发出分析卡片，并在卡片下的话题里开始分析；群内成员都可以在话题里继续追问。关闭时接口回复 404。</div>
               {analyze.topics === 'ready' ? null : <div className="lz__rowError">{analyze.topics === 'missing' ? '接口需要加载 dsh-channels。' : '请把观象与 dsh-channels 升级到相互兼容的版本。'}</div>}
+              {analyze.reportsSupported || analyze.topics !== 'ready' ? null : <div className="lz__rowError">当前 dsh-channels 版本不提供话题状态查询，报告不会回传；请升级 dsh-channels。</div>}
             </div>
             <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="开启分析接口" checked={draft.analyzeEnabled} onChange={(event) => { setDraft({ ...draft, analyzeEnabled: event.target.checked }) }} /></div>
           </div>
@@ -498,7 +500,6 @@ function AnalyzeTab({ draft, setDraft, analyze, credentialsAvailable, overridden
             <div className="lz__rowText">
               <div className="lz__rowLabel">回传命令 <Overridden keys={overridden} name="analyze" /></div>
               <div className="lz__rowSummary">请求带 <span className="lz__mono">logId</span> 时，分析话题每一轮结束后，观象更新话题工作目录下的 <span className="lz__mono">report/</span>（入口 <span className="lz__mono">report.md</span> 记录首轮结论和每轮追问），再执行这条命令上传整个目录。每行一个参数，不经过 shell；可用占位符 <span className="lz__mono">{'{logId}'}</span>、<span className="lz__mono">{'{dir}'}</span>（报告目录绝对路径）、<span className="lz__mono">{'{entry}'}</span>（report.md）。</div>
-              {analyze.reportsSupported || analyze.topics !== 'ready' ? null : <div className="lz__rowError">当前 dsh-channels 版本不提供话题状态查询，报告不会回传；请升级 dsh-channels。</div>}
               <textarea className="lz__input lz__mono lz__textarea" rows={Math.max(3, draft.uploadCommand.split('\n').length)} spellCheck={false} aria-label="回传命令" value={draft.uploadCommand} onChange={(event) => { setDraft({ ...draft, uploadCommand: event.target.value }) }} />
             </div>
           </div>

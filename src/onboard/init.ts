@@ -1,7 +1,7 @@
 /**
  * 仓库接入初稿的起草与提交：
  *
- * - `logalyze_init_repo` 只接受已拉取但还没有可用应用的仓库：在运行目录
+ * - `logalyze_init_repo` 只接受已拉取但还没有可用应用、且在仓库清单中可写的仓库：在运行目录
  *   `.logalyze/runs/<runId>/init/repo/` 从最新同步提交创建工作区，推送分支为
  *   新的 `logalyze/init-<runId>`；以工作区为工作目录启动一个起草子 Agent，等待
  *   它结束后检查初稿并写出 diff，不推送任何东西。超时（`dispatchTimeoutMs`）或
@@ -15,25 +15,25 @@
  * @module dsh-logalyze/onboard/init
  */
 
-import { mkdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { z } from 'zod'
+import type { RepoRegistry } from '../apps/registry.ts'
 import { describeIssue } from '../config.ts'
-import { admitLogs, isDelegatedAgent, logSchema, materializeLogs, newRunId, resolveRunBase, RUNS_SEGMENTS } from '../dispatch/tool.ts'
-import { runChild } from '../dispatch/child.ts'
-import type { Agent, ContentBlock, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
-import { messageOf, requireRepos } from '../repos/lookup.ts'
-import type { RepoRegistry } from '../repos/registry.ts'
-import type { WorkspaceInfo } from '../repos/contract.ts'
+import type { ReposClient } from '../deps/repos.ts'
+import type { ContentBlock, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
+import { describeFiles, WORKSPACE_DIR } from '../runs/changes.ts'
+import type { FileStat } from '../runs/changes.ts'
+import { runChild } from '../runs/child.ts'
+import { admitLogs, logSchema, SAMPLE_LOGS_PARAMETER } from '../runs/logs.ts'
+import { pushChange, SKILL_COMMIT_PREFIX } from '../runs/push.ts'
+import type { PushStatus } from '../runs/push.ts'
+import { newRunId, resolveRunBase, RUNS_SEGMENTS, topLevelAgent } from '../runs/run-dir.ts'
+import { openWorkspace, writeDiff } from '../runs/workspace.ts'
 import type { AppManifest, EditableSettings } from '../settings/contract.ts'
-import { pushChange, SKILL_COMMIT_PREFIX } from '../skill-update/commit.ts'
-import type { PushStatus } from '../skill-update/commit.ts'
-import { replaceFile } from '../skill-update/files.ts'
-import { describeFiles, DIFF_FILE, WORKSPACE_DIR } from '../skill-update/workspace.ts'
-import type { FileStat } from '../skill-update/workspace.ts'
+import { ADD_REPO_TOOL_NAME, INIT_REPO_TOOL_NAME, SUBMIT_INIT_TOOL_NAME } from '../tool-names.ts'
+import { messageOf } from '../util/errors.ts'
 import { AGENTS_DIR, checkInitDraft } from './draft.ts'
 import type { InitDraft } from './draft.ts'
-import { ADD_REPO_TOOL_NAME, INIT_REPO_TOOL_NAME, SUBMIT_INIT_TOOL_NAME } from './names.ts'
 import { renderInitPrompt } from './prompt.ts'
 
 /** Drafts remembered for submission; older ones are forgotten first. */
@@ -104,15 +104,7 @@ const INIT_PARAMETERS: Record<string, unknown> = {
   properties: {
     url: { type: 'string', description: '应用仓库列表中已拉取、但缺少应用描述或日志分析 SKILL 的 git 地址。' },
     guidance: { type: 'string', description: '用户对仓库、模块划分或日志的说明，原样转给起草子 Agent。' },
-    logs: {
-      type: 'array',
-      description: '可选的样例日志。{ "path": 本机绝对路径 } 用于附件和本机文件；{ "url": 下载地址 } 用于对象存储链接（仅白名单域名）。',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        properties: { path: { type: 'string' }, url: { type: 'string' } },
-      },
-    },
+    logs: SAMPLE_LOGS_PARAMETER,
   },
 }
 
@@ -219,17 +211,9 @@ export interface RepoInitializerDeps {
   readonly provider: string
   settings(): EditableSettings
   workingDirectory(): WorkingDirectoryService | undefined
-  /** What `ctx.get('dshRepos')` returns now. */
-  repos(): unknown
+  readonly repos: ReposClient
   readonly fetch?: typeof fetch
   readonly now?: () => Date
-}
-
-function topLevelAgent(exec: ToolRunContext, tool: string): Agent {
-  const agent = exec.agent
-  if (agent === undefined) throw new Error(`${tool} 需要由 Agent 调用`)
-  if (isDelegatedAgent(agent)) throw new Error(`${tool} 不能在子 Agent 中调用`)
-  return agent
 }
 
 /** Drafts and submits application descriptions and SKILLs for repositories that lack them. */
@@ -301,8 +285,9 @@ export class RepoInitializer {
     const status = registry.statusOf(url)
     if (status === undefined) throw new Error(`${url} 不在观象的应用仓库列表中，先用 ${ADD_REPO_TOOL_NAME} 添加`)
     if (status.available) throw new Error(`${url} 的应用「${status.app?.id ?? ''}」已经可用；改进它的 SKILL 走派发结果中的 SKILL 改进`)
+    if (!status.writable) throw new Error(`${url} 在 dsh-repo 仓库清单中的权限是「只读」，不能推送接入草稿；请在 dsh-repo「代码仓库 → 仓库」把权限改为「可改代码」`)
     if (!registry.setupPending().includes(url)) throw new Error(`${url} 还不能起草：${status.error ?? status.phase}`)
-    const repos = requireRepos(this.deps.repos())
+    this.deps.repos.require()
     const settings = this.deps.settings()
     const { effectiveDir, baseDir } = await resolveRunBase(parent, this.deps.workingDirectory(), exec.signal)
     const sources = await admitLogs(parsed.data.logs ?? [], effectiveDir, settings.download)
@@ -311,17 +296,20 @@ export class RepoInitializer {
     const commit = status.commit as string
     const runId = newRunId(this.deps.now?.() ?? new Date())
     const workDir = join(baseDir, ...RUNS_SEGMENTS, runId, 'init')
-    const repoDir = join(workDir, WORKSPACE_DIR)
-    await mkdir(workDir, { recursive: true })
-    const base = registry.branchOf(url)
-    let workspace: WorkspaceInfo
-    try {
-      workspace = await repos.workspaceCreate({ repo: url, path: repoDir, ...base === undefined ? {} : { base }, commit, branch: `logalyze/init-${runId}`, agent: parent, ...exec.callId === undefined ? {} : { callId: exec.callId }, signal: exec.signal })
-    } catch (error) {
-      exec.signal.throwIfAborted()
-      throw new Error(`仓库 ${url} 的工作区创建失败：${messageOf(error)}`)
-    }
-    const logs = await materializeLogs(sources, workDir, settings.download, exec.signal, this.deps.fetch)
+    const { workspace, repoDir, logs } = await openWorkspace({
+      repos: this.deps.repos,
+      parent,
+      exec,
+      repo: url,
+      base: registry.branchOf(url),
+      commit,
+      branch: `logalyze/init-${runId}`,
+      workDir,
+      sources,
+      download: settings.download,
+      ...this.deps.fetch === undefined ? {} : { fetch: this.deps.fetch },
+      subject: `仓库 ${url} `,
+    })
     const prompt = renderInitPrompt({
       url,
       commit,
@@ -331,9 +319,10 @@ export class RepoInitializer {
       workDir,
       maxFiles: settings.skillUpdates.maxFiles,
     })
-    const outcome = await runChild({ subagents: this.deps.subagents, provider: this.deps.provider, parent, label: '观象接入起草', cwd: repoDir, prompt, timeoutMs: settings.dispatchTimeoutMs, signal: exec.signal })
-    const value: InitRepoValue = { url, commit, workDir, ...outcome }
-    if (outcome.status !== 'completed') return value
+    const child = await runChild({ subagents: this.deps.subagents, provider: this.deps.provider, parent, label: '观象接入起草', cwd: repoDir, prompt, timeoutMs: settings.dispatchTimeoutMs, signal: exec.signal })
+    exec.signal.throwIfAborted()
+    const value: InitRepoValue = { url, commit, workDir, status: child.status, output: child.output, ...child.diagnostic === undefined ? {} : { diagnostic: child.diagnostic } }
+    if (child.status !== 'completed') return value
     const task: DraftTask = { workDir, sessionId: parent.session.header.id, url, branch: workspace.branch, target: workspace.base, submitted: false }
     this.remember(task)
     try {
@@ -360,14 +349,11 @@ export class RepoInitializer {
    * @throws ProposalError, or an error when the `dshRepos` service is unavailable or cannot report the changes.
    */
   private async prepare(task: DraftTask, signal?: AbortSignal): Promise<{ draft: InitDraft; diffPath: string }> {
-    const repos = requireRepos(this.deps.repos())
-    const draft = await checkInitDraft(repos, task.workDir, this.deps.settings().skillUpdates, signal)
+    const draft = await checkInitDraft(this.deps.repos, task.workDir, this.deps.settings().skillUpdates, signal)
     // Conflicted applications are not ready but still claim their id.
     const conflict = this.deps.registry.status().find(repo => repo.app?.id === draft.app.id && repo.url !== task.url)
     if (conflict !== undefined) throw new Error(`应用 id「${draft.app.id}」已被 ${conflict.url} 使用，请换一个 id`)
-    const diffPath = join(task.workDir, DIFF_FILE)
-    await replaceFile(diffPath, draft.changes.diff)
-    return { draft, diffPath }
+    return { draft, diffPath: await writeDiff(task.workDir, draft.changes.diff) }
   }
 
   /**
@@ -384,7 +370,7 @@ export class RepoInitializer {
     const task = this.drafts.get(resolve(parsed.data.workDir))
     if (task === undefined) throw new Error(`${parsed.data.workDir} 不是本次 DSH 运行中观象起草任务的运行目录；DSH 重启后需要重新起草`)
     if (task.sessionId !== agent.session.header.id) throw new Error(`${parsed.data.workDir} 不是当前会话起草的任务`)
-    const repos = requireRepos(this.deps.repos())
+    const repos = this.deps.repos.require()
     const { branch, target } = task
 
     let prepared: Awaited<ReturnType<RepoInitializer['prepare']>>
