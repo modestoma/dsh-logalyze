@@ -327,7 +327,7 @@ function ReposTab({ state, busy, openRepoSettings, onSync }: LogalyzePageProps &
                 : null}
               {repo.app !== undefined ? <div className="lz__rowSummary">{repo.app.description}</div> : null}
               {repo.commit !== undefined
-                ? <div className="lz__rowSummary">提交 <span className="lz__mono">{repo.commit.slice(0, 8)}</span>（{formatTime(repo.commitTime)}）· 拉取于 {formatTime(repo.syncedAt)}{repo.dir === undefined ? null : <> · <span className="lz__mono">{repo.dir}</span></>}</div>
+                ? <div className="lz__rowSummary">提交 <span className="lz__mono">{repo.commit.slice(0, 8)}</span> · 拉取于 {formatTime(repo.syncedAt)}</div>
                 : null}
               {repo.error !== undefined ? <div className="lz__rowError">{repo.error}</div> : null}
             </div>

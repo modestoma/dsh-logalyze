@@ -2,12 +2,12 @@
  * `logalyze_add_repo`：在对话中把一个 git 地址加入 dsh-repo 的仓库清单并打开
  * 「日志分析」功能，使它成为观象的应用仓库，并等待第一次拉取结束。
  *
- * - 仓库清单归 dsh-repo 所有：工具调用 `dshRepos.addRepo`，新条目的权限为
+ * - 仓库清单归 dsh-repo 所有：工具调用 `dshRepos.repoAdd`，新条目的权限为
  *   「可改代码」（起草接入和改进 SKILL 要推送分支），已有条目只打开功能、权限
  *   不变。调用前先发 `access/authorize`（级别 `admin`）问其他插件这个会话能不能
  *   改仓库清单，被拒绝时工具报错、不问用户；再经 DSH 审批服务请求一次性授权，
- *   只有 `allowed-once` 才调用，没有审批服务时工具报错。dsh-repo 改动清单前
- *   会以同一级别再问一次。
+ *   只有 `allowed-once` 才调用，没有审批服务时工具报错。授权和审批都由本工具
+ *   完成，调用 dsh-repo 时不带 Agent，dsh-repo 不再询问。
  * - 地址已是应用仓库时不请求授权、不调用，只重新拉取并报告状态；分支不同时报错，
  *   改分支在 dsh-repo 的仓库清单中完成。
  * - 取消调用只停止等待，拉取在后台继续。
@@ -104,10 +104,10 @@ export interface AddRepoDeps {
    */
   authorize?(event: AuthorizeEvent): Promise<void>
   /**
-   * Add the repository to the dsh-repo catalog with the log analysis feature for the Session.
+   * Add the repository to the dsh-repo catalog with the log analysis feature, after this tool authorized and approved it.
    * @returns `exists` when the feature was already on, and the address as the catalog stores it.
    */
-  addRepo(spec: RepoSpec, session: string): Promise<{ readonly status: 'added' | 'exists'; readonly url: string }>
+  addRepo(spec: RepoSpec): Promise<{ readonly status: 'added' | 'exists'; readonly url: string }>
 }
 
 /** Adds repositories from a conversation. */
@@ -175,7 +175,7 @@ export class RepoAdder {
     if (outcome === 'cancelled') exec.signal.throwIfAborted()
     if (outcome !== 'allowed-once') return { status: outcome, url: spec.url }
     exec.signal.throwIfAborted()
-    const added = await this.deps.addRepo(spec, agent.session.header.id)
+    const added = await this.deps.addRepo(spec)
     return await this.settle(added.status, added.url, exec.signal)
   }
 

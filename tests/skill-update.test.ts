@@ -6,13 +6,13 @@ import { defaultsOf, resolveConfig } from '../src/config.ts'
 import type { Agent, SubagentActivation, SubagentResult, SubagentService } from '../src/host.ts'
 import { RepoRegistry } from '../src/repos/registry.ts'
 import type { EditableSettings } from '../src/settings/contract.ts'
-import type { ChangeCreate, WorkspaceChanges, WorkspaceFileChange } from '../src/repos/contract.ts'
+import type { WorkspaceFileChange, WorkspaceStatus } from '../src/repos/contract.ts'
 import { replaceFile } from '../src/skill-update/files.ts'
 import { checkChanges, DIFF_FILE } from '../src/skill-update/workspace.ts'
 import { renderShowSkillValue, SkillViewer } from '../src/skill-update/show.ts'
 import { renderImproveValue, SkillImprover } from '../src/skill-update/tool.ts'
 import type { AnalyzedTask } from '../src/skill-update/tool.ts'
-import { FakeRepos } from './fake-repos.ts'
+import { declinedError, FakeRepos, repoError } from './fake-repos.ts'
 import { createAppRepo, git, tempDir } from './helpers.ts'
 
 const cleanups: (() => Promise<void>)[] = []
@@ -29,7 +29,7 @@ async function dir(): Promise<string> {
 }
 
 /** A workspace at `root` with base files and a stand-in for what `dshRepos` reports. */
-async function workspace(files: Record<string, string>, changes: Partial<WorkspaceFileChange>[], branch?: string): Promise<{ root: string; changes: WorkspaceChanges }> {
+async function workspace(files: Record<string, string>, changes: Partial<WorkspaceFileChange>[]): Promise<{ root: string; changes: WorkspaceStatus }> {
   const root = await dir()
   for (const [path, content] of Object.entries(files)) {
     await mkdir(dirname(join(root, path)), { recursive: true })
@@ -38,9 +38,10 @@ async function workspace(files: Record<string, string>, changes: Partial<Workspa
   return {
     root,
     changes: {
-      workspace: { url: 'https://code.example.com/team/app.git', dir: root, baseCommit: 'b'.repeat(40), ...branch === undefined ? {} : { branch } },
+      workspace: { repo: 'https://code.example.com/team/app.git', path: root, base: 'main', baseCommit: 'b'.repeat(40), branch: 'logalyze/x' },
       files: changes.map(change => ({ path: '', status: 'added', binary: false, additions: 1, deletions: 0, ...change })),
       diff: 'diff --git a/x b/x\n',
+      truncated: false,
     },
   }
 }
@@ -52,11 +53,10 @@ describe('checkChanges', () => {
     const { changes } = await workspace({ [SKILL]: '# new\n', '.agents/skills/log-analysis/cases/a.md': 'a' }, [
       { path: SKILL, status: 'modified', additions: 2, deletions: 1 },
       { path: '.agents/skills/log-analysis/cases/a.md' },
-    ], 'logalyze/x')
+    ])
     const checked = await checkChanges(changes, SCOPE, LIMITS)
     expect(checked).toMatchObject({
       base: 'b'.repeat(40),
-      pushedBranch: 'logalyze/x',
       files: [{ path: SKILL, added: 2, removed: 1 }, { path: '.agents/skills/log-analysis/cases/a.md', added: 1, removed: 0 }],
       contents: expect.arrayContaining([{ path: SKILL, relative: 'SKILL.md', content: '# new\n' }]),
       diff: 'diff --git a/x b/x\n',
@@ -111,13 +111,13 @@ describe('replaceFile', () => {
 function fakeRepos(root: string) {
   const state = { changeError: undefined as Error | undefined }
   const service = new FakeRepos(root)
-  const createChange = vi.fn(async (_repo: string, _change: ChangeCreate) => {
+  const openMr = vi.fn(async (_input: Parameters<NonNullable<FakeRepos['openMr']>>[0]) => {
     if (state.changeError !== undefined) throw state.changeError
-    return { webUrl: MR_URL }
+    return { number: 7, webUrl: MR_URL }
   })
-  Object.assign(service, { createChange })
-  const pushWorkspace = vi.spyOn(service, 'pushWorkspace')
-  return { state, service, createChange, pushWorkspace }
+  service.openMr = openMr
+  const workspacePush = vi.spyOn(service, 'workspacePush')
+  return { state, service, openMr, workspacePush }
 }
 
 interface Started {
@@ -233,7 +233,7 @@ const IN_SKILL = (path: string) => `.agents/skills/log-analysis/${path}`
 const escape = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 describe('logalyze_improve_skill', () => {
-  it('drafts a case with the improvement child and opens a merge request without asking', async () => {
+  it('drafts a case with the improvement child and pushes it with a merge request through dsh-repo', async () => {
     const { origin, registry, task, improver, agent, repos, started, skill } = await setup()
     const exec = { signal: new AbortController().signal, agent, callId: 'call-1' }
     const running = improver.execute({ app: 'order-service' }, exec)
@@ -245,9 +245,10 @@ describe('logalyze_improve_skill', () => {
     const improveDir = improveDirOf(child!)
     expect(improveDir).toMatch(new RegExp(`^${escape(join(agent.session.header.cwd as string, '.logalyze', 'runs'))}/20261031-220000-[0-9a-f]{6}/improve-[0-9a-f]{6}$`))
     expect(child?.spec.request.cwd).toBe(join(improveDir, 'repo'))
-    // The workspace is a checkout of the latest synced commit, without git metadata inside it.
+    // The workspace is a clone at the latest synced commit, pushing to a new branch named after the run.
     expect(await readFile(join(improveDir, 'repo', SKILL), 'utf8')).toBe(skill)
-    expect(await stat(join(improveDir, 'repo', '.git')).then(() => true, () => false)).toBe(false)
+    expect(await stat(join(improveDir, 'repo', '.git')).then(() => true, () => false)).toBe(true)
+    expect(repos.service.creates).toEqual([{ repo: origin, path: join(improveDir, 'repo'), commit: status.commit, branch: expect.stringMatching(/^logalyze\/skill-order-service-20261031-220000-[0-9a-f]{6}$/), agent, callId: 'call-1', signal: exec.signal }])
     const prompt = child?.spec.request.prompt[0]?.text as string
     expect(prompt.split('\n')[0]).toBe('/logalyze-improve')
     expect(prompt).toContain('本会话的一次日志分析之后，分析子 Agent 认为这个 SKILL 没能很好地覆盖遇到的问题，用户同意改进。下面列出的所有改进点都在这一次修改中完成。')
@@ -279,28 +280,24 @@ describe('logalyze_improve_skill', () => {
       files: [{ path: SKILL, added: 4, removed: 0 }, { path: `.agents/skills/log-analysis/${CASE}`, added: 1, removed: 0 }],
       output: '- SKILL.md：补充 traceId\n- cases/2026-10-31-trace-id.md：新增案例',
     })
-    expect(value.branch).toMatch(/^logalyze\/skill-order-service-[0-9a-f]{10}$/)
+    expect(value.branch).toBe(repos.service.creates[0]?.branch)
     expect(await readFile(value.diffPath!, 'utf8')).toContain('+# traceId 串联')
     expect(child?.dispose).toHaveBeenCalledTimes(1)
     expect(registry.status()[0]?.activeRuns).toBe(0)
-    expect(repos.pushWorkspace).toHaveBeenCalledWith(join(improveDir, 'repo'), {
-      branch: value.branch,
+    expect(repos.workspacePush).toHaveBeenCalledWith({
+      path: join(improveDir, 'repo'),
       message: expect.any(String),
-      session: 'parent',
+      mr: { title: 'chore: 补充 traceId 字段说明与案例', body: expect.stringMatching(/^由观象在日志分析后经用户同意提出（应用 order-service，分析提交 [0-9a-f]{12}，会话 parent）。请评审案例和 SKILL 修改。\n\n# 补充 traceId/) },
+      agent,
+      callId: 'call-1',
       signal: exec.signal,
     })
     const [push] = repos.service.pushes
     expect(Object.keys(push!.files)).toEqual([SKILL, IN_SKILL(CASE)])
     expect(git(origin, 'rev-parse', `${value.branch}^`).trim()).toBe(status.commit)
     expect(push?.message).toMatch(new RegExp(`^chore: 补充 traceId 字段说明与案例\\n\\n# 补充 traceId[\\s\\S]*\\n\\nProposed-by: 观象 Logalyze\\nAnalyzed-commit: ${task.commit}\\n$`))
-    expect(repos.createChange).toHaveBeenCalledWith(origin, {
-      title: 'chore: 补充 traceId 字段说明与案例',
-      body: expect.stringMatching(/^由观象在日志分析后经用户同意提出（应用 order-service，分析提交 [0-9a-f]{12}，会话 parent）。请评审案例和 SKILL 修改。\n\n# 补充 traceId/),
-      sourceBranch: value.branch,
-      targetBranch: 'main',
-      session: 'parent',
-      signal: exec.signal,
-    })
+    expect(push?.session).toBe('parent')
+    expect(repos.openMr).toHaveBeenCalledWith({ repo: origin, branch: value.branch, base: 'main', title: 'chore: 补充 traceId 字段说明与案例', body: expect.stringContaining('请评审案例和 SKILL 修改') })
     const text = renderImproveValue(value)[0]?.text
     expect(text).toContain(`SKILL 已改进，提交到 ${origin} 的分支 ${value.branch}（目标 main）并创建合并请求：${MR_URL}`)
     expect(text).toContain('改进子 Agent 的说明：\n- SKILL.md：补充 traceId')
@@ -341,7 +338,7 @@ describe('logalyze_improve_skill', () => {
     expect(started).toHaveLength(1)
     expect(repos.service.pushes[0]?.message).toContain(`Analyzed-commit: ${task.commit}\n`)
     expect(repos.service.pushes[0]?.message).not.toMatch(/Analyzed-commit[^\n]*\nAnalyzed-commit/)
-    expect(repos.createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ body: expect.stringMatching(/分析提交 [0-9a-f]{12}，会话 parent/) }))
+    expect(repos.openMr).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringMatching(/分析提交 [0-9a-f]{12}，会话 parent/) }))
   })
 
   it('waits for the turn that dispatched the analysis to end and starts one improvement per application and turn', async () => {
@@ -405,28 +402,37 @@ describe('logalyze_improve_skill', () => {
       started[last]!.settle({ stopReason: 'error', output: [], diagnostic: '模型出错' })
     })
     expect(stopped.error).toBe('改进子 Agent 没有完成（error：模型出错）')
-    expect(repos.pushWorkspace).not.toHaveBeenCalled()
+    expect(repos.workspacePush).not.toHaveBeenCalled()
   })
 
-  it('reports a pushed branch when the merge request fails, and an existing branch for the same change', async () => {
+  it('reports a pushed branch when the merge request fails, a moved remote branch, and a declined push', async () => {
     const { task, improver, agent, repos, started } = await setup()
     const exec = { signal: new AbortController().signal, agent }
-    repos.state.changeError = Object.assign(new Error('令牌没有权限'), { name: 'RepoError', code: 'forbidden' })
+    repos.state.changeError = new Error('令牌没有权限')
     const running = improver.execute({ app: 'order-service' }, exec)
     await finishChild(started, 0, { [IN_SKILL(CASE)]: '# c\n' })
     const pushed = await running
     expect(pushed).toMatchObject({ status: 'pushed', mergeRequestError: '令牌没有权限' })
     expect(renderImproveValue(pushed)[0]?.text).toContain('创建合并请求失败（令牌没有权限）')
 
-    improver.turnEnded('parent')
-    const again = improver.execute({ app: 'order-service', workDirs: [task.workDir] }, exec)
-    await finishChild(started, 1, { [IN_SKILL(CASE)]: '# c\n' })
-    const exists = await again
-    expect(exists).toMatchObject({ status: 'exists', branch: pushed.branch })
-    expect(repos.pushWorkspace).toHaveBeenCalledTimes(2)
+    const attempt = async (index: number, error: Error) => {
+      improver.turnEnded('parent')
+      repos.service.pushError = error
+      const again = improver.execute({ app: 'order-service', workDirs: [task.workDir] }, exec)
+      await finishChild(started, index, { [IN_SKILL(CASE)]: '# c\n' })
+      return await again
+    }
+    const exists = await attempt(1, repoError('conflict', '远端分支已经变化'))
+    expect(exists.status).toBe('exists')
+    expect(exists.branch).not.toBe(pushed.branch)
+    expect(renderImproveValue(exists)[0]?.text).toContain('在远端已有其他提交')
+    const rejected = await attempt(2, declinedError('rejected'))
+    expect(rejected.status).toBe('rejected')
+    expect(renderImproveValue(rejected)[0]?.text).toContain(`推送授权被拒绝，没有提交`)
+    expect((await attempt(3, declinedError('unavailable'))).status).toBe('unavailable')
+    expect(repos.workspacePush).toHaveBeenCalledTimes(4)
     expect(repos.service.pushes).toHaveLength(1)
-    expect(repos.createChange).toHaveBeenCalledTimes(1)
-    expect(renderImproveValue(exists)[0]?.text).toContain('已存在，同一改动可能已经提交过')
+    expect(repos.openMr).toHaveBeenCalledTimes(1)
   })
 
   it('refuses calls it cannot serve before starting a child', async () => {
@@ -465,7 +471,7 @@ describe('logalyze_improve_skill', () => {
     await expect(improver.execute(args, exec)).rejects.toThrow('本会话中应用「order-service」没有待改进的 skill-gap.md 记录，需要在 feedback 中写明')
     await expect(improver.execute({ ...args, workDirs: [task.workDir] }, exec)).rejects.toThrow('没有待改进的 skill-gap.md 记录')
     expect(started).toHaveLength(0)
-    expect(repos.pushWorkspace).not.toHaveBeenCalled()
+    expect(repos.workspacePush).not.toHaveBeenCalled()
   })
 
   it('tells the child when the repository moved on since the analysis', async () => {
@@ -495,7 +501,7 @@ describe('logalyze_improve_skill', () => {
     await finishChild(started, 0, { [SKILL]: `${skill}\n503 来自网关限流。\n` })
     const value = await running
     expect(value).toMatchObject({ status: 'failed', workDirs: [task.workDir], error: '改动中没有新增或修改案例文件 cases/<日期>-<slug>.md' })
-    expect(repos.pushWorkspace).not.toHaveBeenCalled()
+    expect(repos.workspacePush).not.toHaveBeenCalled()
   })
 
   it('improves a SKILL from user feedback alone, with sample logs and no case required', async () => {
@@ -520,7 +526,7 @@ describe('logalyze_improve_skill', () => {
     const [push] = repos.service.pushes
     expect(push?.message).toBe('chore: 修正日志时区说明\n\nfix(skill)!: 修正日志时区说明\n\n- SKILL.md：时间是 UTC\n\nProposed-by: 观象 Logalyze\n')
     expect(push?.session).toBe('parent')
-    expect(repos.createChange).toHaveBeenCalledWith(origin, expect.objectContaining({ title: 'chore: 修正日志时区说明', body: expect.stringMatching(/^由观象按用户反馈提出（应用 order-service，会话 parent）。请评审 SKILL 修改。/) }))
+    expect(repos.openMr).toHaveBeenCalledWith(expect.objectContaining({ repo: origin, title: 'chore: 修正日志时区说明', body: expect.stringMatching(/^由观象按用户反馈提出（应用 order-service，会话 parent）。请评审 SKILL 修改。/) }))
   })
 })
 

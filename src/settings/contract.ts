@@ -135,13 +135,9 @@ export type RepoPhase = 'pending' | 'syncing' | 'ready' | 'failed'
 export interface RepoStatusWire {
   url: string
   branch?: string
-  /** Absolute directory of dsh-repo's fetch-only mirror, once a sync succeeded; children work in commit snapshots dsh-repo creates. */
-  dir?: string
   phase: RepoPhase
-  /** Latest synced commit, the one the catalog describes and new dispatches use. */
+  /** Latest synced commit, the one the catalog describes and new dispatches use; children work in snapshots of it that dsh-repo creates. */
   commit?: string
-  /** Committer date of {@link commit}, ISO 8601. */
-  commitTime?: string
   /** Last completed sync attempt, epoch milliseconds. */
   syncedAt?: number
   /** Application description read from {@link commit}. */

@@ -22,13 +22,13 @@ async function setup(): Promise<{ root: string; registry: RepoRegistry; fake: Fa
 
 describe('repository registry', () => {
   it('clones a repository and exposes its application', async () => {
-    const { root, registry, fake } = await setup()
+    const { root, registry } = await setup()
     const origin = await createAppRepo(join(root, 'origin'))
     registry.configure([{ url: origin }])
     expect(registry.status()[0]?.phase).toBe('pending')
     await registry.syncAll()
     const [status] = registry.status()
-    expect(status).toMatchObject({ url: origin, phase: 'ready', available: true, activeRuns: 0, dir: fake.mirrorDir(origin) })
+    expect(status).toMatchObject({ url: origin, phase: 'ready', available: true, activeRuns: 0 })
     expect(status?.commit).toBe(git(origin, 'rev-parse', 'HEAD').trim())
     expect(registry.readyApps().map(app => app.app.id)).toEqual(['order-service'])
   })
@@ -115,7 +115,7 @@ describe('repository registry', () => {
     repos.value = service
     await registry.resyncAll()
     expect(registry.status()[0]).toMatchObject({ phase: 'ready', available: true })
-    expect(registry.branchOf(origin)).toBe('main')
+    expect(registry.branchOf(origin)).toBeUndefined()
     expect(() => registry.branchOf('/elsewhere')).toThrow('已不是观象的应用仓库')
   })
 
@@ -140,7 +140,9 @@ describe('repository registry', () => {
     const lease = await registry.acquire(['order-service'])
     const held = lease.apps.get('order-service')
     expect(held).toMatchObject({ commit: first, url: origin })
-    expect(git(held!.dir, 'rev-parse', 'HEAD').trim()).toBe(first)
+    // The snapshot holds the plain files of the commit, without git metadata.
+    expect(await readFile(join(held!.dir, MANIFEST_PATH), 'utf8')).toBe(git(origin, 'show', `${first}:${MANIFEST_PATH}`))
+    await expect(readFile(join(held!.dir, '.git'))).rejects.toThrow()
     expect(registry.status()[0]?.activeRuns).toBe(1)
 
     const manifest = (await readFile(join(origin, MANIFEST_PATH), 'utf8')).replace('logHints: [', 'logHints: [NewHint, ')
@@ -187,7 +189,7 @@ describe('repository registry', () => {
     git(origin, 'commit', '-qm', 'link')
     registry.configure([{ url: origin }])
     await registry.syncAll()
-    expect(registry.status()[0]).toMatchObject({ phase: 'failed', error: `无法读取 ${MANIFEST_PATH}：${MANIFEST_PATH} 不是普通文件` })
+    expect(registry.status()[0]).toMatchObject({ phase: 'failed', error: `无法读取 ${MANIFEST_PATH}：${MANIFEST_PATH} 不是普通文件（不接受符号链接等）` })
   })
 
   it('releases every application when a snapshot cannot be created', async () => {
