@@ -13,6 +13,8 @@ import { REPORT_ENTRY } from '../settings/contract.ts'
 export interface ReportListing {
   /** Relative path (`/`-separated) → `size:mtimeMs`; excludes {@link REPORT_ENTRY}. */
   readonly files: Readonly<Record<string, string>>
+  /** Relative path → size in bytes, for the same files as {@link files}. */
+  readonly sizes: Readonly<Record<string, number>>
   /** Number of regular files, including {@link REPORT_ENTRY}. */
   readonly count: number
   /** Total size of the regular files in bytes. */
@@ -29,6 +31,7 @@ export interface ReportListing {
  */
 export async function listReport(dir: string): Promise<ReportListing> {
   const files: Record<string, string> = {}
+  const sizes: Record<string, number> = {}
   const refused: string[] = []
   let count = 0
   let bytes = 0
@@ -49,14 +52,17 @@ export async function listReport(dir: string): Promise<ReportListing> {
       } else if (info.isFile()) {
         count += 1
         bytes += info.size
-        if (rel !== REPORT_ENTRY) files[rel] = `${info.size}:${Math.trunc(info.mtimeMs)}`
+        if (rel !== REPORT_ENTRY) {
+          files[rel] = `${info.size}:${Math.trunc(info.mtimeMs)}`
+          sizes[rel] = info.size
+        }
       } else {
         refused.push(rel)
       }
     }
   }
   await walk(dir)
-  return { files, count, bytes, refused }
+  return { files, sizes, count, bytes, refused }
 }
 
 /**

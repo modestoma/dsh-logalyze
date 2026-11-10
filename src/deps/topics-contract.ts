@@ -18,11 +18,22 @@ export interface TopicCardText {
   readonly bold?: boolean
 }
 
-/** One linked row of the root card's table. */
+/** One row of the root card's link table. */
 export interface TopicCardLink {
   readonly name: string
-  /** `http(s)` address opened by the row's link. */
-  readonly url: string
+  /** `http(s)` address of the link column; without it the cell shows `—`. */
+  readonly url?: string
+  /** `http(s)` address of the second link column; without it the cell shows `—`. */
+  readonly extraUrl?: string
+}
+
+/** The root card's link table (at most 50 rows). */
+export interface TopicCardLinks {
+  readonly nameHeader: string
+  readonly linkHeader: string
+  /** Header of the second link column, shown only when set. */
+  readonly extraLinkHeader?: string
+  readonly rows: readonly TopicCardLink[]
 }
 
 /** What the root card shows besides its status. */
@@ -32,11 +43,7 @@ export interface TopicRootCard {
   readonly taskName: string
   /** Lead sentence, shown after the requester (an @-mention, or the external requester's text). */
   readonly lead: readonly TopicCardText[]
-  readonly links?: {
-    readonly nameHeader: string
-    readonly linkHeader: string
-    readonly rows: readonly TopicCardLink[]
-  }
+  readonly links?: TopicCardLinks
 }
 
 /** Who a launch is for. */
@@ -101,10 +108,16 @@ export interface TopicLaunchState {
 /** Name of the event the Feishu channel plugin emits after a launch status is recorded; listeners receive the {@link TopicLaunchState}. */
 export const FEISHU_TOPICS_STATUS_EVENT = 'feishu-topics/status'
 
+/** Outcome of {@link FeishuTopicService.updateLinks}. */
+export type TopicLinksUpdateResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly code: 'invalid' | 'unknown-key' | 'not-connected' | 'update-failed'; readonly message: string }
+
 /**
- * The `feishuTopics` service. {@link FeishuTopicService.state} and
- * {@link FeishuTopicService.launchKeyOf} were added without a version change,
- * so older version-2 providers lack them; report tracking needs both.
+ * The `feishuTopics` service. {@link FeishuTopicService.state},
+ * {@link FeishuTopicService.launchKeyOf}, {@link FeishuTopicService.updateLinks},
+ * and the optional link fields were added without a version change, so older
+ * providers lack them; this plugin treats such a provider as incompatible.
  */
 export interface FeishuTopicService {
   readonly version: FeishuTopicsVersion
@@ -119,11 +132,18 @@ export interface FeishuTopicService {
    * @param key - the launch's idempotency key.
    * @returns the state, or undefined for an unknown key or while disconnected.
    */
-  state?(key: string): TopicLaunchState | undefined
+  state(key: string): TopicLaunchState | undefined
   /**
    * Find the launch whose topic route currently names a Session.
    * @param sessionId - DSH session id.
    * @returns the launch's idempotency key, or undefined.
    */
-  launchKeyOf?(sessionId: string): string | undefined
+  launchKeyOf(sessionId: string): string | undefined
+  /**
+   * Replace the link table of a launch's root card and redraw the card.
+   * @param key - the launch's idempotency key.
+   * @param links - the new table; undefined removes it.
+   * @returns whether the card shows the new table, or why not.
+   */
+  updateLinks(key: string, links: TopicCardLinks | undefined): Promise<TopicLinksUpdateResult>
 }

@@ -1,7 +1,7 @@
 /**
- * 回传记录的持久化：每份报告一个 JSON 文件
- * `$DSH_HOME/logalyze/reports/<id>.json`，写入先落临时文件再改名；读到的
- * 内容按 {@link reportRecordSchema} 校验，不合格的文件记日志后跳过。
+ * 分析记录的持久化：每次分析一个 JSON 文件
+ * `$DSH_HOME/logalyze/analyses/<id>.json`，写入先落临时文件再改名；读到的
+ * 内容按 {@link analysisRecordSchema} 校验，不合格的文件记日志后跳过。
  *
  * 保留最近活动（接受请求或记录一轮）在 {@link REPORT_RETENTION_MS} 之内的记录，
  * 最多 {@link MAX_REPORT_RECORDS} 份；清理时删除记录文件和存储目录下的报告目录
@@ -35,16 +35,65 @@ const sectionSchema = z.object({
   at: z.number(),
 }).strict()
 
-/** One tracked report. */
-export const reportRecordSchema = z.object({
+const nullableText = z.string().nullable()
+
+/** One log of a tracked analysis, with its upload state. */
+const analysisLogSchema = z.object({
+  /** Log number in the prompt and the reports (`L1`, `L2`, …). */
+  ref: z.string().min(1),
+  /** Platform log id. */
+  logId: z.string().min(1),
+  fileName: z.string().min(1),
+  productSn: nullableText,
+  hwVersion: nullableText,
+  swVersion: nullableText,
+  componentVersion: nullableText,
+  logType: nullableText,
+  /** Declared file size in bytes, as the platform's decimal string. */
+  sizeBytes: nullableText,
+  createdAt: nullableText,
+  /** The log's page on the platform. */
+  detailUrl: z.string().optional(),
+  /** The log's own conclusion (`report/logs/<ref>.md` at the latest turn), links already relative to the report directory. */
+  conclusion: z.string().optional(),
+  /** The log's analysis page, returned by its first completed revision; fixed per log. */
+  reportUrl: z.string().optional(),
+  /** Whether the root card links {@link reportUrl}. */
+  linked: z.boolean().optional(),
+  /** Latest record revision uploaded to this log. */
+  uploadedRevision: z.number().int().nonnegative(),
+  /** Incremented when the platform refuses an idempotency key reused with other files; part of the next key. */
+  generation: z.number().int().nonnegative(),
+  lastAttemptAt: z.number().optional(),
+  uploadedAt: z.number().optional(),
+  error: z.string().optional(),
+  /** Whether the last attempt failed and retrying cannot help until the content changes. */
+  blocked: z.boolean().optional(),
+}).strict()
+
+/** One tracked log of an analysis. */
+export type AnalysisLog = z.infer<typeof analysisLogSchema>
+
+/** One analysis started through the analyze API. */
+export const analysisRecordSchema = z.object({
   /** Stable id: SHA-256 prefix of {@link key}; also the file name. */
   id: z.string().regex(/^[0-9a-f]{24}$/u),
   /** The request's `Idempotency-Key` (the `feishuTopics` launch key). */
   key: z.string().min(1),
-  logId: z.string().min(1),
-  app: z.string().min(1),
-  errorCode: z.string().min(1),
+  /** The request's fingerprint, compared when the key is used again. */
+  fingerprint: z.string().min(1),
+  triggerType: z.enum(['digital', 'machine']),
+  triggerId: z.string().min(1),
   triggeredAt: z.string().min(1),
+  chatId: z.string().min(1),
+  instructions: z.string().optional(),
+  /** Application id, display name, and project skill as resolved at acceptance. */
+  app: z.string().min(1),
+  appName: z.string().min(1),
+  componentCode: z.string().min(1),
+  /** The batch's error code; null when the platform has none. */
+  errorCode: nullableText,
+  logs: z.array(analysisLogSchema).min(1),
   acceptedAt: z.number(),
   /** Topic working directory once known. */
   workDir: z.string().optional(),
@@ -53,20 +102,16 @@ export const reportRecordSchema = z.object({
   turns: z.record(z.string(), z.number()),
   /** File fingerprints of the report directory at the last recorded turn. */
   snapshot: z.record(z.string(), z.string()),
-  /** Links of the recorded replies the caller cannot open. */
+  /** Links of the recorded replies and conclusions the caller cannot open. */
   warnings: z.array(z.string()),
+  /** Files the last upload left out, with the reason. */
+  skipped: z.array(z.string()),
   /** Incremented on every content change; an upload covers the revision it started from. */
   revision: z.number().int().nonnegative(),
-  uploadedRevision: z.number().int().nonnegative(),
-  lastAttemptAt: z.number().optional(),
-  uploadedAt: z.number().optional(),
-  error: z.string().optional(),
-  /** Whether the last attempt failed and retrying cannot help until the content changes. */
-  blocked: z.boolean().optional(),
 }).strict()
 
-/** One tracked report. */
-export type ReportRecord = z.infer<typeof reportRecordSchema>
+/** One tracked analysis. */
+export type AnalysisRecord = z.infer<typeof analysisRecordSchema>
 
 /** Most records kept; the least recently active are dropped first. */
 export const MAX_REPORT_RECORDS = 200
@@ -79,31 +124,31 @@ export const REPORT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
  * @param record - the record.
  * @returns epoch milliseconds.
  */
-export function lastActivityOf(record: ReportRecord): number {
+export function lastActivityOf(record: Pick<AnalysisRecord, 'acceptedAt' | 'sections'>): number {
   return Math.max(record.acceptedAt, ...record.sections.map(section => section.at))
 }
 
 /**
- * Report id of one request.
+ * Analysis id of one request.
  * @param key - the request's `Idempotency-Key`.
  * @returns 24 hex characters.
  */
-export function reportIdOf(key: string): string {
+export function analysisIdOf(key: string): string {
   return createHash('sha256').update(key).digest('hex').slice(0, 24)
 }
 
 /**
- * Default report store directory.
+ * Default analysis store directory.
  * @param env - process environment.
- * @returns `$DSH_HOME/logalyze/reports`.
+ * @returns `$DSH_HOME/logalyze/analyses`.
  */
-export function defaultReportsDir(env: NodeJS.ProcessEnv = process.env): string {
-  return join(resolveDshHome(env), 'logalyze', 'reports')
+export function defaultAnalysesDir(env: NodeJS.ProcessEnv = process.env): string {
+  return join(resolveDshHome(env), 'logalyze', 'analyses')
 }
 
-/** Reads and writes the report records of one directory. */
-export class ReportStore {
-  private readonly records = new Map<string, ReportRecord>()
+/** Reads and writes the analysis records of one directory. */
+export class AnalysisStore {
+  private readonly records = new Map<string, AnalysisRecord>()
 
   /**
    * @param dir - absolute store directory.
@@ -124,7 +169,7 @@ export class ReportStore {
       if (!name.endsWith('.json')) continue
       const path = join(this.dir, name)
       try {
-        const record = reportRecordSchema.parse(JSON.parse(await readFile(path, 'utf8')))
+        const record = analysisRecordSchema.parse(JSON.parse(await readFile(path, 'utf8')))
         if (`${record.id}.json` === name && !this.records.has(record.id)) this.records.set(record.id, record)
       } catch (error) {
         this.warn(`logalyze: 跳过无法读取的回传记录 ${path}：${error instanceof Error ? error.message : String(error)}`)
@@ -136,12 +181,12 @@ export class ReportStore {
    * @param id - report id.
    * @returns the record, or undefined.
    */
-  get(id: string): ReportRecord | undefined {
+  get(id: string): AnalysisRecord | undefined {
     return this.records.get(id)
   }
 
   /** @returns every record. */
-  all(): ReportRecord[] {
+  all(): AnalysisRecord[] {
     return [...this.records.values()]
   }
 
@@ -149,10 +194,19 @@ export class ReportStore {
    * Replace one record in memory and on disk.
    * @param record - the record to store.
    */
-  async put(record: ReportRecord): Promise<void> {
+  async put(record: AnalysisRecord): Promise<void> {
     this.records.set(record.id, record)
     await mkdir(this.dir, { recursive: true })
     await replaceFile(join(this.dir, `${record.id}.json`), `${JSON.stringify(record)}\n`, 0o600)
+  }
+
+  /**
+   * Forget one record and delete its file.
+   * @param id - analysis id.
+   */
+  async remove(id: string): Promise<void> {
+    this.records.delete(id)
+    await rm(join(this.dir, `${id}.json`), { force: true })
   }
 
   /**

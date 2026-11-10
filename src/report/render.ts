@@ -1,7 +1,9 @@
 /**
- * 报告入口 `report.md` 的生成：把记录下的首轮回复与追问逐节写出，把回复里
- * 以 `report/` 开头的链接改成相对报告目录的路径，检查调用方打不开的链接，
- * 并为回复没有引用的本轮新文件补一段「本轮文件」。只做字符串处理，不读写文件。
+ * 每份日志的报告入口 `report.md` 的生成：开头是这份日志与整批的信息，接着
+ * 是这份日志自己的结论（`report/logs/<编号>.md`）、首轮回复（整批结论）和
+ * 每轮追问，最后列出没有上传的文件。回复里以 `report/` 开头的链接改成相对
+ * 报告目录的路径，检查调用方打不开的链接，并为回复没有引用的本轮新文件补一段
+ * 「本轮文件」。只做字符串处理，不读写文件。
  *
  * @module dsh-logalyze/report/render
  */
@@ -9,17 +11,13 @@
 import { posix } from 'node:path'
 import { REPORT_DIR } from '../settings/contract.ts'
 import type { ReportStatus } from '../settings/contract.ts'
-import type { ReportRecord } from './store.ts'
+import type { AnalysisLog, AnalysisRecord } from './store.ts'
 
-/** One recorded turn of an analysis topic (see `reportRecordSchema`). */
-export type ReportSection = ReportRecord['sections'][number]
+/** One recorded turn of an analysis topic (see `analysisRecordSchema`). */
+export type ReportSection = AnalysisRecord['sections'][number]
 
-/** Request facts shown in the report header. */
-export interface ReportHeader {
-  readonly app: string
-  readonly errorCode: string
-  readonly triggeredAt: string
-}
+/** Shown where the platform has no error code for the batch. */
+export const UNLABELED_ERROR_CODE = '未标注'
 
 const STATUS_TEXT: Readonly<Record<ReportStatus, string>> = {
   done: '已完成',
@@ -128,24 +126,44 @@ function sectionBody(section: ReportSection, empty: string): string {
 }
 
 /**
- * Render `report.md`.
- * @param header - request facts.
- * @param sections - recorded turns, the `analysis` section first when present.
+ * Render the `report.md` of one log.
+ * @param record - the analysis, its `analysis` section first when present.
+ * @param log - the log the report is for.
+ * @param skipped - files of the report directory left out of the upload, with the reason.
  * @returns Markdown text ending with one newline.
  */
-export function renderReport(header: ReportHeader, sections: readonly ReportSection[]): string {
+export function renderLogReport(record: AnalysisRecord, log: AnalysisLog, skipped: readonly string[]): string {
+  const { sections } = record
   const analysis = sections.find(section => section.kind === 'analysis')
   const status = analysis === undefined ? '分析中' : statusText(analysis.status)
+  const batch = record.logs.length > 1
+  const facts = [
+    `日志 id \`${log.logId}\``,
+    ...log.productSn === null ? [] : [`设备 SN ${cell(log.productSn)}`],
+    ...log.swVersion === null ? [] : [`软件版本 ${cell(log.swVersion)}`],
+    ...log.componentVersion === null ? [] : [`组件版本 ${cell(log.componentVersion)}`],
+  ]
   const out = [
     '# 日志分析报告',
     [
-      '| 应用 | 错误码 | 发起时间 | 状态 |',
-      '| --- | --- | --- | --- |',
-      `| ${cell(header.app)} | ${cell(header.errorCode)} | ${cell(header.triggeredAt)} | ${status} |`,
+      '| 日志 | 应用 | 错误码 | 发起时间 | 状态 |',
+      '| --- | --- | --- | --- | --- |',
+      `| ${cell(`${log.ref} · ${log.fileName}`)} | ${cell(record.appName)} | ${cell(record.errorCode ?? UNLABELED_ERROR_CODE)} | ${cell(record.triggeredAt)} | ${status} |`,
     ].join('\n'),
-    '## 分析结论',
-    analysis === undefined ? '分析进行中，结论会在首轮结束后更新。' : sectionBody(analysis, '（本轮没有回复）'),
+    facts.join('；'),
   ]
+  if (batch) {
+    const others = record.logs.filter(other => other.ref !== log.ref).map(other => other.ref)
+    out.push(`本次与另外 ${others.length} 份日志（${others.join('、')}）集中分析，「整批结论」适用于整批日志。`)
+    out.push('## 本日志结论')
+    out.push(log.conclusion !== undefined && log.conclusion.trim() !== ''
+      ? log.conclusion.trim()
+      : analysis === undefined ? '分析进行中，结论会在首轮结束后更新。' : '本次没有这份日志单独的结论，见「整批结论」。')
+    out.push('## 整批结论')
+  } else {
+    out.push('## 分析结论')
+  }
+  out.push(analysis === undefined ? '分析进行中，结论会在首轮结束后更新。' : sectionBody(analysis, '（本轮没有回复）'))
   let round = 0
   for (const section of sections) {
     if (section.kind !== 'followup') continue
@@ -154,11 +172,15 @@ export function renderReport(header: ReportHeader, sections: readonly ReportSect
     if (section.question !== undefined && section.question.trim() !== '') out.push(quote(section.question.trim()))
     out.push(sectionBody(section, '（本轮没有回复）'))
   }
+  if (skipped.length > 0) {
+    out.push('## 未上传的文件')
+    out.push(skipped.map(item => `- ${item}`).join('\n'))
+  }
   return `${out.join('\n\n')}\n`
 }
 
 function cell(value: string): string {
-  return value.replace(/\|/g, '\\|')
+  return value.replace(/[\r\n]+/gu, ' ').replace(/\|/g, '\\|')
 }
 
 /** Most characters of a follow-up question kept in the report. */

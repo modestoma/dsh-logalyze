@@ -1,13 +1,18 @@
 /**
  * 观象运行时的组装：生效设置、应用注册表与仓库清单跟随、入口 SKILL、五个
- * 工具的注册条件、分析接口令牌和分析报告回传，并为设置面板提供状态与写入口。
+ * 工具的注册条件、分析接口令牌、日志平台客户端、分析请求的受理和报告回传，
+ * 并为设置面板提供状态与写入口。
  *
  * @module dsh-logalyze/service
  */
 
-import { AnalyzeToken } from './analyze/token.ts'
+import { resolveBatch } from './analyze/batch.ts'
+import { analyzeRequestHash } from './analyze/contract.ts'
+import type { AnalyzeRequest, AnalyzeResponse } from './analyze/contract.ts'
+import { newAnalysisRecord } from './analyze/record.ts'
 import type { AnalyzeGate } from './analyze/server.ts'
-import type { AnalyzeRequest } from './analyze/contract.ts'
+import { StoredCredential } from './analyze/token.ts'
+import { analysisTopicSpec, analyzeResponseOf, refused } from './analyze/topics.ts'
 import { CatalogFollower } from './apps/catalog.ts'
 import { RepoRegistry } from './apps/registry.ts'
 import type { LogalyzeConfig } from './config.ts'
@@ -15,16 +20,19 @@ import { describeIssue } from './config.ts'
 import { DSH_REPOS_SERVICE, ReposClient } from './deps/repos.ts'
 import type { DshRepos } from './deps/repos-contract.ts'
 import { FEISHU_TOPICS_STATUS_EVENT } from './deps/topics-contract.ts'
-import { FEISHU_TOPICS_SERVICE, lookupTopics, topicStatesOf } from './deps/topics.ts'
-import type { TopicStates } from './deps/topics.ts'
+import type { FeishuTopicService } from './deps/topics-contract.ts'
+import { FEISHU_TOPICS_SERVICE, lookupTopics } from './deps/topics.ts'
 import { Dispatcher } from './dispatch/tool.ts'
 import type { HostContext, HostCredentials, ToolActivationContext, ToolDefinition, WorkingDirectoryService } from './host.ts'
 import { SkillViewer } from './improve/show.ts'
 import { SkillImprover } from './improve/tool.ts'
 import { RepoInitializer } from './onboard/init.ts'
-import type { CommandRunner } from './report/command.ts'
-import { defaultReportsDir, ReportStore } from './report/store.ts'
+import { PlatformClient, PlatformError, platformProblem } from './platform/client.ts'
+import { LegacyReports, legacyReportsDir } from './report/legacy.ts'
+import { AnalysisStore, defaultAnalysesDir } from './report/store.ts'
 import { ReportTracker } from './report/tracker.ts'
+import { admitPlatformUrl, downloadLog, DownloadError } from './runs/download.ts'
+import type { PlatformLogDownloader, PlatformLogRef } from './runs/logs.ts'
 import { inRunDirectory, isDelegatedAgent, isInside } from './runs/run-dir.ts'
 import { ANALYZE_ROUTE } from './settings/contract.ts'
 import type { StateWire } from './settings/contract.ts'
@@ -36,15 +44,17 @@ import { abortable } from './util/abort.ts'
 import { messageOf } from './util/errors.ts'
 import { z } from 'zod'
 
-const reportRetrySchema = z.object({ id: z.string().regex(/^[0-9a-f]{24}$/u, '报告 id 不合法') }).strict()
+const reportRetrySchema = z.object({ id: z.string().regex(/^[0-9a-f]{24}$/u, '分析 id 不合法') }).strict()
+const credentialNameSchema = z.object({ tokenEnv: z.string() }).loose()
 
 /** Optional seams for tests. */
 export interface ServiceOptions {
+  /** Fetch used for log downloads and the log platform. */
   readonly fetch?: typeof fetch
-  /** Report record directory; defaults to `$DSH_HOME/logalyze/reports`. */
-  readonly reportsDir?: string
-  /** Runs the upload command. */
-  readonly runCommand?: CommandRunner
+  /** Analysis record directory; defaults to `$DSH_HOME/logalyze/analyses`. */
+  readonly analysesDir?: string
+  /** Directory of the former report records; defaults to `$DSH_HOME/logalyze/reports`. */
+  readonly legacyReportsDir?: string
 }
 
 /** Package files the service serves. */
@@ -59,7 +69,12 @@ export class LogalyzeService {
   private readonly settings: SettingsController
   private readonly repos: ReposClient
   private readonly catalog: CatalogFollower
-  private readonly token: AnalyzeToken
+  private readonly token: StoredCredential
+  private readonly secret: StoredCredential
+  private readonly platform: PlatformClient
+  private readonly legacy: LegacyReports
+  /** Idempotency key → acceptance in progress (concurrent retries wait for it). */
+  private readonly accepting = new Map<string, Promise<AnalyzeResponse>>()
   private readonly dispatcher: Dispatcher
   private readonly improver: SkillImprover
   private readonly viewer: SkillViewer
@@ -91,7 +106,11 @@ export class LogalyzeService {
     this.settings = new SettingsController(config, store, warn)
     this.refreshWaitMs = config.refreshWaitMs
     this.repos = new ReposClient(() => ctx.get?.(DSH_REPOS_SERVICE))
-    this.token = new AnalyzeToken(config.analyzeTokenRef, () => ctx.get?.('credentials') as HostCredentials | undefined, warn)
+    const credentials = (): HostCredentials | undefined => ctx.get?.('credentials') as HostCredentials | undefined
+    this.token = new StoredCredential(config.analyzeTokenRef, '分析接口令牌', credentials, warn)
+    this.secret = new StoredCredential(config.platformSecretRef, '日志平台 client_secret', credentials, warn)
+    this.platform = new PlatformClient({ settings: () => this.settings.get().analyze.platform, secret: () => this.secret.value(), ...fetchSeam })
+    this.legacy = new LegacyReports(options.legacyReportsDir ?? legacyReportsDir(), warn)
     this.registry = new RepoRegistry({ repos: this.repos, onChange: () => { this.onRegistryChange() } })
     this.catalog = new CatalogFollower({
       registry: this.registry,
@@ -102,14 +121,14 @@ export class LogalyzeService {
     const children = { registry: this.registry, subagents: ctx.subagents, provider: config.subagentProvider, settings, workingDirectory, ...fetchSeam }
     this.improver = new SkillImprover({ ...children, repos: this.repos })
     this.viewer = new SkillViewer({ registry: this.registry, repos: this.repos })
-    this.dispatcher = new Dispatcher({ ...children, gaps: this.improver })
+    this.dispatcher = new Dispatcher({ ...children, gaps: this.improver, platformLogs: sessionId => this.platformLogsOf(sessionId), platform: this.platformDownloader(options.fetch) })
     this.initializer = new RepoInitializer({ ...children, repos: this.repos })
     this.reports = new ReportTracker({
-      store: new ReportStore(options.reportsDir ?? defaultReportsDir(), warn),
-      topics: () => this.reportTopics(),
+      store: new AnalysisStore(options.analysesDir ?? defaultAnalysesDir(), warn),
+      topics: () => this.topicsService(),
+      platform: this.platform,
       upload: () => this.settings.get().analyze.upload,
       warn,
-      ...options.runCommand === undefined ? {} : { run: options.runCommand },
     })
     this.skill = createEntrySkillProvider({
       prepare: signal => this.prepareCatalog(signal),
@@ -196,7 +215,10 @@ export class LogalyzeService {
     try {
       await this.settings.load()
       await this.reports.boot().catch((error: unknown) => {
-        this.ctx.logger?.error?.('logalyze: 读取回传记录失败：%s', messageOf(error))
+        this.ctx.logger?.error?.('logalyze: 读取分析记录失败：%s', messageOf(error))
+      })
+      await this.legacy.load(Date.now()).catch((error: unknown) => {
+        this.ctx.logger?.error?.('logalyze: 读取旧版回传记录失败：%s', messageOf(error))
       })
       await this.catalog.load()
     } finally {
@@ -242,36 +264,120 @@ export class LogalyzeService {
   }
 
   /**
-   * Start tracking the report of an accepted analyze request with `logId`.
+   * Accept one validated analyze request: replay an accepted key, otherwise
+   * read the logs from the platform, check the batch, record the analysis,
+   * and launch its topic. Concurrent requests with one key share the first
+   * one's answer.
+   * @param topics - the loaded `feishuTopics`.
    * @param request - the validated request.
    * @param key - its `Idempotency-Key`.
+   * @returns the HTTP answer.
    */
-  async trackReport(request: AnalyzeRequest & { readonly logId: string }, key: string): Promise<void> {
+  async acceptAnalysis(topics: FeishuTopicService, request: AnalyzeRequest, key: string): Promise<AnalyzeResponse> {
+    const pending = this.accepting.get(key)
+    if (pending !== undefined) {
+      await pending.catch(() => undefined)
+      return await this.acceptAnalysis(topics, request, key)
+    }
+    const accepting = this.acceptOnce(topics, request, key)
+    this.accepting.set(key, accepting)
+    try {
+      return await accepting
+    } finally {
+      this.accepting.delete(key)
+    }
+  }
+
+  private async acceptOnce(topics: FeishuTopicService, request: AnalyzeRequest, key: string): Promise<AnalyzeResponse> {
     await this.booted.promise
-    await this.reports.track(request, key)
+    const settings = this.settings.get().analyze
+    const fingerprint = analyzeRequestHash(request)
+    const existing = this.reports.byKey(key)
+    if (existing !== undefined) {
+      if (existing.fingerprint !== fingerprint) return refused(409, 'Idempotency-Key 已被内容不同的请求使用')
+      return analyzeResponseOf(await topics.launch(analysisTopicSpec(existing, settings.upload)))
+    }
+    const problem = platformProblem(settings.platform)
+    if (problem !== undefined) return refused(503, problem)
+    let found
+    try {
+      found = await this.platform.findLogs(request.logIds)
+    } catch (error) {
+      if (!(error instanceof PlatformError)) throw error
+      return refused(error.retryable ? 503 : 502, error.message)
+    }
+    const batch = resolveBatch(request.logIds, found, this.registry.readyApps().map(ready => ready.app))
+    if (!batch.ok) return { status: 422, body: { ok: false, error: batch.error, ...batch.invalidLogs === undefined ? {} : { invalidLogs: batch.invalidLogs } } }
+    const record = newAnalysisRecord(request, key, fingerprint, batch.value, Date.now())
+    await this.reports.accept(record)
+    let response: AnalyzeResponse
+    try {
+      response = analyzeResponseOf(await topics.launch(analysisTopicSpec(record, settings.upload)))
+    } catch (error) {
+      await this.reports.forget(record.id)
+      throw error
+    }
+    if (response.status === 202) await this.reports.launched(record.id)
+    else await this.reports.forget(record.id)
+    return response
   }
 
   /**
-   * Upload one report again now.
+   * The platform logs of the analyze API topic a Session belongs to.
+   * @param sessionId - the dispatching top-level Session.
+   * @returns a resolver of log numbers, or undefined when the Session is not such a topic.
+   */
+  private platformLogsOf(sessionId: string): ((ref: string) => PlatformLogRef) | undefined {
+    const key = this.topicsService()?.launchKeyOf(sessionId)
+    const record = key === undefined ? undefined : this.reports.byKey(key)
+    if (record === undefined) return undefined
+    return (ref) => {
+      const log = record.logs.find(item => item.ref === ref)
+      if (log === undefined) throw new Error(`本话题没有日志 ${ref}（可用：${record.logs.map(item => item.ref).join('、')}）`)
+      return { ref: log.ref, logId: log.logId, fileName: log.fileName }
+    }
+  }
+
+  /** Downloads platform logs through a fresh temporary link each time. */
+  private platformDownloader(fetchImpl: typeof fetch | undefined): PlatformLogDownloader {
+    return {
+      download: async (log, dir, fileName, download, signal) => {
+        let link
+        try {
+          link = await this.platform.downloadUrl(log.logId)
+        } catch (error) {
+          if (error instanceof PlatformError) throw new DownloadError(`日志 ${log.ref}：${error.message}`)
+          throw error
+        }
+        const file = await downloadLog(link.url, dir, fileName, download, signal, fetchImpl, { admit: admitPlatformUrl, label: `日志 ${log.ref}（${log.fileName}）` })
+        return file.path
+      },
+    }
+  }
+
+  /**
+   * Upload one analysis's reports again now.
    * @param raw - request body `{ id }`.
    * @returns the new panel state.
-   * @throws SettingsError when the body is invalid or the report is unknown.
+   * @throws SettingsError when the body is invalid or the analysis is unknown.
    */
   async retryReport(raw: unknown): Promise<StateWire> {
     const parsed = reportRetrySchema.safeParse(raw)
     if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
-    if (!this.reports.retry(parsed.data.id)) throw new SettingsError(`没有这份报告：${parsed.data.id}`)
+    if (!this.reports.retry(parsed.data.id)) throw new SettingsError(`没有这次分析：${parsed.data.id}`)
     return await this.state()
   }
 
-  /** The launch-state methods of the loaded `feishuTopics`. */
-  private reportTopics(): TopicStates | undefined {
-    return topicStatesOf(lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE)))
+  /** The loaded `feishuTopics`, when compatible. */
+  private topicsService(): FeishuTopicService | undefined {
+    const lookup = lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE))
+    return lookup.availability === 'ready' ? lookup.service : undefined
   }
 
   /** @returns the panel state. */
   async state(): Promise<StateWire> {
-    const token = await this.token.status()
+    const [token, secret] = await Promise.all([this.token.status(), this.secret.status()])
+    const problem = platformProblem(this.settings.get().analyze.platform)
     return {
       ...this.settings.panel(),
       repos: this.registry.status(),
@@ -281,43 +387,58 @@ export class LogalyzeService {
         route: ANALYZE_ROUTE,
         tokenEnv: this.token.ref,
         ...token === undefined ? {} : { token },
+        secretEnv: this.secret.ref,
+        ...secret === undefined ? {} : { secret },
+        ...problem === undefined ? {} : { platformProblem: problem },
         topics: lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE)).availability,
-        reportsSupported: this.reportTopics() !== undefined,
         reports: this.reports.list(),
+        legacyReports: this.legacy.list(),
       },
     }
   }
 
-  /** @returns the analyze route's switch and bearer token, read per request. */
+  /** @returns the analyze route's switch, limits, and bearer token, read per request. */
   analyzeGate(): AnalyzeGate {
     return {
       enabled: () => this.settings.get().analyze.enabled,
       tokenEnv: () => this.token.ref,
       defaultChatId: () => this.settings.get().analyze.defaultChatId,
+      maxLogs: () => this.settings.get().analyze.maxLogs,
       token: () => this.token.value(),
     }
   }
 
   /**
-   * Store the analyze API's bearer token in DSH's credential store.
+   * Store the analyze API's bearer token or the platform client secret in DSH's credential store.
    * @param raw - request body `{ tokenEnv, value }`.
    * @returns the new panel state.
-   * @throws SettingsError when the body is invalid, the name is not `analyzeTokenRef`, or no credential store is loaded.
+   * @throws SettingsError when the body is invalid, the name is neither credential's, or no credential store is loaded.
    */
   async setToken(raw: unknown): Promise<StateWire> {
-    await this.token.set(raw)
+    await this.credentialOf(raw).set(raw)
+    this.platform.reset()
     return await this.state()
   }
 
   /**
-   * Remove the stored analyze token.
+   * Remove a stored credential.
    * @param raw - request body `{ tokenEnv }`.
    * @returns the new panel state.
    * @throws SettingsError on the same conditions as {@link setToken}.
    */
   async clearToken(raw: unknown): Promise<StateWire> {
-    await this.token.clear(raw)
+    await this.credentialOf(raw).clear(raw)
+    this.platform.reset()
     return await this.state()
+  }
+
+  /** The credential a token route body names. */
+  private credentialOf(raw: unknown): StoredCredential {
+    const parsed = credentialNameSchema.safeParse(raw)
+    if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
+    const slot = [this.token, this.secret].find(candidate => candidate.ref === parsed.data.tokenEnv)
+    if (slot === undefined) throw new SettingsError(`${parsed.data.tokenEnv} 不是观象管理的凭据名称`)
+    return slot
   }
 
   /**

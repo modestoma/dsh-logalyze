@@ -67,8 +67,38 @@ export function fileNameFor(url: URL, fallback: string): string {
   } catch {
     // Keep the raw segment when it is not valid percent-encoding.
   }
-  const safe = segment.replace(/[^\p{L}\p{N}._-]/gu, '_').replace(/^\.+/, '')
-  return safe === '' ? fallback : safe.slice(0, 200)
+  const safe = safeFileName(segment)
+  return safe === '' ? fallback : safe
+}
+
+/**
+ * A file name restricted to letters, digits, `.`, `_`, and `-`, without
+ * leading dots, at most 200 characters.
+ * @param name - raw name.
+ * @returns the safe name; empty when nothing usable remains.
+ */
+export function safeFileName(name: string): string {
+  return name.replace(/[^\p{L}\p{N}._-]/gu, '_').replace(/^\.+/, '').slice(0, 200)
+}
+
+/**
+ * Validate a download address the log platform issued: any http(s) host,
+ * without credentials in the URL. The platform is trusted to name its own
+ * storage, so the panel's host list does not apply.
+ * @param raw - URL text from the platform.
+ * @returns the parsed URL.
+ * @throws DownloadError when the URL is malformed.
+ */
+export function admitPlatformUrl(raw: string): URL {
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    throw new DownloadError('日志平台返回的下载地址不是合法的 URL')
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new DownloadError('日志平台返回的下载地址不是 http/https')
+  if (url.username !== '' || url.password !== '') throw new DownloadError('日志平台返回的下载地址包含用户名或密码')
+  return url
 }
 
 /** One completed download. */
@@ -86,6 +116,7 @@ export interface DownloadedFile {
  * @param settings - download policy.
  * @param signal - caller cancellation.
  * @param fetchImpl - fetch implementation (tests substitute it).
+ * @param options - `admit` checks the address and every redirect target (default: the panel's host list); `label` names the file in messages instead of the address.
  * @returns the saved file.
  * @throws DownloadError on policy refusal, HTTP failure, size overflow, or timeout.
  */
@@ -96,10 +127,13 @@ export async function downloadLog(
   settings: DownloadSettings,
   signal: AbortSignal,
   fetchImpl: typeof fetch = fetch,
+  options: { readonly admit?: (raw: string) => URL; readonly label?: string } = {},
 ): Promise<DownloadedFile> {
+  const admit = options.admit ?? ((value: string): URL => admitUrl(value, settings))
+  const label = options.label ?? raw
   const timeout = AbortSignal.timeout(settings.timeoutMs)
   const combined = AbortSignal.any([signal, timeout])
-  let url = admitUrl(raw, settings)
+  let url = admit(raw)
   let response: Response
   for (let hop = 0; ; hop += 1) {
     try {
@@ -111,8 +145,8 @@ export async function downloadLog(
     const location = response.headers.get('location')
     await response.body?.cancel()
     if (location === null) throw new DownloadError(`${url.hostname} 返回重定向 ${response.status} 但没有 Location`)
-    if (hop >= MAX_REDIRECTS) throw new DownloadError(`重定向超过 ${MAX_REDIRECTS} 次：${raw}`)
-    url = admitUrl(new URL(location, url).href, settings)
+    if (hop >= MAX_REDIRECTS) throw new DownloadError(`重定向超过 ${MAX_REDIRECTS} 次：${label}`)
+    url = admit(new URL(location, url).href)
   }
   if (!response.ok) {
     await response.body?.cancel()
@@ -121,16 +155,16 @@ export async function downloadLog(
   const declared = Number(response.headers.get('content-length') ?? Number.NaN)
   if (Number.isFinite(declared) && declared > settings.maxBytes) {
     await response.body?.cancel()
-    throw new DownloadError(`文件大小 ${declared} 字节超过上限 ${settings.maxBytes} 字节：${raw}`)
+    throw new DownloadError(`文件大小 ${declared} 字节超过上限 ${settings.maxBytes} 字节：${label}`)
   }
-  if (response.body === null) throw new DownloadError(`响应没有内容：${raw}`)
+  if (response.body === null) throw new DownloadError(`响应没有内容：${label}`)
   const path = join(dir, fileName)
   let bytes = 0
   const meter = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
       bytes += chunk.length
       if (bytes > settings.maxBytes) {
-        callback(new DownloadError(`文件超过大小上限 ${settings.maxBytes} 字节：${raw}`))
+        callback(new DownloadError(`文件超过大小上限 ${settings.maxBytes} 字节：${label}`))
         return
       }
       callback(null, chunk)

@@ -5,7 +5,9 @@
  * - 应用 id 必须与注册表一一对应且仓库可用，否则整次调用被拒绝、不启动任何子 Agent。
  * - 日志一律以绝对路径交给子 Agent；URL 先下载到本次运行目录
  *   `<父会话目录>/.logalyze/runs/<runId>/<序号>-<应用 id>/`，该目录也是子 Agent
- *   解压日志的可写目录。
+ *   解压日志的可写目录。分析接口话题里的日志编号（`{ ref: "L1" }`）按本话题的
+ *   分析记录找到日志平台的 log_id，派发时现取临时下载链接下载到同一目录；
+ *   链接不进入模型可见的内容。
  * - 超时（`dispatchTimeoutMs`）或调用被取消时停止全部仍在运行的子 Agent。
  * - 开启 SKILL 改进时，可写仓库（dsh-repo 权限「可改代码」或「可合并」）的子 Agent
  *   在 SKILL 不足时于运行目录写 `skill-gap.md`；派发结束后检查已完成任务的记录，
@@ -28,7 +30,8 @@ import type { GapCheck } from '../improve/gap.ts'
 import type { AnalyzedTask } from '../improve/tool.ts'
 import { runChild } from '../runs/child.ts'
 import type { ChildStatus } from '../runs/child.ts'
-import { admitLogs, logSchema, materializeLogs } from '../runs/logs.ts'
+import { admitLogs, dispatchLogSchema, materializeLogs } from '../runs/logs.ts'
+import type { PlatformLogDownloader, PlatformLogRef } from '../runs/logs.ts'
 import { newRunId, resolveRunBase, RUNS_SEGMENTS, topLevelAgent } from '../runs/run-dir.ts'
 import type { EditableSettings } from '../settings/contract.ts'
 import { DISPATCH_TOOL_NAME, IMPROVE_TOOL_NAME } from '../tool-names.ts'
@@ -38,7 +41,7 @@ const argsSchema = z.object({
   tasks: z.array(z.object({
     app: z.string().trim().min(1),
     question: z.string().trim().min(1, 'question 不能为空'),
-    logs: z.array(logSchema).min(1, '每个任务至少需要一份日志'),
+    logs: z.array(dispatchLogSchema).min(1, '每个任务至少需要一份日志'),
   }).strict()).min(1, '至少需要一个任务'),
 }).strict()
 
@@ -171,13 +174,14 @@ export const DISPATCH_PARAMETERS: Record<string, unknown> = {
           question: { type: 'string', description: '给子 Agent 的完整问题：现象、时间范围、关键标识与用户原话要点。子 Agent 看不到当前对话。' },
           logs: {
             type: 'array',
-            description: '日志位置。{ "path": 本机绝对路径 } 用于附件和本机文件；{ "url": 下载地址 } 用于对象存储链接（仅白名单域名）。',
+            description: '日志位置。{ "path": 本机绝对路径 } 用于附件和本机文件；{ "url": 下载地址 } 用于对象存储链接（仅白名单域名）；{ "ref": "L1" } 用于分析接口话题首轮消息日志表里的编号（由观象向日志平台取链接下载）。',
             items: {
               type: 'object',
               additionalProperties: false,
               properties: {
                 path: { type: 'string', description: '本机日志文件或目录的绝对路径。' },
                 url: { type: 'string', description: '日志下载地址。' },
+                ref: { type: 'string', description: '分析接口话题的日志编号，如 L1。' },
                 filter: { type: 'string', description: '混合日志中本应用相关行的识别方式，例如 tag 或进程名。' },
               },
             },
@@ -200,6 +204,13 @@ export interface DispatchDeps {
   workingDirectory(): WorkingDirectoryService | undefined
   /** SKILL gap records; omitted never mentions them to children. */
   readonly gaps?: GapInbox
+  /**
+   * The platform logs of the analyze API topic a top-level Session belongs to.
+   * @returns a resolver of log numbers, or undefined when the Session is not such a topic (log numbers are refused).
+   */
+  platformLogs?(sessionId: string): ((ref: string) => PlatformLogRef) | undefined
+  /** Downloads platform logs named by log number. */
+  readonly platform?: PlatformLogDownloader
   readonly fetch?: typeof fetch
   readonly now?: () => Date
 }
@@ -257,7 +268,8 @@ export class Dispatcher {
       throw new Error(`一次最多派发 ${settings.maxAppsPerRequest} 个任务，本次有 ${tasks.length} 个；请合并或分批`)
     }
     const { effectiveDir, baseDir } = await resolveRunBase(parent, this.deps.workingDirectory(), exec.signal)
-    const sources = await Promise.all(tasks.map(task => admitLogs(task.logs, effectiveDir, settings.download)))
+    const refs = this.deps.platformLogs?.(parent.session.header.id)
+    const sources = await Promise.all(tasks.map(task => admitLogs(task.logs, effectiveDir, settings.download, refs)))
 
     const lease = await this.deps.registry.acquire(tasks.map(task => task.app))
     try {
@@ -269,7 +281,7 @@ export class Dispatcher {
         if (ready === undefined) throw new Error(`应用「${task.app}」不可用`)
         const workDir = join(runDir, `${index + 1}-${task.app}`)
         await mkdir(workDir, { recursive: true })
-        const logs = await materializeLogs(sources[index] ?? [], workDir, settings.download, exec.signal, this.deps.fetch)
+        const logs = await materializeLogs(sources[index] ?? [], workDir, settings.download, exec.signal, this.deps.fetch, this.deps.platform)
         return { task, ready, workDir, logs }
       }))
       const gaps = this.deps.gaps?.enabled() === true ? this.deps.gaps : undefined

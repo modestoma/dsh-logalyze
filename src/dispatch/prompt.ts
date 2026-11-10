@@ -36,6 +36,18 @@ function gapSection(skill: string, workDir: string): string {
 `
 }
 
+function multiLogSection(count: number): string {
+  return `
+## 多份日志
+
+这 ${count} 份日志一起交给你，可能是同一问题，也可能不是：
+
+- 逐份确认日志的时间范围、设备和版本，以及里面有没有本问题的现象。
+- 按根因把日志分组，每组说明依据；看不出归属或没有出现问题的日志单独列出，不要硬归到某一组。
+- 结论里给每份日志一句话小结（用上面列出的文件名或编号指明是哪一份）。
+`
+}
+
 /**
  * Render the child's first message.
  * @param input - application, question, logs, writable directory, and whether SKILL gaps are recorded.
@@ -44,7 +56,9 @@ function gapSection(skill: string, workDir: string): string {
 export function renderChildPrompt(input: ChildPromptInput): string {
   const { app, commit, question, logs, workDir, gaps } = input
   const logLines = logs.map((log) => {
-    const origin = log.url === undefined ? '' : `（下载自 ${log.url}）`
+    const origin = log.platformLog !== undefined
+      ? `（日志 ${log.platformLog.ref}，日志平台 log_id \`${log.platformLog.logId}\`，原文件名 ${log.platformLog.fileName}）`
+      : log.url === undefined ? '' : `（下载自 ${log.url}）`
     const filter = log.filter === undefined ? '' : `；只看本应用相关部分：${log.filter}`
     return `- \`${log.path}\`${origin}${filter}`
   })
@@ -61,7 +75,7 @@ ${question}
 ${logLines.join('\n')}
 
 日志可能是压缩包，按上面加载的日志分析 SKILL 处理；需要解压时解压到运行目录。
-
+${logs.length > 1 ? multiLogSection(logs.length) : ''}
 ## 工作约束
 
 - 应用仓库只读：不要修改、新建或删除仓库中的文件，不要执行任何 git 写操作。
