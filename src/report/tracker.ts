@@ -573,6 +573,7 @@ export class ReportTracker {
       const skipped = [...manifest.skipped]
       await this.mutate(id, current => (sameList(current.skipped, skipped) ? undefined : { ...current, skipped }))
       if (entry.byteLength > settings.maxMarkdownBytes) return { ok: false, retryable: false, error: `报告入口 ${entry.byteLength} 字节，超过 Markdown 文件上限 ${settings.maxMarkdownBytes}，没有上传` }
+      if (entry.byteLength > settings.maxFileBytes) return { ok: false, retryable: false, error: `报告入口 ${entry.byteLength} 字节，超过单文件上限 ${settings.maxFileBytes}，没有上传` }
       const total = entry.byteLength + manifest.files.reduce((sum, file) => sum + file.size, 0)
       if (total > settings.maxBytes) return { ok: false, retryable: false, error: `报告共 ${total} 字节，超过总大小上限 ${settings.maxBytes}，没有上传` }
       try {

@@ -394,13 +394,20 @@ describe('report tracking', () => {
     expect(h.store.get(record.id)?.logs[0]?.generation).toBe(1)
   })
 
-  it('refuses a report directory that is a symbolic link and an entry over the Markdown limit', async () => {
+  it('refuses a report directory that is a symbolic link and an entry over the Markdown or single-file limit', async () => {
     const h = await harness()
     h.settings.maxMarkdownBytes = 10
     await h.start(analysis('req-1', 1))
     h.turn(1, { reply: '一段超过十个字节的结论' })
     await vi.waitFor(() => { expect(h.tracker.list()[0]?.logs[0]?.error).toContain('超过 Markdown 文件上限 10') })
     expect(h.platform.revisions).toEqual([])
+
+    const single = await harness()
+    single.settings.maxFileBytes = 10
+    await single.start(analysis('req-3', 1))
+    single.turn(1, { reply: '一段超过十个字节的结论' })
+    await vi.waitFor(() => { expect(single.tracker.list()[0]?.logs[0]?.error).toContain('超过单文件上限 10') })
+    expect(single.platform.revisions).toEqual([])
 
     const other = await harness()
     const target = join(other.workDir, 'elsewhere')
