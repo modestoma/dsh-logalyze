@@ -7,9 +7,10 @@
  *   `<父会话目录>/.logalyze/runs/<runId>/<序号>-<应用 id>/`，该目录也是子 Agent
  *   解压日志的可写目录。
  * - 超时（`dispatchTimeoutMs`）或调用被取消时停止全部仍在运行的子 Agent。
- * - 开启 SKILL 改进时，子 Agent 在 SKILL 不足时于运行目录写 `skill-gap.md`；派发
- *   结束后检查已完成任务的记录，并在结果中标出 SKILL 不足，供父 Agent 在汇总回复
- *   末尾给出改进建议，用户在之后的消息里同意后再改进。
+ * - 开启 SKILL 改进时，可写仓库（dsh-repo 权限「可改代码」或「可合并」）的子 Agent
+ *   在 SKILL 不足时于运行目录写 `skill-gap.md`；派发结束后检查已完成任务的记录，
+ *   并在结果中标出 SKILL 不足，供父 Agent 在汇总回复末尾给出改进建议，用户在之后
+ *   的消息里同意后再改进。只读仓库的子 Agent 不记录。
  * - 每个任务的结果带上应用仓库地址和分析的提交，后续修复代码可以从同一仓库和
  *   提交开始。
  * - 子会话（委派深度大于 0）中不提供本工具。
@@ -17,29 +18,21 @@
  * @module dsh-logalyze/dispatch/tool
  */
 
-import { randomBytes } from 'node:crypto'
-import { mkdir, stat } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { mkdir } from 'node:fs/promises'
+import { join } from 'node:path'
 import { z } from 'zod'
+import type { LeasedApp, RepoRegistry } from '../apps/registry.ts'
 import { describeIssue } from '../config.ts'
-import type { Agent, ContentBlock, SubagentActivation, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
-import type { RepoRegistry } from '../repos/registry.ts'
-import type { AppManifest, EditableSettings } from '../settings/contract.ts'
-import type { GapCheck } from '../skill-update/gap.ts'
-import { IMPROVE_TOOL_NAME } from '../skill-update/names.ts'
-import type { AnalyzedTask } from '../skill-update/tool.ts'
-import { admitUrl, downloadLog, fileNameFor } from './download.ts'
+import type { ContentBlock, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
+import type { GapCheck } from '../improve/gap.ts'
+import type { AnalyzedTask } from '../improve/tool.ts'
+import { runChild } from '../runs/child.ts'
+import type { ChildStatus } from '../runs/child.ts'
+import { admitLogs, logSchema, materializeLogs } from '../runs/logs.ts'
+import { newRunId, resolveRunBase, RUNS_SEGMENTS, topLevelAgent } from '../runs/run-dir.ts'
+import type { EditableSettings } from '../settings/contract.ts'
+import { DISPATCH_TOOL_NAME, IMPROVE_TOOL_NAME } from '../tool-names.ts'
 import { renderChildPrompt } from './prompt.ts'
-import type { ChildLog } from './prompt.ts'
-
-/** Model-facing tool name. */
-export const DISPATCH_TOOL_NAME = 'logalyze_dispatch'
-
-/** One log item of a model request: a local path or a download URL, with an optional filter. */
-export const logSchema = z.union([
-  z.object({ path: z.string().trim().min(1), filter: z.string().trim().min(1).optional() }).strict(),
-  z.object({ url: z.string().trim().min(1), filter: z.string().trim().min(1).optional() }).strict(),
-], { error: '每个日志项必须是 { path } 或 { url } 之一（可带 filter）' })
 
 const argsSchema = z.object({
   tasks: z.array(z.object({
@@ -52,8 +45,6 @@ const argsSchema = z.object({
 /** Validated dispatch arguments. */
 export type DispatchArgs = z.output<typeof argsSchema>
 
-/** Terminal state of one child analysis. */
-export type TaskStatus = 'completed' | 'aborted' | 'error' | 'max-tokens' | 'refusal' | 'timeout' | 'failed' | (string & {})
 
 /** One application's outcome. */
 export interface TaskResult {
@@ -63,7 +54,7 @@ export interface TaskResult {
   url: string
   /** Commit the child analyzed. */
   commit: string
-  status: TaskStatus
+  status: ChildStatus
   childId?: string
   /** The child's final answer text (possibly partial when not completed). */
   output: string
@@ -73,7 +64,7 @@ export interface TaskResult {
   workDir: string
   /** Absolute log paths handed to the child. */
   logs: string[]
-  /** The SKILL gap record the child wrote, when SKILL improvement is enabled and it wrote one. */
+  /** The SKILL gap record the child wrote, when SKILL improvement is enabled, the repository is writable, and the child wrote one. */
   skillGap?: GapCheck
 }
 
@@ -225,134 +216,6 @@ export interface GapInbox {
   inspect(task: AnalyzedTask): Promise<GapCheck | undefined>
 }
 
-/**
- * Whether a session is a delegated child, where the tool is not offered.
- * @param agent - calling agent.
- * @returns whether its delegation depth is above zero.
- */
-export function isDelegatedAgent(agent: Agent): boolean {
-  return (agent.session.header.delegationDepth ?? 0) > 0
-}
-
-/**
- * A new run id: local timestamp plus a random suffix.
- * @param now - current time.
- * @returns `YYYYMMDD-HHMMSS-xxxxxx`.
- */
-export function newRunId(now: Date): string {
-  const pad = (value: number): string => String(value).padStart(2, '0')
-  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
-  return `${stamp}-${randomBytes(3).toString('hex')}`
-}
-
-/**
- * Whether a path is a directory or a descendant of another.
- * @param child - candidate path.
- * @param parent - containing directory.
- * @returns whether `child` lies in `parent`.
- */
-export function isInside(child: string, parent: string): boolean {
-  const path = relative(parent, child)
-  return path === '' || (!path.startsWith('..') && !isAbsolute(path))
-}
-
-/** Path segments of the run directories below a base directory. */
-export const RUNS_SEGMENTS = ['.logalyze', 'runs'] as const
-
-/**
- * Whether a path lies in a run directory, where improvement and drafting
- * children work in their workspaces.
- * @param path - absolute path.
- * @returns whether the path has a `.logalyze/runs/` segment pair.
- */
-export function inRunDirectory(path: string): boolean {
-  const segments = path.split(sep)
-  return segments.some((segment, index) => segment === RUNS_SEGMENTS[0] && segments[index + 1] === RUNS_SEGMENTS[1])
-}
-
-/** Where a top-level agent's run directories live. */
-export interface RunBase {
-  /** The agent's effective working directory; relative log paths resolve against it. */
-  readonly effectiveDir: string
-  /** Directory holding `.logalyze/runs/`: the effective directory when it lies in the project directory, else the project directory. */
-  readonly baseDir: string
-}
-
-/**
- * Resolve where an agent's run directories go.
- * @param parent - calling top-level agent.
- * @param workingDirectory - the working-directory service, when the composition has one.
- * @param signal - cancellation.
- * @returns the effective and base directories.
- * @throws when the session has no project directory.
- */
-export async function resolveRunBase(parent: Agent, workingDirectory: WorkingDirectoryService | undefined, signal: AbortSignal): Promise<RunBase> {
-  const projectDir = parent.session.header.cwd
-  if (projectDir === undefined) throw new Error('当前会话没有项目目录，无法创建运行目录')
-  const effectiveDir = await workingDirectory?.ensure(parent, signal) ?? projectDir
-  return { effectiveDir, baseDir: isInside(effectiveDir, projectDir) ? effectiveDir : projectDir }
-}
-
-/** A checked log source: an existing local path or an admitted download URL. */
-export type LogSource =
-  | { readonly path: string; readonly url?: undefined; readonly filter?: string | undefined }
-  | { readonly url: string; readonly path?: undefined; readonly filter?: string | undefined }
-
-/**
- * Check log items before anything starts: local paths must exist, URLs must
- * pass the download policy.
- * @param logs - validated log items.
- * @param effectiveDir - directory relative paths resolve against.
- * @param download - download policy.
- * @returns the sources in order.
- * @throws when a path is unreadable or a URL is not admitted.
- */
-export async function admitLogs(logs: readonly z.output<typeof logSchema>[], effectiveDir: string, download: EditableSettings['download']): Promise<LogSource[]> {
-  return await Promise.all(logs.map(async (log): Promise<LogSource> => {
-    if ('url' in log) return { url: admitUrl(log.url, download).href, filter: log.filter }
-    const path = resolve(effectiveDir, log.path)
-    try {
-      await stat(path)
-    } catch (error) {
-      throw new Error(`日志路径不可读：${path}（${(error as NodeJS.ErrnoException).code ?? messageOf(error)}）`)
-    }
-    return { path, filter: log.filter }
-  }))
-}
-
-/**
- * Turn admitted sources into local paths, downloading URLs into a run directory.
- * @param sources - admitted sources.
- * @param workDir - run directory receiving downloads.
- * @param download - download policy.
- * @param signal - cancellation.
- * @param fetchImpl - fetch implementation.
- * @returns the logs as handed to a child.
- * @throws when a download fails.
- */
-export async function materializeLogs(sources: readonly LogSource[], workDir: string, download: EditableSettings['download'], signal: AbortSignal, fetchImpl?: typeof fetch): Promise<ChildLog[]> {
-  const logs: ChildLog[] = []
-  for (const [position, source] of sources.entries()) {
-    const filter = source.filter === undefined ? {} : { filter: source.filter }
-    if (source.path !== undefined) {
-      logs.push({ path: source.path, ...filter })
-      continue
-    }
-    const name = `${position + 1}-${fileNameFor(new URL(source.url), 'log')}`
-    const file = await downloadLog(source.url, workDir, name, download, signal, fetchImpl)
-    logs.push({ path: file.path, url: source.url, ...filter })
-  }
-  return logs
-}
-
-function textOf(blocks: readonly ContentBlock[]): string {
-  return blocks.flatMap(block => block.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n').trim()
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
 /** Runs dispatches; one instance serves every registration of the tool. */
 export class Dispatcher {
   /** @param deps - registry, subagent service, settings, and I/O seams. */
@@ -388,9 +251,7 @@ export class Dispatcher {
     const parsed = argsSchema.safeParse(rawArgs)
     if (!parsed.success) throw new Error(`${DISPATCH_TOOL_NAME} 参数不合法：${describeIssue(parsed.error)}`)
     const { tasks } = parsed.data
-    const parent = exec.agent
-    if (parent === undefined) throw new Error(`${DISPATCH_TOOL_NAME} 需要由 Agent 调用`)
-    if (isDelegatedAgent(parent)) throw new Error(`${DISPATCH_TOOL_NAME} 不能在子 Agent 中调用`)
+    const parent = topLevelAgent(exec, DISPATCH_TOOL_NAME)
     const settings = this.deps.settings()
     if (tasks.length > settings.maxAppsPerRequest) {
       throw new Error(`一次最多派发 ${settings.maxAppsPerRequest} 个任务，本次有 ${tasks.length} 个；请合并或分批`)
@@ -412,11 +273,26 @@ export class Dispatcher {
         return { task, ready, workDir, logs }
       }))
       const gaps = this.deps.gaps?.enabled() === true ? this.deps.gaps : undefined
-      const results = await this.runChildren(parent, prepared, settings, exec.signal, gaps !== undefined)
+      // Read-only repositories cannot take a SKILL improvement, so their children record no gaps.
+      const recordsGaps = (ready: LeasedApp): boolean => gaps !== undefined && ready.writable
+      const results = await Promise.all(prepared.map(async ({ task, ready, workDir, logs }): Promise<TaskResult> => {
+        const outcome = await runChild({
+          subagents: this.deps.subagents,
+          provider: this.deps.provider,
+          parent,
+          label: `${ready.app.name}分析`,
+          cwd: ready.dir,
+          prompt: renderChildPrompt({ app: ready.app, commit: ready.commit, question: task.question, logs, workDir, gaps: recordsGaps(ready) }),
+          timeoutMs: settings.dispatchTimeoutMs,
+          signal: exec.signal,
+        })
+        return { app: ready.app.id, name: ready.app.name, url: ready.url, commit: ready.commit, workDir, logs: logs.map(log => log.path), ...outcome }
+      }))
+      exec.signal.throwIfAborted()
       if (gaps !== undefined) {
         await Promise.all(results.map(async (result, index) => {
           const item = prepared[index]
-          if (result.status !== 'completed' || item === undefined) return
+          if (result.status !== 'completed' || item === undefined || !recordsGaps(item.ready)) return
           const check = await gaps.inspect({
             workDir: result.workDir,
             sessionId: parent.session.header.id,
@@ -434,71 +310,5 @@ export class Dispatcher {
     } finally {
       lease.release()
     }
-  }
-
-  private async runChildren(
-    parent: Agent,
-    prepared: readonly { task: DispatchArgs['tasks'][number]; ready: { app: AppManifest; url: string; dir: string; commit: string }; workDir: string; logs: ChildLog[] }[],
-    settings: EditableSettings,
-    signal: AbortSignal,
-    gaps: boolean,
-  ): Promise<TaskResult[]> {
-    const deadline = AbortSignal.timeout(settings.dispatchTimeoutMs)
-    const stop = AbortSignal.any([signal, deadline])
-    const maxDepth = this.deps.subagents.resolveMaxDepth()
-    const activations: (SubagentActivation | undefined)[] = []
-    const results = await Promise.all(prepared.map(async ({ task, ready, workDir, logs }, index): Promise<TaskResult> => {
-      const base = { app: ready.app.id, name: ready.app.name, url: ready.url, commit: ready.commit, workDir, logs: logs.map(log => log.path) }
-      let activation: SubagentActivation
-      try {
-        activation = await this.deps.subagents.startActivation({
-          provider: this.deps.provider,
-          label: `${ready.app.name}分析`,
-          request: {
-            cwd: ready.dir,
-            prompt: [{ type: 'text', text: renderChildPrompt({ app: ready.app, commit: ready.commit, question: task.question, logs, workDir, gaps }) }],
-            parent,
-            ...maxDepth === undefined ? {} : { maxDepth },
-          },
-          signal: stop,
-          delivery: 'caller',
-        })
-      } catch (error) {
-        return { ...base, status: stop.aborted && !signal.aborted ? 'timeout' : 'failed', output: '', diagnostic: messageOf(error) }
-      }
-      activations[index] = activation
-      const stopped = new Promise<'stopped'>((resolveStop) => {
-        if (stop.aborted) resolveStop('stopped')
-        else stop.addEventListener('abort', () => { resolveStop('stopped') }, { once: true })
-      })
-      try {
-        const outcome = await Promise.race([activation.result, stopped])
-        if (outcome === 'stopped') {
-          return { ...base, childId: activation.childId, status: signal.aborted ? 'aborted' : 'timeout', output: '', diagnostic: signal.aborted ? '派发被取消' : `超过派发等待上限 ${settings.dispatchTimeoutMs} ms` }
-        }
-        return {
-          ...base,
-          childId: activation.childId,
-          status: outcome.stopReason,
-          output: textOf(outcome.output),
-          ...outcome.diagnostic === undefined ? {} : { diagnostic: outcome.diagnostic },
-        }
-      } catch (error) {
-        return { ...base, childId: activation.childId, status: 'error', output: '', diagnostic: messageOf(error) }
-      }
-    }))
-    // Activations are disposed in every outcome: after a result this releases
-    // the child's resources, after a timeout or cancellation it stops the child.
-    await Promise.all(activations.map(async (activation) => {
-      if (activation === undefined) return
-      try {
-        await activation.dispose()
-      } catch (error) {
-        const result = results.find(entry => entry.childId === activation.childId)
-        if (result !== undefined) result.diagnostic = [result.diagnostic, `子 Agent 清理失败：${messageOf(error)}`].filter(Boolean).join('；')
-      }
-    }))
-    signal.throwIfAborted()
-    return results
   }
 }

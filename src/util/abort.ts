@@ -1,7 +1,7 @@
 /**
- * Cancellation helpers shared by the entry skill and the dispatch tool.
+ * Cancellation helpers for waits that must not outlive their caller.
  *
- * @module dsh-logalyze/abort
+ * @module dsh-logalyze/util/abort
  */
 
 /**

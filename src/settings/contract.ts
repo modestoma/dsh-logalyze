@@ -7,7 +7,7 @@
 
 /** GET：面板所需的全部状态（生效设置、默认值、仓库与应用）。 */
 export const STATE_ROUTE = '/logalyze/state'
-/** PUT：保存可编辑设置；DELETE：清除面板覆盖、恢复 cordis.yml 默认值。 */
+/** PUT：保存可编辑设置；DELETE：清除面板覆盖、恢复 cordis.yml 默认值。应用仓库不在这里编辑，来自 dsh-repo 的仓库清单。 */
 export const SETTINGS_ROUTE = '/logalyze/settings'
 /** POST：立即重新拉取全部仓库，或 body `{ url }` 指定的一个仓库。 */
 export const SYNC_ROUTE = '/logalyze/sync'
@@ -22,9 +22,9 @@ export const TOKEN_ROUTE = '/logalyze/token'
  */
 export const ANALYZE_ROUTE = '/open-api/logalyze'
 
-/** One configured application repository. */
+/** One application repository: a dsh-repo catalog repository with the log analysis feature turned on. */
 export interface RepoSpec {
-  /** Git remote address, mirrored by dsh-repo with the token of its host or the machine's existing git credentials. */
+  /** Git remote address as the catalog stores it, mirrored by dsh-repo. */
   url: string
   /** Remote branch to follow; omitted follows the remote's default branch. */
   branch?: string
@@ -92,8 +92,6 @@ export interface AnalyzeSettings {
 
 /** The settings the Web panel can override; every field is required on the wire. */
 export interface EditableSettings {
-  /** Application repositories to mirror and keep updated. */
-  repos: RepoSpec[]
   /** Minimum age of a repository's last sync before loading `/logalyze` syncs it again, in milliseconds; 0 syncs on every load. */
   fetchIntervalMs: number
   /** Maximum number of child analyses one dispatch may start. */
@@ -109,7 +107,7 @@ export interface EditableSettings {
 }
 
 /** Keys of {@link EditableSettings}, in panel order. */
-export const EDITABLE_KEYS = ['repos', 'fetchIntervalMs', 'maxAppsPerRequest', 'dispatchTimeoutMs', 'download', 'skillUpdates', 'analyze'] as const satisfies readonly (keyof EditableSettings)[]
+export const EDITABLE_KEYS = ['fetchIntervalMs', 'maxAppsPerRequest', 'dispatchTimeoutMs', 'download', 'skillUpdates', 'analyze'] as const satisfies readonly (keyof EditableSettings)[]
 
 /** One editable key. */
 export type EditableKey = (typeof EDITABLE_KEYS)[number]
@@ -137,13 +135,9 @@ export type RepoPhase = 'pending' | 'syncing' | 'ready' | 'failed'
 export interface RepoStatusWire {
   url: string
   branch?: string
-  /** Absolute directory of dsh-repo's fetch-only mirror, once a sync succeeded; children work in commit snapshots dsh-repo creates. */
-  dir?: string
   phase: RepoPhase
-  /** Latest synced commit, the one the catalog describes and new dispatches use. */
+  /** Latest synced commit, the one the catalog describes and new dispatches use; children work in snapshots of it that dsh-repo creates. */
   commit?: string
-  /** Committer date of {@link commit}, ISO 8601. */
-  commitTime?: string
   /** Last completed sync attempt, epoch milliseconds. */
   syncedAt?: number
   /** Application description read from {@link commit}. */
@@ -152,6 +146,8 @@ export interface RepoStatusWire {
   error?: string
   /** Whether the application is offered to intent recognition and dispatch. */
   available: boolean
+  /** Whether the catalog entry's access lets setups and SKILL improvements push; a read-only repository is only analyzed. */
+  writable: boolean
   /** Child analyses currently running in snapshots of this repository. */
   activeRuns: number
 }
@@ -180,12 +176,14 @@ export type ReposAvailability = 'ready' | 'missing' | 'incompatible'
 /** dsh-repo view of the panel. */
 export interface ReposWire {
   availability: ReposAvailability
-  /** Mirror directory; absent unless `ready`. */
+  /** Mirror directory; absent unless `ready`, and absent while the provider has none chosen (repositories cannot be fetched until it is set in the provider's settings). */
   mirrorDir?: string
+  /** The provider's reason for not using its stored mirror directory; absent otherwise. */
+  mirrorProblem?: string
 }
 
 /**
- * Whether dsh-channels provides the `feishuTopics` service the analyze API
+ * Whether the Feishu channel plugin provides the `feishuTopics` service the analyze API
  * posts through: `missing` while it is not loaded, `incompatible` when its
  * contract version is not
  * the one this plugin speaks.
@@ -234,7 +232,7 @@ export interface AnalyzeWire {
   /** Token status; absent while the DSH composition has no credential store. */
   token?: TokenStatusWire
   topics: TopicsAvailability
-  /** Whether the loaded dsh-channels reports launch states, which report upload needs. */
+  /** Whether the provider reports launch states, which report uploads need; older version-2 providers do not. */
   reportsSupported: boolean
   /** Most recently accepted reports, newest first. */
   reports: ReportWire[]

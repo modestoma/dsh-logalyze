@@ -1,8 +1,9 @@
 /**
  * `logalyze_improve_skill`：用户在对话中同意改进某个应用的日志分析 SKILL 后，
  * 派一个改进子 Agent 把该应用的所有改进点一次改进完（需要时把问题整理为案例），
- * 再提交到新分支、创建合并请求供用户评审。调用本身就代表用户已经同意，工具不再
- * 询问。改进的依据有两种，至少要有一种：
+ * 再提交到新分支、创建合并请求供用户评审。父 Agent 只在用户于对话中同意后调用；
+ * 推送前 dsh-repo 按它的写操作设置可能再请用户批准一次。只改进仓库清单中可写
+ * （权限「可改代码」或「可合并」）的应用。改进的依据有两种，至少要有一种：
  *
  * - 分析：本进程中同一会话派发并已完成的该应用的任务。默认取其中记录了
  *   `skill-gap.md`、还没有被改进过的全部任务；参数 `workDirs` 给出时只用这些任务。
@@ -19,44 +20,44 @@
  *
  * 其余规则：
  *
- * - 观象在新的运行目录 `.logalyze/runs/<runId>/improve-<序号>/repo/` 打开应用最新
- *   同步提交的可写工作区，改进子 Agent 以它为工作目录、首行 `/logalyze-improve`，
+ * - 观象在新的运行目录 `.logalyze/runs/<runId>/improve-<序号>/repo/` 从应用最新
+ *   同步提交创建工作区，推送分支为新的 `logalyze/skill-<应用 id>-<runId>`；改进
+ *   子 Agent 以它为工作目录、首行 `/logalyze-improve`，
  *   直接修改 `.agents/skills/<skill>/`，改动说明写在工作区之外的
  *   `improve-<序号>/reason.md`；超时（`dispatchTimeoutMs`）或调用被取消时停止它。
  * - 改动只能是 `.agents/skills/<skill>/` 下新增或修改的文件；依据分析时必须新增
- *   或修改 `cases/` 下至少一个案例。合格后推送到新分支
- *   `logalyze/skill-<应用 id>-<改动摘要前缀>`，从不推送到已有分支或默认分支。
+ *   或修改 `cases/` 下至少一个案例。合格后经 dsh-repo 的审批推送到工作区的
+ *   分支并创建合并请求，从不推送到已有分支或默认分支。
  * - 工作区、推送和合并请求经 `dshRepos` 服务完成。子会话中不提供本工具。
  *
- * @module dsh-logalyze/skill-update/tool
+ * @module dsh-logalyze/improve/tool
  */
 
 import { randomBytes } from 'node:crypto'
-import { mkdir } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { z } from 'zod'
+import { disablesUserInvocation, skillDir, skillNameOf } from '../apps/manifest.ts'
+import type { RepoRegistry } from '../apps/registry.ts'
 import { describeIssue } from '../config.ts'
-import { runChild } from '../dispatch/child.ts'
-import type { ChildOutcome } from '../dispatch/child.ts'
-import type { ChildLog } from '../dispatch/prompt.ts'
-import { admitLogs, isDelegatedAgent, logSchema, materializeLogs, newRunId, resolveRunBase, RUNS_SEGMENTS } from '../dispatch/tool.ts'
-import type { LogSource } from '../dispatch/tool.ts'
+import type { ReposClient } from '../deps/repos.ts'
 import type { Agent, ContentBlock, SubagentService, ToolDefinition, ToolRunContext, WorkingDirectoryService } from '../host.ts'
-import type { CommitAuthor } from '../repos/contract.ts'
-import { messageOf, requireRepos } from '../repos/lookup.ts'
-import { disablesUserInvocation, skillDir, skillNameOf } from '../repos/manifest.ts'
-import type { RepoRegistry } from '../repos/registry.ts'
+import { checkChanges, describeFiles, readReason } from '../runs/changes.ts'
+import type { CheckedChanges, FileStat } from '../runs/changes.ts'
+import { runChild } from '../runs/child.ts'
+import { admitLogs, logSchema, SAMPLE_LOGS_PARAMETER } from '../runs/logs.ts'
+import type { ChildLog, LogSource } from '../runs/logs.ts'
+import { pushChange, SKILL_COMMIT_PREFIX } from '../runs/push.ts'
+import type { PushStatus } from '../runs/push.ts'
+import { newRunId, resolveRunBase, RUNS_SEGMENTS, topLevelAgent } from '../runs/run-dir.ts'
+import { openWorkspace, writeDiff } from '../runs/workspace.ts'
 import type { AppManifest, EditableSettings } from '../settings/contract.ts'
-import { pushChange, SKILL_COMMIT_PREFIX } from './commit.ts'
-import type { PushStatus } from './commit.ts'
+import { IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from '../tool-names.ts'
+import { messageOf } from '../util/errors.ts'
+import { ProposalError } from '../util/files.ts'
 import { GAP_FILE, GAP_PREVIEW_CHARS, previewOf, readGap } from './gap.ts'
 import type { GapCheck } from './gap.ts'
-import { IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from './names.ts'
-import { ProposalError, replaceFile } from './files.ts'
 import { CASES_DIR, renderImprovePrompt } from './prompt.ts'
 import type { ImproveAnalysis } from './prompt.ts'
-import { checkChanges, describeFiles, DIFF_FILE, readReason, WORKSPACE_DIR } from './workspace.ts'
-import type { CheckedChanges, FileStat } from './workspace.ts'
 
 /** Longest commit subject and merge request title, including {@link SKILL_COMMIT_PREFIX}. */
 export const MAX_TITLE_CHARS = 120
@@ -100,7 +101,7 @@ export interface AnalyzedTask {
   readonly logs: readonly string[]
 }
 
-/** How one improvement ended: a push status, or `failed` when no submittable change came out. */
+/** How one improvement ended: a push status (including the approval outcome that stopped it), or `failed` when no submittable change came out. */
 export type ImproveStatus = PushStatus | 'failed'
 
 /** Canonical tool value. */
@@ -147,15 +148,7 @@ const PARAMETERS: Record<string, unknown> = {
       description: '可选：作为依据的分析任务运行目录（绝对路径，本会话之前回合派发的该应用任务）。省略时自动取本会话中该应用记录了 SKILL 不足、还没改进过的全部分析；用户纠正的是某次没有标出不足的分析，或要求重试已经改进过的分析时才填写。',
     },
     feedback: { type: 'string', description: '用户指出的问题、补充的改进点和期望的改法，尽量保留用户原话。没有可用的 SKILL 不足记录时必填。' },
-    logs: {
-      type: 'array',
-      description: '可选的样例日志。{ "path": 本机绝对路径 } 用于附件和本机文件；{ "url": 下载地址 } 用于对象存储链接（仅白名单域名）。',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        properties: { path: { type: 'string' }, url: { type: 'string' } },
-      },
-    },
+    logs: SAMPLE_LOGS_PARAMETER,
   },
 }
 
@@ -171,7 +164,7 @@ const OUTPUT_SCHEMA = {
   additionalProperties: false,
   required: ['status', 'app', 'repo', 'improveDir', 'target'],
   properties: {
-    status: { type: 'string', enum: ['opened', 'pushed', 'exists', 'failed'] },
+    status: { type: 'string', enum: ['opened', 'pushed', 'exists', 'rejected', 'cancelled', 'unavailable', 'failed'] },
     app: { type: 'string' },
     repo: { type: 'string' },
     workDirs: { type: 'array', items: { type: 'string' } },
@@ -197,7 +190,10 @@ export function renderImproveValue(value: ImproveValue): ContentBlock[] {
   const head = {
     opened: `SKILL 已改进，提交到 ${where}并创建合并请求：${value.mergeRequestUrl ?? ''}`,
     pushed: `SKILL 已改进并提交到 ${where}，但创建合并请求失败（${value.mergeRequestError ?? '未知原因'}）；请在代码托管平台上从该分支手动创建。`,
-    exists: `${where} 已存在，同一改动可能已经提交过，本次没有提交。`,
+    exists: `${where} 在远端已有其他提交，本次没有提交。`,
+    rejected: `SKILL 已改进，但推送授权被拒绝，没有提交：用户拒绝了，或会话的审批策略为 never（例如「完全访问」权限模式）。改动仍在 ${value.improveDir}。`,
+    cancelled: '推送授权请求被撤回，没有提交。',
+    unavailable: '当前没有可以回答推送授权请求的界面，没有提交。',
     failed: `SKILL 改进没有完成，没有提交：${value.error ?? '未知原因'}`,
   }[value.status]
   const files = value.files === undefined || value.files.length === 0 ? '' : `\n改动：${describeFiles(value.files)}`
@@ -216,9 +212,7 @@ export interface SkillImproverDeps {
   settings(): EditableSettings
   /** The working-directory service, when the composition has one. */
   workingDirectory(): WorkingDirectoryService | undefined
-  readonly author?: CommitAuthor
-  /** What `ctx.get('dshRepos')` returns now. */
-  repos(): unknown
+  readonly repos: ReposClient
   readonly fetch?: typeof fetch
   readonly now?: () => Date
 }
@@ -357,7 +351,7 @@ export class SkillImprover {
     return {
       name: IMPROVE_TOOL_NAME,
       description: '观象：改进某个应用的日志分析 SKILL。派一个子 Agent 把该应用的所有改进点一次改完（需要时把问题整理为案例写入 SKILL 的 cases/ 目录），推送到新分支并创建合并请求供用户评审，不会改动默认分支，需要几分钟。'
-        + '调用即视为用户已同意，工具不再询问，所以只在用户于对话中明确同意改进后调用。分析结果标出「SKILL 不足」的那一回合不要调用（工具会拒绝）：先写完分析结论，在回复末尾给出 SKILL 改进建议并问用户是否改进。'
+        + '只在用户于对话中明确同意改进后调用；推送前 dsh-repo 可能再请用户批准一次。仓库在 dsh-repo 中为只读的应用不能改进（工具会拒绝）。分析结果标出「SKILL 不足」的那一回合不要调用（工具会拒绝）：先写完分析结论，在回复末尾给出 SKILL 改进建议并问用户是否改进。'
         + `每个应用每回合只调用一次，把该应用的所有改进点放进同一次调用。用户主动纠正 SKILL 时，先用 ${SHOW_TOOL_NAME} 查看现有 SKILL，和用户确认哪部分不对、正确做法是什么、有没有样例日志，问清后再调用，并把用户的纠正写进 feedback。不要自己修改或推送 SKILL 文件。`,
       parameters: PARAMETERS,
       output: {
@@ -379,12 +373,10 @@ export class SkillImprover {
   async execute(rawArgs: unknown, exec: ToolRunContext): Promise<ImproveValue> {
     const parsed = argsSchema.safeParse(rawArgs)
     if (!parsed.success) throw new Error(`${IMPROVE_TOOL_NAME} 参数不合法：${describeIssue(parsed.error)}`)
-    const agent = exec.agent
-    if (agent === undefined) throw new Error(`${IMPROVE_TOOL_NAME} 需要由 Agent 调用`)
-    if (isDelegatedAgent(agent)) throw new Error(`${IMPROVE_TOOL_NAME} 不能在子 Agent 中调用`)
+    const agent = topLevelAgent(exec, IMPROVE_TOOL_NAME)
     if (!this.enabled()) throw new Error('观象的 SKILL 改进未开启（设置面板「高级」→「SKILL 改进」）')
     const request = await this.resolve(parsed.data, agent, exec.signal)
-    requireRepos(this.deps.repos())
+    this.deps.repos.require()
 
     const turn = this.turnOf(request.sessionId)
     if (this.running.has(request.key)) throw new Error(`应用「${request.app.id}」的 SKILL 改进正在进行`)
@@ -404,7 +396,8 @@ export class SkillImprover {
     const sessionId = agent.session.header.id
     const settings = this.deps.settings()
     const { feedback } = args
-    const { app, url } = this.deps.registry.readyApp(args.app)
+    const { app, url, writable } = this.deps.registry.readyApp(args.app)
+    if (!writable) throw new Error(`应用「${app.id}」的仓库在 dsh-repo 仓库清单中的权限是「只读」，观象不能推送 SKILL 改进；请在 dsh-repo「代码仓库 → 仓库」把权限改为「可改代码」，或由仓库维护者自己修改 SKILL`)
     const turn = this.turnOf(sessionId)
     const analyzed = [...this.tasks.values()].filter(record => record.task.sessionId === sessionId && record.task.app.id === app.id)
     if (analyzed.some(record => record.turn === turn)) {
@@ -443,17 +436,22 @@ export class SkillImprover {
     const tasks = bases.map(basis => basis.record.task)
     const caseRequired = tasks.length > 0
     const { app, url, commit } = this.deps.registry.readyApp(request.app.id)
-    const target = this.deps.registry.branchOf(url)
+    const base = this.deps.registry.branchOf(url)
     const improveDir = join(request.parentDir, `improve-${randomBytes(3).toString('hex')}`)
-    const repoDir = join(improveDir, WORKSPACE_DIR)
-    await mkdir(improveDir, { recursive: true })
-    try {
-      await requireRepos(this.deps.repos()).openWorkspace(url, { dir: repoDir, baseBranch: target, commit, signal: exec.signal })
-    } catch (error) {
-      exec.signal.throwIfAborted()
-      throw new Error(`应用「${app.id}」的工作区创建失败：${messageOf(error)}`)
-    }
-    const extra = await materializeLogs(request.sources, improveDir, settings.download, exec.signal, this.deps.fetch)
+    const { workspace, repoDir, logs: extra } = await openWorkspace({
+      repos: this.deps.repos,
+      parent,
+      exec,
+      repo: url,
+      base,
+      commit,
+      branch: `logalyze/skill-${app.id}-${basename(request.parentDir)}`,
+      workDir: improveDir,
+      sources: request.sources,
+      download: settings.download,
+      ...this.deps.fetch === undefined ? {} : { fetch: this.deps.fetch },
+      subject: `应用「${app.id}」`,
+    })
     const logs: ChildLog[] = [...distinct(tasks.flatMap(task => task.logs)).map(path => ({ path })), ...extra]
     const analyses: ImproveAnalysis[] = bases.map(({ record: { task }, gap }) => ({
       commit: task.commit,
@@ -473,34 +471,34 @@ export class SkillImprover {
       caseRequired,
       date: localDate(this.deps.now?.() ?? new Date()),
     })
-    const child: ChildOutcome = await runChild({ subagents: this.deps.subagents, provider: this.deps.provider, parent, label: `${app.name} SKILL 改进`, cwd: repoDir, prompt, timeoutMs: settings.dispatchTimeoutMs, signal: exec.signal })
-    const base = { app: app.id, repo: url, ...tasks.length === 0 ? {} : { workDirs: tasks.map(task => task.workDir) }, improveDir, target, ...child.output === '' ? {} : { output: child.output } }
+    const child = await runChild({ subagents: this.deps.subagents, provider: this.deps.provider, parent, label: `${app.name} SKILL 改进`, cwd: repoDir, prompt, timeoutMs: settings.dispatchTimeoutMs, signal: exec.signal })
+    exec.signal.throwIfAborted()
+    const { branch, base: target } = workspace
+    const result = { app: app.id, repo: url, ...tasks.length === 0 ? {} : { workDirs: tasks.map(task => task.workDir) }, improveDir, branch, target, ...child.output === '' ? {} : { output: child.output } }
     if (child.status !== 'completed') {
-      return { ...base, status: 'failed', error: `改进子 Agent 没有完成（${child.status}${child.diagnostic === undefined ? '' : `：${child.diagnostic}`}）` }
+      return { ...result, status: 'failed', error: `改进子 Agent 没有完成（${child.status}${child.diagnostic === undefined ? '' : `：${child.diagnostic}`}）` }
     }
 
     // The service may have reloaded while the child ran.
-    const repos = requireRepos(this.deps.repos())
+    const repos = this.deps.repos.require()
     const dir = skillDir(app.skill)
     let prepared: { changes: CheckedChanges; reason: string; diffPath: string }
     try {
       const changes = await checkChanges(
-        await repos.workspaceChanges(repoDir, { signal: exec.signal }),
+        await repos.workspaceStatus({ path: repoDir, signal: exec.signal }),
         { root: dir, allows: () => true, description: `${dir}/` },
         settings.skillUpdates,
       )
       checkImprovement(changes, app.skill, caseRequired)
       const reason = await readReason(improveDir, settings.skillUpdates.maxFileBytes, '改动说明')
-      const diffPath = join(improveDir, DIFF_FILE)
-      await replaceFile(diffPath, changes.diff)
+      const diffPath = await writeDiff(improveDir, changes.diff)
       prepared = { changes, reason, diffPath }
     } catch (error) {
       exec.signal.throwIfAborted()
-      return { ...base, status: 'failed', error: messageOf(error) }
+      return { ...result, status: 'failed', error: messageOf(error) }
     }
 
     const { changes, reason, diffPath } = prepared
-    const branch = `logalyze/skill-${app.id}-${changes.digest.slice(0, 10)}`
     const title = titleOf(reason, app)
     const commits = distinct(tasks.map(task => task.commit))
     const origin = tasks.length === 0
@@ -509,16 +507,12 @@ export class SkillImprover {
     const outcome = await pushChange({
       repos,
       exec,
-      url,
+      agent: parent,
       dir: repoDir,
-      branch,
-      target,
       message: `${title}\n\n${reason}\n\nProposed-by: 观象 Logalyze\n${commits.map(sha => `Analyzed-commit: ${sha}\n`).join('')}`,
-      session: request.sessionId,
       title,
       body: `${origin}。请评审${caseRequired ? '案例和 ' : ' '}SKILL 修改。\n\n${reason.slice(0, REASON_DESCRIPTION_CHARS)}`,
-      ...this.deps.author === undefined ? {} : { author: this.deps.author },
     })
-    return { ...base, branch, files: [...changes.files], diffPath, ...outcome }
+    return { ...result, files: [...changes.files], diffPath, ...outcome }
   }
 }

@@ -6,11 +6,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import { resolveConfig, defaultsOf } from '../src/config.ts'
 import { Dispatcher, renderDispatchValue } from '../src/dispatch/tool.ts'
 import type { Agent, SubagentActivation, SubagentResult, SubagentService } from '../src/host.ts'
-import { RepoRegistry } from '../src/repos/registry.ts'
+import { RepoRegistry } from '../src/apps/registry.ts'
 import type { EditableSettings } from '../src/settings/contract.ts'
-import { SkillImprover } from '../src/skill-update/tool.ts'
+import { SkillImprover } from '../src/improve/tool.ts'
 import { FakeRepos } from './fake-repos.ts'
 import { createAppRepo, tempDir } from './helpers.ts'
+import { ReposClient } from '../src/deps/repos.ts'
 
 let server: Server
 let port = 0
@@ -57,17 +58,16 @@ async function setup(overrides: Partial<EditableSettings> = {}, gaps = false) {
   const project = join(dir, 'project')
   await createAppRepo(project)
   const repos = new FakeRepos(join(dir, 'mirrors'))
-  const registry = new RepoRegistry({ repos: () => repos, onChange: () => {} })
+  const registry = new RepoRegistry({ repos: new ReposClient(() => repos), onChange: () => {} })
   const settings: EditableSettings = {
     ...defaultsOf(resolveConfig({})),
-    repos: [{ url: origin }],
     download: { allowedHosts: ['127.0.0.1'], maxBytes: 1024, timeoutMs: 5000 },
     ...overrides,
   }
-  registry.configure(settings.repos)
+  registry.configure([{ url: origin, writable: true }])
   await registry.syncAll()
   const { service, started } = fakeSubagents()
-  const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: () => repos })
+  const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: new ReposClient(() => repos) })
   const dispatcher = new Dispatcher({
     registry,
     ...gaps ? { gaps: improver } : {},
@@ -101,9 +101,9 @@ describe('logalyze_dispatch', () => {
     await waitForStarts(started, 1)
     const [child] = started
     expect(registry.status()[0]?.activeRuns).toBe(1)
-    expect(child?.spec).toMatchObject({ provider: 'spawn', label: '订单服务分析', delivery: 'caller', request: { parent, maxDepth: 1 } })
-    expect(child?.spec.request.cwd).toBe(join(repos.root, '.snapshots', basename(repos.mirrorDir(registry.status()[0]!.url)), registry.status()[0]!.commit!.slice(0, 12)))
-    const prompt = child?.spec.request.prompt[0]?.text as string
+    expect(child?.spec).toMatchObject({ provider: 'spawn', label: '订单服务分析', delivery: 'caller', parent, maxDepth: 1 })
+    expect(child?.spec.cwd).toBe(join(repos.root, '.snapshots', basename(repos.mirrorDir(registry.status()[0]!.url)), registry.status()[0]!.commit!.slice(0, 12)))
+    const prompt = child?.spec.prompt[0]?.text as string
     expect(prompt.split('\n')[0]).toBe('/log-analysis')
     const workDir = join(project, 'sample-logs', '.logalyze', 'runs')
     expect(prompt).toContain(`- \`${log}\``)
@@ -136,13 +136,13 @@ describe('logalyze_dispatch', () => {
     const path = join(project, 'sample-logs', 'order-service.log')
     const running = dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ path }] }, { app: 'order-service', question: 'q2', logs: [{ path }] }] }, { signal: new AbortController().signal, agent: parent })
     await waitForStarts(started, 2)
-    const prompt = started[0]?.spec.request.prompt[0]?.text as string
+    const prompt = started[0]?.spec.prompt[0]?.text as string
     expect(prompt).toContain('## SKILL 不足时')
     expect(prompt).toContain('只是多查了几步，或者缺的是只在这一次出现、以后用不上的细节，都不算不足，不要记录。')
     expect(prompt).toContain('仓库中的 `.agents/skills/log-analysis/`')
     expect(prompt).toContain('不要修改 SKILL，是否改进由用户决定。')
     const workDir = /`([^`]+)\/skill-gap\.md`/.exec(prompt)?.[1] as string
-    const second = /`([^`]+)\/skill-gap\.md`/.exec(started[1]?.spec.request.prompt[0]?.text as string)?.[1] as string
+    const second = /`([^`]+)\/skill-gap\.md`/.exec(started[1]?.spec.prompt[0]?.text as string)?.[1] as string
     await writeFile(join(workDir, 'skill-gap.md'), '  SKILL 没写   traceId 字段\n\n靠 grep 找到的\n')
     await writeFile(join(second, 'skill-gap.md'), '失败的任务不检查')
     started[0]?.settle({ stopReason: 'completed', output: [{ type: 'text', text: '结论' }] })
@@ -155,11 +155,22 @@ describe('logalyze_dispatch', () => {
     expect(text).toContain('在汇总回复末尾的「SKILL 改进建议」中用一两句说明，并问用户是否改进。本回合不要调用 logalyze_improve_skill（工具会拒绝）；用户同意后再调用，app 为 order-service。')
   })
 
+  it('does not ask children of read-only repositories to record SKILL gaps', async () => {
+    const { project, dispatcher, started, parent, registry } = await setup({ skillUpdates: { enabled: true, maxFiles: 4, maxFileBytes: 65536 } }, true)
+    const { url } = registry.status()[0]!
+    registry.configure([{ url, writable: false }])
+    const running = dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ path: join(project, 'sample-logs', 'order-service.log') }] }] }, { signal: new AbortController().signal, agent: parent })
+    await waitForStarts(started, 1)
+    expect(started[0]?.spec.prompt[0]?.text).not.toContain('skill-gap.md')
+    started[0]?.settle({ stopReason: 'completed', output: [{ type: 'text', text: '结论' }] })
+    expect((await running).results[0]?.skillGap).toBeUndefined()
+  })
+
   it('reports a gap record that cannot be read instead of offering it', async () => {
     const { project, dispatcher, started, parent } = await setup({ skillUpdates: { enabled: true, maxFiles: 4, maxFileBytes: 8 } }, true)
     const running = dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ path: join(project, 'sample-logs', 'order-service.log') }] }] }, { signal: new AbortController().signal, agent: parent })
     await waitForStarts(started, 1)
-    const workDir = /`([^`]+)\/skill-gap\.md`/.exec(started[0]?.spec.request.prompt[0]?.text as string)?.[1] as string
+    const workDir = /`([^`]+)\/skill-gap\.md`/.exec(started[0]?.spec.prompt[0]?.text as string)?.[1] as string
     await writeFile(join(workDir, 'skill-gap.md'), 'x'.repeat(20))
     started[0]?.settle({ stopReason: 'completed', output: [] })
     const value = await running

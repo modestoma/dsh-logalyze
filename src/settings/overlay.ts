@@ -6,10 +6,11 @@
  * @module dsh-logalyze/settings/overlay
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { describeIssue, overlaySchema, resolveDshHome } from '../config.ts'
 import type { SettingsOverlay } from '../config.ts'
+import { replaceFile } from '../util/files.ts'
 import { EDITABLE_KEYS } from './contract.ts'
 import type { EditableKey, EditableSettings } from './contract.ts'
 
@@ -85,8 +86,6 @@ export class OverlayStore {
    */
   async write(overlay: SettingsOverlay): Promise<void> {
     await mkdir(dirname(this.path), { recursive: true })
-    const temporary = `${this.path}.${process.pid}.${Date.now()}.tmp`
-    await writeFile(temporary, `${JSON.stringify(overlay, undefined, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
-    await rename(temporary, this.path)
+    await replaceFile(this.path, `${JSON.stringify(overlay, undefined, 2)}\n`, 0o600)
   }
 }

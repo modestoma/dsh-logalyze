@@ -1,14 +1,14 @@
 /**
  * 左侧栏「观象」主区页面：应用仓库、日志下载、分析接口、高级（含 SKILL 改进）四个
- * 分页，共用一份草稿和底部保存条。拉取仓库用的主机与令牌在「插件 → dsh-repo」
- * 页面管理，应用仓库分页提供跳转。
+ * 分页，后三个共用一份草稿和底部保存条。应用仓库分页只读：仓库在 dsh-repo 的
+ * 仓库清单中添加并打开「日志分析」功能，分页显示拉取状态并提供跳转。
  * 仓库拉取中时每 2 秒刷新状态；打开「分析接口」分页时每 5 秒刷新回传记录。
  *
  * @module dsh-logalyze/client/page
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { AnalyzeWire, EditableKey, EditableSettings, ReportStatus, ReportWire, RepoSpec, RepoStatusWire, StateWire, TokenStatusWire, UploadPhase } from '../settings/contract.ts'
+import type { AnalyzeWire, EditableKey, EditableSettings, ReportStatus, ReportWire, RepoStatusWire, StateWire, TokenStatusWire, UploadPhase } from '../settings/contract.ts'
 import { clearToken, fetchState, messageOf, resetSettings, retryReport, saveSettings, saveToken, syncRepos } from './api.ts'
 
 /** Sidebar label and page title. */
@@ -29,7 +29,6 @@ const TABS: readonly { id: TabId; label: string }[] = [
 
 /** Editable text form of the settings. */
 interface Draft {
-  repos: RepoSpec[]
   fetchIntervalMin: string
   maxAppsPerRequest: string
   dispatchTimeoutMin: string
@@ -55,7 +54,6 @@ function trimNumber(value: number): string {
 
 function toDraft(settings: EditableSettings): Draft {
   return {
-    repos: settings.repos.map(repo => ({ ...repo })),
     fetchIntervalMin: trimNumber(settings.fetchIntervalMs / MINUTE),
     maxAppsPerRequest: String(settings.maxAppsPerRequest),
     dispatchTimeoutMin: trimNumber(settings.dispatchTimeoutMs / MINUTE),
@@ -93,7 +91,6 @@ function fromDraft(draft: Draft): EditableSettings {
   const maxFiles = positive(draft.skillMaxFiles, '改进文件数上限')
   if (!Number.isInteger(maxFiles)) throw new Error('改进文件数上限必须是整数')
   return {
-    repos: draft.repos.map(repo => repo.branch === undefined || repo.branch.trim() === '' ? { url: repo.url.trim() } : { url: repo.url.trim(), branch: repo.branch.trim() }),
     fetchIntervalMs: Math.round(positive(draft.fetchIntervalMin, '更新间隔', true) * MINUTE),
     maxAppsPerRequest: maxApps,
     dispatchTimeoutMs: Math.round(positive(draft.dispatchTimeoutMin, '派发超时') * MINUTE),
@@ -136,8 +133,7 @@ function formatTime(iso: string | number | undefined): string {
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleString()
 }
 
-function phasePill(repo: RepoStatusWire | undefined): JSX.Element {
-  if (repo === undefined) return <span className="lz__pill"><span className="lz__dot" />保存后拉取</span>
+function phasePill(repo: RepoStatusWire): JSX.Element {
   if (repo.phase === 'syncing') return <span className="lz__pill lz__pill--warn"><span className="lz__dot" />拉取中</span>
   if (repo.available) return <span className="lz__pill lz__pill--ok"><span className="lz__dot" />就绪</span>
   if (repo.phase === 'ready' || repo.phase === 'failed') return <span className="lz__pill lz__pill--bad"><span className="lz__dot" />不可用</span>
@@ -249,7 +245,7 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
       setNotice({ kind: 'error', text: messageOf(error) })
       return
     }
-    void run(() => saveSettings(settings), '已保存，新的仓库会在后台拉取', true)
+    void run(() => saveSettings(settings), '已保存', true)
   }
 
   if (state === undefined || draft === undefined) {
@@ -280,7 +276,7 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
       </header>
       {state.overlayError === undefined ? null : <div className="lz__notice lz__notice--error">面板设置文件未生效：{state.overlayError}。保存一次会用当前内容覆盖它。</div>}
       <div className="lz__body" role="tabpanel">
-        {tab === 'repos' ? <ReposTab draft={draft} setDraft={setDraft} state={state} busy={busy || dirty} openRepoSettings={openRepoSettings} onSync={(url) => { void run(() => syncRepos(url), url === undefined ? '已开始重新拉取全部仓库' : '已开始重新拉取', false) }} /> : null}
+        {tab === 'repos' ? <ReposTab state={state} busy={busy} openRepoSettings={openRepoSettings} onSync={(url) => { void run(() => syncRepos(url), url === undefined ? '已开始重新拉取全部仓库' : '已开始重新拉取', false) }} /> : null}
         {tab === 'download' ? <DownloadTab draft={draft} setDraft={setDraft} overridden={state.overridden} /> : null}
         {tab === 'analyze'
           ? <AnalyzeTab
@@ -312,60 +308,42 @@ interface TabProps {
   setDraft: (next: Draft) => void
 }
 
-function ReposTab({ draft, setDraft, state, busy, openRepoSettings, onSync }: TabProps & LogalyzePageProps & { state: StateWire; busy: boolean; onSync: (url?: string) => void }): JSX.Element {
-  const [url, setUrl] = useState('')
-  const [branch, setBranch] = useState('')
-  const status = useMemo(() => new Map(state.repos.map(repo => [repo.url, repo])), [state.repos])
-  const add = (): void => {
-    const trimmed = url.trim()
-    if (trimmed === '' || draft.repos.some(repo => repo.url === trimmed)) return
-    setDraft({ ...draft, repos: [...draft.repos, branch.trim() === '' ? { url: trimmed } : { url: trimmed, branch: branch.trim() }] })
-    setUrl('')
-    setBranch('')
-  }
+function ReposTab({ state, busy, openRepoSettings, onSync }: LogalyzePageProps & { state: StateWire; busy: boolean; onSync: (url?: string) => void }): JSX.Element {
   return (
     <section className="lz__sec">
-      <h2 className="lz__secTitle">应用仓库 <Overridden keys={state.overridden} name="repos" /></h2>
+      <h2 className="lz__secTitle">应用仓库</h2>
       <div className="lz__list">
-        {draft.repos.length === 0 ? <div className="lz__emptyRow">还没有应用仓库。添加仓库的 https 地址后保存，观象会把仓库拉取到本机。</div> : null}
-        {draft.repos.map((repo, index) => {
-          const current = status.get(repo.url)
-          const saved = current !== undefined && current.branch === repo.branch
-          return (
-            <div key={repo.url} className="lz__row lz__row--top">
-              <div className="lz__rowText">
-                <div className="lz__rowLabel">
-                  <span className="lz__mono">{repo.url}</span>
-                  {repo.branch === undefined ? null : <span className="lz__tag">{repo.branch}</span>}
-                  {phasePill(saved ? current : undefined)}
-                </div>
-                {saved && current.app !== undefined
-                  ? <div className="lz__rowSummary">{current.app.name}（<span className="lz__mono">{current.app.id}</span>）· SKILL <span className="lz__mono">/{current.app.skill}</span>{current.activeRuns > 0 ? ` · ${current.activeRuns} 个分析进行中` : ''}</div>
-                  : null}
-                {saved && current.app !== undefined ? <div className="lz__rowSummary">{current.app.description}</div> : null}
-                {saved && current.commit !== undefined
-                  ? <div className="lz__rowSummary">提交 <span className="lz__mono">{current.commit.slice(0, 8)}</span>（{formatTime(current.commitTime)}）· 拉取于 {formatTime(current.syncedAt)}{current.dir === undefined ? null : <> · <span className="lz__mono">{current.dir}</span></>}</div>
-                  : null}
-                {saved && current.error !== undefined ? <div className="lz__rowError">{current.error}</div> : null}
+        {state.repos.length === 0 ? <div className="lz__emptyRow">还没有应用仓库。在 dsh-repo 的「代码仓库 → 仓库」中添加仓库并打开「日志分析」，或在对话中让观象添加。</div> : null}
+        {state.repos.map(repo => (
+          <div key={repo.url} className="lz__row lz__row--top">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">
+                <span className="lz__mono">{repo.url}</span>
+                {repo.branch === undefined ? null : <span className="lz__tag">{repo.branch}</span>}
+                {phasePill(repo)}
+                {repo.writable ? null : <span className="lz__pill" title="dsh-repo 中权限为只读：只分析，不起草接入、不改进 SKILL">只读</span>}
               </div>
-              <div className="lz__rowCtl">
-                {saved ? <button type="button" className="lz__btn" disabled={busy || current.phase === 'syncing'} onClick={() => { onSync(repo.url) }}>重新拉取</button> : null}
-                <button type="button" className="lz__btn lz__btn--danger" onClick={() => { setDraft({ ...draft, repos: draft.repos.filter((_, position) => position !== index) }) }}>删除</button>
-              </div>
+              {repo.app !== undefined
+                ? <div className="lz__rowSummary">{repo.app.name}（<span className="lz__mono">{repo.app.id}</span>）· SKILL <span className="lz__mono">/{repo.app.skill}</span>{repo.activeRuns > 0 ? ` · ${repo.activeRuns} 个分析进行中` : ''}</div>
+                : null}
+              {repo.app !== undefined ? <div className="lz__rowSummary">{repo.app.description}</div> : null}
+              {repo.commit !== undefined
+                ? <div className="lz__rowSummary">提交 <span className="lz__mono">{repo.commit.slice(0, 8)}</span> · 拉取于 {formatTime(repo.syncedAt)}</div>
+                : null}
+              {repo.error !== undefined ? <div className="lz__rowError">{repo.error}</div> : null}
             </div>
-          )
-        })}
-        <div className="lz__addRow">
-          <input className="lz__input" placeholder="仓库 https 地址，例如 https://github.com/example/order-service.git" value={url} onChange={(event) => { setUrl(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') add() }} />
-          <input className="lz__input lz__input--branch" placeholder="分支（可选）" value={branch} onChange={(event) => { setBranch(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') add() }} />
-          <button type="button" className="lz__btn" disabled={url.trim() === ''} onClick={add}>添加</button>
-        </div>
+            <div className="lz__rowCtl">
+              <button type="button" className="lz__btn" disabled={busy || repo.phase === 'syncing'} onClick={() => { onSync(repo.url) }}>重新拉取</button>
+            </div>
+          </div>
+        ))}
       </div>
-      {state.dshRepo.availability === 'ready' ? null : <div className="lz__notice lz__notice--error">{state.dshRepo.availability === 'missing' ? '没有加载 dsh-repo 插件，仓库无法拉取。请安装 dsh-repo。' : 'dsh-repo 版本与观象不兼容，仓库无法拉取。'}</div>}
-      <p className="lz__secFoot">由 dsh-repo 拉取到它的镜像目录{state.dshRepo.mirrorDir === undefined ? '' : `（${state.dshRepo.mirrorDir}）`}。只支持 https 地址（也可以是 file URL 或本机绝对路径），不支持 ssh 地址；主机或令牌变更后会自动重新拉取。不留分支时跟随远端默认分支。每个仓库需包含 <span className="lz__mono">.agents/logalyze.yaml</span> 与其中声明的日志分析 SKILL。删除地址不会删除本地镜像。</p>
+      {state.dshRepo.availability === 'ready' ? null : <div className="lz__notice lz__notice--error">{state.dshRepo.availability === 'missing' ? '没有加载 dsh-repo 插件，应用仓库来自它的仓库清单。请安装 dsh-repo。' : 'dsh-repo 版本与观象不兼容，无法读取仓库清单。'}</div>}
+      {state.dshRepo.availability === 'ready' && state.dshRepo.mirrorDir === undefined ? <div className="lz__notice lz__notice--error">{state.dshRepo.mirrorProblem ?? 'dsh-repo 的镜像目录未设置，仓库无法拉取。'}请到 dsh-repo 的设置页「高级」里设置镜像目录。</div> : null}
+      <p className="lz__secFoot">应用仓库是 dsh-repo 仓库清单中打开了「日志分析」功能的仓库，地址、分支和权限都在 dsh-repo 中修改，改动后观象自动拉取。由 dsh-repo 拉取到它的镜像目录{state.dshRepo.mirrorDir === undefined ? '' : `（${state.dshRepo.mirrorDir}）`}；主机或令牌变更后自动重新拉取。每个仓库需包含 <span className="lz__mono">.agents/logalyze.yaml</span> 与其中声明的日志分析 SKILL；起草接入和改进 SKILL 要推送分支，仓库权限需为「可改代码」。</p>
       <div className="lz__headRow">
         {state.repos.length > 0 ? <button type="button" className="lz__btn" disabled={busy} onClick={() => { onSync() }}>重新拉取全部</button> : null}
-        {openRepoSettings === undefined || state.dshRepo.availability === 'missing' ? null : <button type="button" className="lz__btn lz__btn--ghost" onClick={openRepoSettings}>管理主机与令牌</button>}
+        {openRepoSettings === undefined || state.dshRepo.availability === 'missing' ? null : <button type="button" className="lz__btn lz__btn--ghost" onClick={openRepoSettings}>{state.dshRepo.availability === 'ready' && state.dshRepo.mirrorDir === undefined ? '去设置镜像目录' : '在 dsh-repo 中管理仓库'}</button>}
       </div>
     </section>
   )
@@ -492,6 +470,7 @@ function AnalyzeTab({ draft, setDraft, analyze, credentialsAvailable, overridden
               <div className="lz__rowLabel">开启接口 <Overridden keys={overridden} name="analyze" /><span className={`lz__pill ${topics.pill}`}><span className="lz__dot" />{topics.text}</span></div>
               <div className="lz__rowSummary">日志平台调用接口后，观象经飞书渠道（dsh-channels）在目标群发出分析卡片，并在卡片下的话题里开始分析；群内成员都可以在话题里继续追问。关闭时接口回复 404。</div>
               {analyze.topics === 'ready' ? null : <div className="lz__rowError">{analyze.topics === 'missing' ? '接口需要加载 dsh-channels。' : '请把观象与 dsh-channels 升级到相互兼容的版本。'}</div>}
+              {analyze.reportsSupported || analyze.topics !== 'ready' ? null : <div className="lz__rowError">当前 dsh-channels 版本不提供话题状态查询，报告不会回传；请升级 dsh-channels。</div>}
             </div>
             <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="开启分析接口" checked={draft.analyzeEnabled} onChange={(event) => { setDraft({ ...draft, analyzeEnabled: event.target.checked }) }} /></div>
           </div>
@@ -521,7 +500,6 @@ function AnalyzeTab({ draft, setDraft, analyze, credentialsAvailable, overridden
             <div className="lz__rowText">
               <div className="lz__rowLabel">回传命令 <Overridden keys={overridden} name="analyze" /></div>
               <div className="lz__rowSummary">请求带 <span className="lz__mono">logId</span> 时，分析话题每一轮结束后，观象更新话题工作目录下的 <span className="lz__mono">report/</span>（入口 <span className="lz__mono">report.md</span> 记录首轮结论和每轮追问），再执行这条命令上传整个目录。每行一个参数，不经过 shell；可用占位符 <span className="lz__mono">{'{logId}'}</span>、<span className="lz__mono">{'{dir}'}</span>（报告目录绝对路径）、<span className="lz__mono">{'{entry}'}</span>（report.md）。</div>
-              {analyze.reportsSupported || analyze.topics !== 'ready' ? null : <div className="lz__rowError">当前 dsh-channels 版本不提供话题状态查询，报告不会回传；请升级 dsh-channels。</div>}
               <textarea className="lz__input lz__mono lz__textarea" rows={Math.max(3, draft.uploadCommand.split('\n').length)} spellCheck={false} aria-label="回传命令" value={draft.uploadCommand} onChange={(event) => { setDraft({ ...draft, uploadCommand: event.target.value }) }} />
             </div>
           </div>

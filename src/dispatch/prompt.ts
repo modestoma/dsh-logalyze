@@ -5,18 +5,10 @@
  * @module dsh-logalyze/dispatch/prompt
  */
 
+import { skillDir } from '../apps/manifest.ts'
+import { GAP_FILE } from '../improve/gap.ts'
+import type { ChildLog } from '../runs/logs.ts'
 import type { AppManifest } from '../settings/contract.ts'
-import { skillDir } from '../repos/manifest.ts'
-import { GAP_FILE } from '../skill-update/gap.ts'
-
-/** One log handed to a child, always as an absolute local path. */
-export interface ChildLog {
-  readonly path: string
-  /** Original download URL when the dispatch tool fetched the file. */
-  readonly url?: string
-  /** How to pick this application's lines out of a mixed log. */
-  readonly filter?: string
-}
 
 /** Inputs of one child prompt. */
 export interface ChildPromptInput {

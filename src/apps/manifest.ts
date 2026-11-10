@@ -2,11 +2,9 @@
  * 应用仓库内 `.agents/logalyze.yaml` 应用描述的解析与校验，以及对应日志分析
  * SKILL 的存在性检查。
  *
- * @module dsh-logalyze/repos/manifest
+ * @module dsh-logalyze/apps/manifest
  */
 
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
 import { parse as parseYaml } from 'yaml'
 import { z } from 'zod'
 import { describeIssue } from '../config.ts'
@@ -135,20 +133,4 @@ export async function checkAppManifest(read: RepoFileReader): Promise<ManifestRe
   if (skillText === undefined) return { ok: false, error: `仓库缺少日志分析 SKILL ${skill}` }
   if (disablesUserInvocation(skillText)) return { ok: false, error: `${skill} 设置了 user-invocable: false，派发时无法用 /${manifest.app.skill} 加载` }
   return manifest
-}
-
-/**
- * Read and check one checkout on disk.
- * @param dir - repository root.
- * @returns the application description or the reason it is unusable.
- */
-export async function readAppManifest(dir: string): Promise<ManifestRead> {
-  return await checkAppManifest(async (path) => {
-    try {
-      return await readFile(join(dir, path), 'utf8')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
-      throw error
-    }
-  })
 }

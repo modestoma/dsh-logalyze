@@ -1,14 +1,14 @@
 /**
- * The part of dsh-channels' `feishuTopics` service (contract version 1) this
- * plugin uses, declared here so the plugin does not depend on the dsh-channels
- * package. dsh-channels provides the service under `feishuTopics` and emits
+ * The part of the Feishu channel plugin's `feishuTopics` service (contract version 2) this
+ * plugin uses, declared here so the plugin does not depend on that plugin's
+ * package. The plugin provides the service under `feishuTopics` and emits
  * {@link FEISHU_TOPICS_STATUS_EVENT}; both are looked up at run time.
  *
- * @module dsh-logalyze/analyze/feishu-topics
+ * @module dsh-logalyze/deps/topics-contract
  */
 
-/** The contract version this plugin speaks. */
-export type FeishuTopicsVersion = 1
+/** The contract version this plugin speaks. Version 2 dropped the `workspace` parameter: the channel derives the topic directory from the group and the topic. */
+export type FeishuTopicsVersion = 2
 
 /** One run of the root card's lead sentence. */
 export interface TopicCardText {
@@ -47,14 +47,9 @@ export interface TopicLaunchSpec {
   readonly fingerprint: string
   /** Target group chat (`oc_…`). */
   readonly chatId: string
-  /** Feishu `user_id` @-mentioned on the root card and recorded as the requester. */
+  /** Feishu `user_id` @-mentioned on the root card; the first turn is submitted as this user, so they need chat access in the channel. */
   readonly requesterUserId: string
   readonly card: TopicRootCard
-  /** Workspace directory segments below the channel's `baseDir`, and the workspace title. */
-  readonly workspace: {
-    readonly segments: readonly string[]
-    readonly title: string
-  }
   /** First user message of the Session, sent verbatim. */
   readonly prompt: string
 }
@@ -93,16 +88,17 @@ export interface TopicLaunchState {
   readonly reason?: string
   /** Session the topic's route currently names. */
   readonly sessionId?: string
-  /** Directory the topic's tools work in; present exactly when {@link sessionId} is. */
+  /** The topic's directory (its DSH workspace); present exactly when {@link sessionId} is. */
   readonly workDir?: string
 }
 
-/** Name of the event dsh-channels emits after a launch status is recorded; listeners receive the {@link TopicLaunchState}. */
+/** Name of the event the Feishu channel plugin emits after a launch status is recorded; listeners receive the {@link TopicLaunchState}. */
 export const FEISHU_TOPICS_STATUS_EVENT = 'feishu-topics/status'
 
 /**
- * The `feishuTopics` service. `state` and `launchKeyOf` exist on providers
- * released with them; this plugin checks for them before calling.
+ * The `feishuTopics` service. {@link FeishuTopicService.state} and
+ * {@link FeishuTopicService.launchKeyOf} were added without a version change,
+ * so older version-2 providers lack them; report tracking needs both.
  */
 export interface FeishuTopicService {
   readonly version: FeishuTopicsVersion

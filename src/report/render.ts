@@ -166,7 +166,7 @@ export const MAX_QUESTION_CHARS = 4000
 
 /**
  * Readable question of a follow-up turn: the user messages' text without the
- * `<feishu_…>` context blocks dsh-channels adds.
+ * `<feishu_…>` context blocks the Feishu channel plugin adds.
  * @param texts - text of the turn's user messages.
  * @returns the question, cut to {@link MAX_QUESTION_CHARS}.
  */

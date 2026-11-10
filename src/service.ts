@@ -1,48 +1,42 @@
 /**
- * 观象运行时：持有生效设置（cordis.yml + 面板覆盖）、应用注册表、入口
- * SKILL、派发工具、SKILL 查看与改进工具、仓库接入工具的注册和分析报告回传，并为设置面板提供状态与写入口。
+ * 观象运行时的组装：生效设置、应用注册表与仓库清单跟随、入口 SKILL、六个
+ * 工具的注册条件、分析接口令牌和分析报告回传，并为设置面板提供状态与写入口。
  *
  * @module dsh-logalyze/service
  */
 
-import type { DshRepos } from './repos/contract.ts'
-import { z } from 'zod'
-import { applyOverlay, defaultsOf, describeIssue, editableSettingsSchema } from './config.ts'
-import type { LogalyzeConfig, SettingsOverlay } from './config.ts'
-import { abortable } from './abort.ts'
-import type { AnalyzeRequest } from './analyze/contract.ts'
-import { FEISHU_TOPICS_STATUS_EVENT } from './analyze/feishu-topics.ts'
+import { AnalyzeToken } from './analyze/token.ts'
 import type { AnalyzeGate } from './analyze/server.ts'
-import { FEISHU_TOPICS_SERVICE, lookupTopics } from './analyze/topics.ts'
+import type { AnalyzeRequest } from './analyze/contract.ts'
+import { CatalogFollower } from './apps/catalog.ts'
+import { RepoRegistry } from './apps/registry.ts'
+import type { LogalyzeConfig } from './config.ts'
+import { describeIssue } from './config.ts'
+import { DSH_REPOS_SERVICE, LOG_ANALYSIS_FEATURE, ReposClient } from './deps/repos.ts'
+import type { DshRepos } from './deps/repos-contract.ts'
+import { FEISHU_TOPICS_STATUS_EVENT } from './deps/topics-contract.ts'
+import { FEISHU_TOPICS_SERVICE, lookupTopics, topicStatesOf } from './deps/topics.ts'
+import type { TopicStates } from './deps/topics.ts'
+import { Dispatcher } from './dispatch/tool.ts'
+import type { HostContext, HostCredentials, ToolActivationContext, ToolDefinition, WorkingDirectoryService } from './host.ts'
+import { SkillViewer } from './improve/show.ts'
+import { SkillImprover } from './improve/tool.ts'
+import { RepoAdder } from './onboard/add.ts'
+import { RepoInitializer } from './onboard/init.ts'
 import type { CommandRunner } from './report/command.ts'
 import { defaultReportsDir, ReportStore } from './report/store.ts'
 import { ReportTracker } from './report/tracker.ts'
-import type { ReportTopics } from './report/tracker.ts'
-import { Dispatcher, inRunDirectory, isDelegatedAgent, isInside } from './dispatch/tool.ts'
-import type { HostApproval, HostContext, HostCredentials, ToolActivationContext, WorkingDirectoryService } from './host.ts'
-import { DSH_REPOS_SERVICE, lookupRepos, messageOf } from './repos/lookup.ts'
-import { RepoRegistry } from './repos/registry.ts'
+import { inRunDirectory, isDelegatedAgent, isInside } from './runs/run-dir.ts'
 import { ANALYZE_ROUTE } from './settings/contract.ts'
-import type { AnalyzeWire, EditableSettings, RepoSpec, ReposWire, StateWire, TokenStatusWire } from './settings/contract.ts'
-import { diffOverlay, overriddenKeys } from './settings/overlay.ts'
+import type { StateWire } from './settings/contract.ts'
+import { SettingsController, SettingsError } from './settings/controller.ts'
 import type { OverlayStore } from './settings/overlay.ts'
-import { createEntrySkillProvider } from './skill/entry.ts'
 import type { BundledSkill } from './skill/bundled.ts'
-import { SkillViewer } from './skill-update/show.ts'
-import { SkillImprover } from './skill-update/tool.ts'
-import { RepoAdder } from './onboard/add.ts'
-import { RepoInitializer } from './onboard/init.ts'
+import { createEntrySkillProvider } from './skill/entry.ts'
+import { abortable } from './util/abort.ts'
+import { messageOf } from './util/errors.ts'
+import { z } from 'zod'
 
-/** A settings write the panel reports as a field error. */
-export class SettingsError extends Error {}
-
-/** Longest accepted token; personal access tokens are far shorter. */
-const MAX_TOKEN_LENGTH = 4096
-
-const tokenValue = z.string().trim()
-  .refine(value => value.length > 0 && value.length <= MAX_TOKEN_LENGTH && !/[\u0000-\u001f\u007f]/.test(value), `令牌不能为空、超过 ${MAX_TOKEN_LENGTH} 个字符或包含换行等控制字符`)
-const tokenClearSchema = z.object({ tokenEnv: z.string() }).strict()
-const tokenSetSchema = tokenClearSchema.extend({ value: tokenValue }).strict()
 const reportRetrySchema = z.object({ id: z.string().regex(/^[0-9a-f]{24}$/u, '报告 id 不合法') }).strict()
 
 /** Optional seams for tests. */
@@ -63,10 +57,10 @@ export interface ServiceAssets {
 /** The plugin's long-lived state. */
 export class LogalyzeService {
   readonly registry: RepoRegistry
-  private readonly defaults: EditableSettings
-  private overlay: SettingsOverlay = {}
-  private overlayError: string | undefined
-  private current: EditableSettings
+  private readonly settings: SettingsController
+  private readonly repos: ReposClient
+  private readonly catalog: CatalogFollower
+  private readonly token: AnalyzeToken
   private readonly dispatcher: Dispatcher
   private readonly improver: SkillImprover
   private readonly viewer: SkillViewer
@@ -76,9 +70,7 @@ export class LogalyzeService {
   private readonly reports: ReportTracker
   private active = true
   private readonly refreshWaitMs: number
-  private readonly analyzeTokenRef: string
   private readonly booted = Promise.withResolvers<void>()
-  private additions: Promise<void> = Promise.resolve()
 
   /**
    * @param ctx - plugin context.
@@ -90,72 +82,49 @@ export class LogalyzeService {
   constructor(
     private readonly ctx: HostContext,
     config: LogalyzeConfig,
-    private readonly store: OverlayStore,
+    store: OverlayStore,
     assets: ServiceAssets,
     options: ServiceOptions = {},
   ) {
-    this.defaults = defaultsOf(config)
+    const warn = (message: string): void => { ctx.logger?.warn?.(message) }
+    const settings = (): ReturnType<SettingsController['get']> => this.settings.get()
+    const workingDirectory = (): WorkingDirectoryService | undefined => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined
+    const fetchSeam = options.fetch === undefined ? {} : { fetch: options.fetch }
+    this.settings = new SettingsController(config, store, warn)
     this.refreshWaitMs = config.refreshWaitMs
-    this.analyzeTokenRef = config.analyzeTokenRef
-    this.current = this.defaults
-    this.registry = new RepoRegistry({
-      repos: () => ctx.get?.(DSH_REPOS_SERVICE),
-      onChange: () => { this.onRegistryChange() },
-    })
-    this.improver = new SkillImprover({
+    this.repos = new ReposClient(() => ctx.get?.(DSH_REPOS_SERVICE))
+    this.token = new AnalyzeToken(config.analyzeTokenRef, () => ctx.get?.('credentials') as HostCredentials | undefined, warn)
+    this.registry = new RepoRegistry({ repos: this.repos, onChange: () => { this.onRegistryChange() } })
+    this.catalog = new CatalogFollower({
       registry: this.registry,
-      subagents: ctx.subagents,
-      provider: config.subagentProvider,
-      settings: () => this.current,
-      workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
-      ...config.skillUpdateAuthor === undefined ? {} : { author: config.skillUpdateAuthor },
-      repos: () => ctx.get?.(DSH_REPOS_SERVICE),
-      ...options.fetch === undefined ? {} : { fetch: options.fetch },
+      repos: this.repos,
+      active: () => this.active,
+      error: (message) => { ctx.logger?.error?.(message) },
     })
-    this.viewer = new SkillViewer({ registry: this.registry, repos: () => ctx.get?.(DSH_REPOS_SERVICE) })
-    this.dispatcher = new Dispatcher({
-      registry: this.registry,
-      gaps: this.improver,
-      subagents: ctx.subagents,
-      settings: () => this.current,
-      provider: config.subagentProvider,
-      workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
-      ...options.fetch === undefined ? {} : { fetch: options.fetch },
-    })
-    this.adder = new RepoAdder({
-      registry: this.registry,
-      approval: () => ctx.get?.('approval') as HostApproval | undefined,
-      addRepo: spec => this.addRepo(spec),
-    })
-    this.initializer = new RepoInitializer({
-      registry: this.registry,
-      subagents: ctx.subagents,
-      provider: config.subagentProvider,
-      settings: () => this.current,
-      workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
-      approval: () => ctx.get?.('approval') as HostApproval | undefined,
-      repos: () => ctx.get?.(DSH_REPOS_SERVICE),
-      ...config.skillUpdateAuthor === undefined ? {} : { author: config.skillUpdateAuthor },
-      ...options.fetch === undefined ? {} : { fetch: options.fetch },
-    })
+    const children = { registry: this.registry, subagents: ctx.subagents, provider: config.subagentProvider, settings, workingDirectory, ...fetchSeam }
+    this.improver = new SkillImprover({ ...children, repos: this.repos })
+    this.viewer = new SkillViewer({ registry: this.registry, repos: this.repos })
+    this.dispatcher = new Dispatcher({ ...children, gaps: this.improver })
+    this.adder = new RepoAdder({ registry: this.registry, addRepo: (spec, caller) => this.catalog.add(spec, caller) })
+    this.initializer = new RepoInitializer({ ...children, repos: this.repos })
     this.reports = new ReportTracker({
-      store: new ReportStore(options.reportsDir ?? defaultReportsDir(), message => ctx.logger?.warn?.(message)),
+      store: new ReportStore(options.reportsDir ?? defaultReportsDir(), warn),
       topics: () => this.reportTopics(),
-      upload: () => this.current.analyze.upload,
-      warn: message => ctx.logger?.warn?.(message),
+      upload: () => this.settings.get().analyze.upload,
+      warn,
       ...options.runCommand === undefined ? {} : { run: options.runCommand },
     })
     this.skill = createEntrySkillProvider({
       prepare: signal => this.prepareCatalog(signal),
       apps: () => this.registry.readyApps().map(ready => ready.app),
-      maxAppsPerRequest: () => this.current.maxAppsPerRequest,
-      skillUpdates: () => this.current.skillUpdates.enabled,
+      maxAppsPerRequest: () => this.settings.get().maxAppsPerRequest,
+      skillUpdates: () => this.settings.get().skillUpdates.enabled,
       autoInvoke: config.autoInvoke,
       bundled: assets.bundled,
       inRepositories: (cwd) => {
         if (inRunDirectory(cwd)) return true
-        const lookup = lookupRepos(ctx.get?.(DSH_REPOS_SERVICE))
-        return lookup.availability === 'ready' && isInside(cwd, lookup.service.mirrorSettings().dir)
+        const mirrors = this.repos.mirrorDir()
+        return mirrors !== undefined && isInside(cwd, mirrors)
       },
     })
   }
@@ -166,41 +135,27 @@ export class LogalyzeService {
   }
 
   /**
-   * Register the dispatch, SKILL improvement and view, and repository onboarding tools;
-   * called once from `apply()`. The definitions stay fixed because a step
-   * drops a tool whose registration changed after the step resolved its tools.
-   * The improvement tool counts finished turns from `turn/end` Session events.
+   * Register the six tools and the Session listeners they need; called once
+   * from `apply()`. The definitions stay fixed because a step drops a tool
+   * whose registration changed after the step resolved its tools. The
+   * improvement tool counts finished turns from `turn/end` Session events.
    */
-  registerTool(): void {
+  registerTools(): void {
     this.ctx.on('session/event', (session, event) => {
       if (event.type === 'turn/end') this.improver.turnEnded(session.header.id)
       this.reports.sessionEvent(session, event)
     })
     this.ctx.on(FEISHU_TOPICS_STATUS_EVENT, (state) => { this.reports.statusChanged(state) })
-    this.ctx.effect(
-      () => this.ctx.tools.register(this.dispatcher.definition(), { when: context => this.offersTool(context) }),
-      'logalyze: dispatch tool',
-    )
-    this.ctx.effect(
-      () => this.ctx.tools.register(this.improver.definition(), { when: async context => this.current.skillUpdates.enabled && await this.offersTool(context) }),
-      'logalyze: skill improvement tool',
-    )
-    this.ctx.effect(
-      () => this.ctx.tools.register(this.viewer.definition(), { when: context => this.offersTool(context) }),
-      'logalyze: skill view tool',
-    )
-    this.ctx.effect(
-      () => this.ctx.tools.register(this.adder.definition(), { when: context => this.offersTopLevel(context, () => true) }),
-      'logalyze: add repository tool',
-    )
-    this.ctx.effect(
-      () => this.ctx.tools.register(this.initializer.initDefinition(), { when: context => this.offersTopLevel(context, () => this.registry.setupPending().length > 0) }),
-      'logalyze: draft repository setup tool',
-    )
-    this.ctx.effect(
-      () => this.ctx.tools.register(this.initializer.submitDefinition(), { when: context => this.offersTopLevel(context, () => this.initializer.hasDraft(context.agent.session.header.id)) }),
-      'logalyze: submit repository setup tool',
-    )
+    const hasApps = (): boolean => this.registry.readyApps().length > 0
+    const register = <V>(definition: ToolDefinition<V>, condition: (context: ToolActivationContext) => boolean, label: string): void => {
+      this.ctx.effect(() => this.ctx.tools.register(definition, { when: context => this.offers(context, condition) }), `logalyze: ${label} tool`)
+    }
+    register(this.dispatcher.definition(), hasApps, 'dispatch')
+    register(this.improver.definition(), () => this.settings.get().skillUpdates.enabled && this.registry.readyApps().some(ready => ready.writable), 'skill improvement')
+    register(this.viewer.definition(), hasApps, 'skill view')
+    register(this.adder.definition(), () => true, 'add repository')
+    register(this.initializer.initDefinition(), () => this.registry.setupPending().length > 0, 'draft repository setup')
+    register(this.initializer.submitDefinition(), context => this.initializer.hasDraft(context.agent.session.header.id), 'submit repository setup')
   }
 
   /**
@@ -210,20 +165,10 @@ export class LogalyzeService {
    * @param condition - the tool's condition, read after the first sync.
    * @returns whether the step may call the tool.
    */
-  private async offersTopLevel({ agent, signal }: ToolActivationContext, condition: () => boolean): Promise<boolean> {
-    if (isDelegatedAgent(agent)) return false
-    await abortable(this.booted.promise, signal)
-    return this.active && condition()
-  }
-
-  /**
-   * Offer the dispatch and SKILL tools to top-level agents once the first
-   * sync settled and at least one application is usable.
-   * @param context - the preparing step.
-   * @returns whether the step may call the tool.
-   */
-  private async offersTool(context: ToolActivationContext): Promise<boolean> {
-    return await this.offersTopLevel(context, () => this.registry.readyApps().length > 0)
+  private async offers(context: ToolActivationContext, condition: (context: ToolActivationContext) => boolean): Promise<boolean> {
+    if (isDelegatedAgent(context.agent)) return false
+    await abortable(this.booted.promise, context.signal)
+    return this.active && condition(context)
   }
 
   /**
@@ -238,7 +183,7 @@ export class LogalyzeService {
     if (!this.active) return
     const limit = AbortSignal.timeout(this.refreshWaitMs)
     try {
-      await abortable(this.registry.refresh(this.current.fetchIntervalMs), signal === undefined ? limit : AbortSignal.any([signal, limit]))
+      await abortable(this.registry.refresh(this.settings.get().fetchIntervalMs), signal === undefined ? limit : AbortSignal.any([signal, limit]))
     } catch (error) {
       if (signal?.aborted === true || !limit.aborted) throw error
       // The wait limit passed: render the catalog synced so far.
@@ -246,57 +191,39 @@ export class LogalyzeService {
   }
 
   /**
-   * Load the panel overlay, configure the registry, and sync every repository.
+   * Load the panel overlay and the report records, take the application
+   * repositories from the dsh-repo catalog, and sync every repository.
    * @returns when the first sync round settled.
    */
   async boot(): Promise<void> {
     try {
-      await this.bootOnce()
+      await this.settings.load()
+      await this.reports.boot().catch((error: unknown) => {
+        this.ctx.logger?.error?.('logalyze: 读取回传记录失败：%s', messageOf(error))
+      })
+      await this.catalog.load()
     } finally {
       this.booted.resolve()
     }
   }
 
-  private async bootOnce(): Promise<void> {
-    const read = await this.store.read()
-    if (read.ok) {
-      this.overlay = read.overlay
-    } else {
-      this.overlayError = read.error
-      this.ctx.logger?.warn?.('logalyze: 忽略面板设置：%s', read.error)
-    }
-    this.current = applyOverlay(this.defaults, this.overlay)
-    await this.reports.boot().catch((error: unknown) => {
-      this.ctx.logger?.error?.('logalyze: 读取回传记录失败：%s', messageOf(error))
-    })
-    this.registry.configure(this.current.repos)
-    await this.registry.syncAll()
-  }
-
   /**
-   * React to dsh-repo becoming available (or reloading): sync every
-   * repository again.
+   * React to dsh-repo becoming available after boot or reloading.
    * @returns when the syncs settled.
    */
   async reposAvailable(): Promise<void> {
     await this.booted.promise
     if (!this.active) return
-    await this.registry.resyncAll()
+    await this.catalog.serviceAppeared()
   }
 
   /**
-   * Re-sync every repository after each host or token change in dsh-repo, so a
-   * new token reaches the mirrors without a manual sync.
+   * Register the log analysis feature with dsh-repo and follow its catalog and host changes.
    * @param repos - the `dshRepos` service.
-   * @returns disposer that stops watching.
+   * @returns disposer that withdraws the feature and stops watching.
    */
-  watchHosts(repos: DshRepos): () => void {
-    return repos.onHostsChange(() => {
-      if (!this.active) return
-      void this.registry.resyncAll().catch((error: unknown) => {
-        this.ctx.logger?.error?.('logalyze: 主机变更后同步仓库失败：%s', messageOf(error))
-      })
-    })
+  watchRepos(repos: DshRepos): () => void {
+    return this.catalog.watch(repos)
   }
 
   /** Stop registering tools and retrying uploads; in-flight syncs and uploads finish without side effects on the host. */
@@ -340,139 +267,70 @@ export class LogalyzeService {
     return await this.state()
   }
 
-  /** The launch-state methods of the loaded `feishuTopics`, when it has them. */
-  private reportTopics(): ReportTopics | undefined {
-    const lookup = lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE))
-    if (lookup.availability !== 'ready') return undefined
-    const { service } = lookup
-    if (typeof service.state !== 'function' || typeof service.launchKeyOf !== 'function') return undefined
-    return { state: key => service.state?.(key), launchKeyOf: sessionId => service.launchKeyOf?.(sessionId) }
-  }
-
-  /** @returns current effective settings. */
-  settings(): EditableSettings {
-    return this.current
+  /** The launch-state methods of the loaded `feishuTopics`. */
+  private reportTopics(): TopicStates | undefined {
+    return topicStatesOf(lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE)))
   }
 
   /** @returns the panel state. */
   async state(): Promise<StateWire> {
+    const token = await this.token.status()
     return {
-      settings: this.current,
-      defaults: this.defaults,
-      overridden: overriddenKeys(this.overlay),
-      ...this.overlayError === undefined ? {} : { overlayError: this.overlayError },
+      ...this.settings.panel(),
       repos: this.registry.status(),
-      dshRepo: this.reposState(),
-      credentialsAvailable: this.credentialStore() !== undefined,
-      analyze: await this.analyzeState(),
+      dshRepo: this.repos.panelState(),
+      credentialsAvailable: this.token.available(),
+      analyze: {
+        route: ANALYZE_ROUTE,
+        tokenEnv: this.token.ref,
+        ...token === undefined ? {} : { token },
+        topics: lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE)).availability,
+        reportsSupported: this.reportTopics() !== undefined,
+        reports: this.reports.list(),
+      },
     }
   }
 
   /** @returns the analyze route's switch and bearer token, read per request. */
   analyzeGate(): AnalyzeGate {
     return {
-      enabled: () => this.current.analyze.enabled,
-      tokenEnv: () => this.analyzeTokenRef,
-      token: async () => {
-        try {
-          return (await this.credentialStore()?.resolve(this.analyzeTokenRef))?.value
-        } catch (error) {
-          this.ctx.logger?.warn?.('logalyze: 读取分析接口令牌 %s 失败：%s', this.analyzeTokenRef, error instanceof Error ? error.message : String(error))
-          return undefined
-        }
-      },
+      enabled: () => this.settings.get().analyze.enabled,
+      tokenEnv: () => this.token.ref,
+      token: () => this.token.value(),
     }
-  }
-
-  private async analyzeState(): Promise<AnalyzeWire> {
-    const store = this.credentialStore()
-    return {
-      route: ANALYZE_ROUTE,
-      tokenEnv: this.analyzeTokenRef,
-      ...store === undefined ? {} : { token: await describeToken(store, this.analyzeTokenRef) },
-      topics: lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE)).availability,
-      reportsSupported: this.reportTopics() !== undefined,
-      reports: this.reports.list(),
-    }
-  }
-
-  private credentialStore(): HostCredentials | undefined {
-    return this.ctx.get?.('credentials') as HostCredentials | undefined
-  }
-
-  private reposState(): ReposWire {
-    const lookup = lookupRepos(this.ctx.get?.(DSH_REPOS_SERVICE))
-    if (lookup.availability !== 'ready') return { availability: lookup.availability }
-    return { availability: 'ready', mirrorDir: lookup.service.mirrorSettings().dir }
   }
 
   /**
-   * Store the analyze API's bearer token (`analyzeTokenRef`) in DSH's
-   * credential store; it applies from the next request.
+   * Store the analyze API's bearer token in DSH's credential store.
    * @param raw - request body `{ tokenEnv, value }`.
    * @returns the new panel state.
    * @throws SettingsError when the body is invalid, the name is not `analyzeTokenRef`, or no credential store is loaded.
    */
   async setToken(raw: unknown): Promise<StateWire> {
-    const parsed = tokenSetSchema.safeParse(raw)
-    if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
-    return await this.writeToken(parsed.data.tokenEnv, parsed.data.value)
+    await this.token.set(raw)
+    return await this.state()
   }
 
   /**
-   * Remove the stored analyze token; an environment variable of the same name
-   * applies again afterwards.
+   * Remove the stored analyze token.
    * @param raw - request body `{ tokenEnv }`.
    * @returns the new panel state.
    * @throws SettingsError on the same conditions as {@link setToken}.
    */
   async clearToken(raw: unknown): Promise<StateWire> {
-    const parsed = tokenClearSchema.safeParse(raw)
-    if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
-    return await this.writeToken(parsed.data.tokenEnv, undefined)
-  }
-
-  private async writeToken(tokenEnv: string, value: string | undefined): Promise<StateWire> {
-    if (tokenEnv !== this.analyzeTokenRef) throw new SettingsError(`${tokenEnv} 不是分析接口令牌的名称`)
-    const store = this.credentialStore()
-    if (store === undefined) throw new SettingsError('当前 DSH 组合没有凭据服务（@deepseek-ai/dsh-credentials-local），无法保存令牌')
-    if (value === undefined) await store.unset(tokenEnv)
-    else await store.set(tokenEnv, value)
+    await this.token.clear(raw)
     return await this.state()
   }
 
   /**
-   * Validate and persist a complete settings payload from the panel, then
-   * sync repositories whose address or branch changed.
+   * Validate and persist a complete settings payload from the panel.
    * @param raw - request body.
    * @returns the new panel state.
    * @throws SettingsError when the payload is invalid.
    */
   async save(raw: unknown): Promise<StateWire> {
-    const parsed = editableSettingsSchema.safeParse(raw)
-    if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
-    const overlay = diffOverlay(this.defaults, applyOverlay(this.defaults, parsed.data))
-    await this.store.write(overlay)
-    this.apply(overlay)
+    await this.settings.save(raw)
     return await this.state()
-  }
-
-  /**
-   * Append one repository to the panel settings, as a panel save would, and
-   * start syncing it. Concurrent additions are applied in call order.
-   * @param spec - validated repository.
-   * @returns `exists` without writing when the address is already configured.
-   * @throws SettingsError when the resulting settings are invalid.
-   */
-  async addRepo(spec: RepoSpec): Promise<'added' | 'exists'> {
-    // Additions run one at a time so each one reads the settings the previous one saved.
-    const added = this.additions.then(async () => {
-      if (this.registry.has(spec.url)) return 'exists' as const
-      await this.save({ ...this.current, repos: [...this.current.repos, spec] })
-      return 'added' as const
-    })
-    this.additions = added.then(() => undefined, () => undefined)
-    return await added
   }
 
   /**
@@ -480,40 +338,22 @@ export class LogalyzeService {
    * @returns the new panel state.
    */
   async reset(): Promise<StateWire> {
-    await this.store.write({})
-    this.apply({})
+    await this.settings.reset()
     return await this.state()
   }
 
   /**
-   * Re-sync one configured repository, or all of them.
+   * Sync one application repository again, or all of them, in the background.
    * @param url - address to sync; omitted syncs every repository.
-   * @throws SettingsError when the address is not configured.
+   * @throws SettingsError when the address is not an application repository.
    */
   sync(url?: string): void {
-    if (url !== undefined && !this.registry.has(url)) throw new SettingsError(`未配置的仓库：${url}`)
+    if (url !== undefined && !this.registry.has(url)) throw new SettingsError(`仓库清单中没有打开「${LOG_ANALYSIS_FEATURE.title}」的仓库：${url}`)
     void (url === undefined ? this.registry.syncAll() : this.registry.syncUrls([url]))
-  }
-
-  /** Make an overlay effective and sync the repositories whose address or branch changed. */
-  private apply(overlay: SettingsOverlay): void {
-    this.overlay = overlay
-    this.overlayError = undefined
-    this.current = applyOverlay(this.defaults, overlay)
-    void this.registry.syncUrls(this.registry.configure(this.current.repos))
   }
 
   private onRegistryChange(): void {
     if (!this.active) return
     this.skill.invalidate()
-  }
-}
-
-async function describeToken(store: HostCredentials, tokenEnv: string): Promise<TokenStatusWire> {
-  try {
-    const info = await store.describe(tokenEnv)
-    return { tokenEnv, configured: info.configured, ...info.source === undefined ? {} : { source: info.source }, writable: info.writable }
-  } catch (error) {
-    return { tokenEnv, configured: false, writable: false, error: error instanceof Error ? error.message : String(error) }
   }
 }

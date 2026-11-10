@@ -8,30 +8,15 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
-import { SettingsError } from '../service.ts'
 import type { LogalyzeService } from '../service.ts'
+import { HttpError, mediaTypeOf, readBody, sendJson } from '../util/http.ts'
+import { SettingsError } from './controller.ts'
 import { REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_ROUTE, TOKEN_ROUTE } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
 /** Request body cap: the settings payload is small. */
 const MAX_BODY_BYTES = 256 * 1024
-
-class HttpError extends Error {
-  constructor(readonly status: number, message: string) {
-    super(message)
-  }
-}
-
-function sendJson(res: ServerResponse, status: number, payload: unknown): void {
-  const body = JSON.stringify(payload)
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-    'content-length': Buffer.byteLength(body),
-  })
-  res.end(body)
-}
 
 /**
  * Mutating requests must come from the same origin. A missing Origin (curl and
@@ -53,22 +38,14 @@ export function isSameOriginRequest(req: IncomingMessage): boolean {
 }
 
 async function readJsonBody(req: IncomingMessage, optional: boolean): Promise<unknown> {
-  const chunks: Buffer[] = []
-  let size = 0
-  for await (const chunk of req) {
-    const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : chunk as Buffer
-    size += buffer.length
-    if (size > MAX_BODY_BYTES) throw new HttpError(413, '请求体过大')
-    chunks.push(buffer)
-  }
-  if (size === 0) {
+  const text = await readBody(req, MAX_BODY_BYTES)
+  if (text === '') {
     if (optional) return undefined
     throw new HttpError(400, '请求体为空')
   }
-  const contentType = (req.headers['content-type'] ?? '').split(';')[0]?.trim().toLowerCase()
-  if (contentType !== 'application/json') throw new HttpError(415, '请求体必须是 application/json')
+  if (mediaTypeOf(req) !== 'application/json') throw new HttpError(415, '请求体必须是 application/json')
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    return JSON.parse(text)
   } catch {
     // The parse error position is not useful to the panel.
     throw new HttpError(400, '请求体不是合法 JSON')

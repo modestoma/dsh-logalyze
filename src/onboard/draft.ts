@@ -12,13 +12,15 @@
  */
 
 import { join } from 'node:path'
-import type { DshRepos, WorkspaceChanges } from '../repos/contract.ts'
-import { checkAppManifest, skillNameOf, skillPath } from '../repos/manifest.ts'
-import type { RepoFileReader } from '../repos/manifest.ts'
+import { checkAppManifest, skillNameOf, skillPath } from '../apps/manifest.ts'
+import type { RepoFileReader } from '../apps/manifest.ts'
+import { treeReader } from '../apps/tree.ts'
+import type { ReposClient } from '../deps/repos.ts'
+import type { WorkspaceStatus } from '../deps/repos-contract.ts'
+import { checkChanges, readReason, WORKSPACE_DIR } from '../runs/changes.ts'
+import type { CheckedChanges } from '../runs/changes.ts'
 import type { AppManifest, SkillUpdateSettings } from '../settings/contract.ts'
-import { ProposalError } from '../skill-update/files.ts'
-import { checkChanges, readReason, workspaceReader, WORKSPACE_DIR } from '../skill-update/workspace.ts'
-import type { CheckedChanges } from '../skill-update/workspace.ts'
+import { ProposalError } from '../util/files.ts'
 
 /** Repository directory the draft lives in. */
 export const AGENTS_DIR = '.agents'
@@ -37,15 +39,15 @@ export interface InitDraft {
  * A reader of the tree a push of the workspace publishes: changed files from
  * the workspace, every other file from the base commit. A file that exists in
  * the workspace but in neither is excluded by the repository's ignore rules.
- * @param repos - the `dshRepos` service holding the workspace.
  * @param changes - the workspace's changes.
+ * @param baseDir - snapshot of the workspace's base commit.
  * @param maxBytes - size ceiling.
- * @param signal - cancellation.
  * @returns the reader; it yields undefined for a path the push does not publish.
  */
-function publishedReader(repos: DshRepos, changes: WorkspaceChanges, maxBytes: number, signal?: AbortSignal): RepoFileReader {
+function publishedReader(changes: WorkspaceStatus, baseDir: string, maxBytes: number): RepoFileReader {
   const { workspace } = changes
-  const disk = workspaceReader(workspace.dir, maxBytes)
+  const disk = treeReader(workspace.path, maxBytes)
+  const base = treeReader(baseDir, maxBytes)
   const changed = new Map<string, string>()
   for (const file of changes.files) {
     if (file.previousPath !== undefined) changed.set(file.previousPath, 'deleted')
@@ -55,9 +57,8 @@ function publishedReader(repos: DshRepos, changes: WorkspaceChanges, maxBytes: n
     const status = changed.get(path)
     if (status === 'deleted') return undefined
     if (status !== undefined) return await disk(path)
-    const published = await repos.readMirrorFile(workspace.url, workspace.baseCommit, path, signal === undefined ? {} : { signal })
+    const published = await base(path)
     if (published === undefined && await disk(path) !== undefined) throw new ProposalError(`${path} 被仓库的忽略规则（.gitignore 等）排除，推送时不会包含它；请改用不被忽略的文件名`)
-    if (published !== undefined && Buffer.byteLength(published, 'utf8') > maxBytes) throw new ProposalError(`${path} 超过大小上限 ${maxBytes} 字节`)
     return published
   }
 }
@@ -72,16 +73,18 @@ function publishedReader(repos: DshRepos, changes: WorkspaceChanges, maxBytes: n
  * @returns the draft.
  * @throws ProposalError when the application would not be usable or a change is not allowed; the service's error when it cannot report the changes.
  */
-export async function checkInitDraft(repos: DshRepos, workDir: string, limits: Pick<SkillUpdateSettings, 'maxFiles' | 'maxFileBytes'>, signal?: AbortSignal): Promise<InitDraft> {
+export async function checkInitDraft(repos: ReposClient, workDir: string, limits: Pick<SkillUpdateSettings, 'maxFiles' | 'maxFileBytes'>, signal?: AbortSignal): Promise<InitDraft> {
   const dir = join(workDir, WORKSPACE_DIR)
-  const changes = await repos.workspaceChanges(dir, signal === undefined ? {} : { signal })
-  const read = publishedReader(repos, changes, limits.maxFileBytes, signal)
-  const checked = await checkAppManifest(read)
-  if (!checked.ok) throw new ProposalError(checked.error)
-  const { app } = checked
-  const skill = skillPath(app.skill)
-  const name = skillNameOf(await read(skill) ?? '')
-  if (name !== app.skill) throw new ProposalError(`${skill} 的 frontmatter name 是${name === undefined ? '（缺失）' : `「${name}」`}，必须等于 skill 字段「${app.skill}」`)
+  const changes = await repos.require().workspaceStatus({ path: dir, ...signal === undefined ? {} : { signal } })
+  const { app } = await repos.withSnapshot(changes.workspace.repo, changes.workspace.baseCommit, signal, async (lease) => {
+    const read = publishedReader(changes, lease.path, limits.maxFileBytes)
+    const checked = await checkAppManifest(read)
+    if (!checked.ok) throw new ProposalError(checked.error)
+    const skill = skillPath(checked.app.skill)
+    const name = skillNameOf(await read(skill) ?? '')
+    if (name !== checked.app.skill) throw new ProposalError(`${skill} 的 frontmatter name 是${name === undefined ? '（缺失）' : `「${name}」`}，必须等于 skill 字段「${checked.app.skill}」`)
+    return checked
+  })
   const skillPrefix = `skills/${app.skill}/`
   const scope = { root: AGENTS_DIR, allows: (path: string) => path === MANIFEST_FILE || path.startsWith(skillPrefix), description: `${AGENTS_DIR}/${MANIFEST_FILE} 和 ${AGENTS_DIR}/${skillPrefix}` }
   const draft = await checkChanges(changes, scope, limits)

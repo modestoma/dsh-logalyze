@@ -1,12 +1,14 @@
 /**
- * 读写 Agent 可写目录（运行目录、工作区）中的文件。这些目录里的一切都按不可信
- * 输入处理：不跟随符号链接，只接受普通文件、UTF-8 文本和大小上限。
+ * 读写 Agent 可写目录（运行目录、工作区、报告目录）中的文件，以及插件自己的
+ * 状态文件的原子替换。Agent 可写目录里的一切都按不可信输入处理：不跟随符号
+ * 链接，只接受普通文件、UTF-8 文本和大小上限。
  *
- * @module dsh-logalyze/skill-update/files
+ * @module dsh-logalyze/util/files
  */
 
 import { randomBytes } from 'node:crypto'
 import { lstat, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
 
 const decoder = new TextDecoder('utf-8', { fatal: true })
 
@@ -54,16 +56,18 @@ export async function readText(path: string, label: string, maxBytes: number): P
 }
 
 /**
- * Write a file in an agent-writable directory without following whatever
- * entry the agent left at its path: the content goes to a new file created
+ * Replace a file atomically without following whatever entry is at its
+ * path (agent-writable directories may hold a symbolic link there): the
+ * content goes to a new hidden file in the same directory, created
  * exclusively, which then replaces the directory entry.
  * @param path - absolute path.
  * @param content - file content.
+ * @param mode - permission bits of a new file.
  */
-export async function replaceFile(path: string, content: string): Promise<void> {
-  const temporary = `${path}.${randomBytes(6).toString('hex')}.tmp`
+export async function replaceFile(path: string, content: string, mode?: number): Promise<void> {
+  const temporary = join(dirname(path), `.${basename(path)}.${randomBytes(6).toString('hex')}.tmp`)
   try {
-    await writeFile(temporary, content, { flag: 'wx' })
+    await writeFile(temporary, content, { flag: 'wx', ...mode === undefined ? {} : { mode } })
     await rename(temporary, path)
   } catch (error) {
     await rm(temporary, { force: true })

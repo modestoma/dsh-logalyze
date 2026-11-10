@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { abortable } from '../src/abort.ts'
+import { abortable } from '../src/util/abort.ts'
 import { createEntrySkillProvider, DESCRIPTION_MAX_CHARS, describeApps, renderCatalog, renderEntrySkill } from '../src/skill/entry.ts'
 import type { AppManifest } from '../src/settings/contract.ts'
 import { loadBundledSkills, parseBundledSkill } from '../src/skill/bundled.ts'
@@ -14,6 +14,8 @@ describe('entry skill', () => {
   it('lists usable applications in the catalog', () => {
     expect(renderCatalog([order])).toContain('| `order-service` | 订单服务 | 下单 \\| 支付 | 订单 | `OrderController` |')
     expect(renderCatalog([])).toContain('当前没有可用的应用')
+    expect(renderCatalog([])).toContain('在 dsh-repo 的「代码仓库 → 仓库」中添加仓库并打开「日志分析」')
+    expect(renderEntrySkill([order], 3, true)).toContain('推送前可能还会弹出审批请用户再批准一次')
     const body = renderEntrySkill([order], 3, false)
     expect(body).toContain('`logalyze_dispatch`')
     expect(body).toContain('最多 3 个')

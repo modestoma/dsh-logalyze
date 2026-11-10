@@ -1,27 +1,32 @@
 /**
- * 应用注册表：经 dsh-repo 的本地镜像拉取设置中的 git 地址，从远端分支最新提交
- * 读取各仓库的应用描述，对外提供「已就绪的应用」，并为每次派发持有该提交的
- * 只读代码快照。
+ * 应用注册表：经 dsh-repo 取仓库清单里打开了日志分析的仓库在跟踪分支最新提交
+ * 的只读快照，从中读取各仓库的应用描述，对外提供「已就绪的应用」，并为每次
+ * 派发持有该提交的快照。
  *
- * - 镜像、快照和令牌都由 dsh-repo 管理：镜像只做 fetch，不检出；应用描述与
- *   SKILL 直接从提交读取，所以随时可以更新，不受正在进行的分析影响。快照在
+ * - 镜像、快照和令牌都由 dsh-repo 管理：每次同步取跟踪分支的快照（dsh-repo 先
+ *   从远端拉取），读完应用描述与 SKILL 即释放，不受正在进行的分析影响。快照在
  *   所有持有者释放后由 dsh-repo 清理。
  * - dsh-repo 不可用或更新失败时继续使用已有提交，并在状态里给出原因；应用描述
  *   或 SKILL 不合法时该应用不可用。
  * - 多个仓库声明同一个应用 id 时，这些仓库全部不可用。
+ * - 记录每个仓库在清单中是否可写（权限「可改代码」或「可合并」）；只读仓库
+ *   照常分析，但不起草接入、不改进 SKILL。
  *
- * @module dsh-logalyze/repos/registry
+ * @module dsh-logalyze/apps/registry
  */
 
-import type { DshRepos, SnapshotLease } from './contract.ts'
+import type { AppRepo, ReposClient } from '../deps/repos.ts'
+import type { SnapshotLease } from '../deps/repos-contract.ts'
 import type { AppManifest, RepoSpec, RepoStatusWire } from '../settings/contract.ts'
-import { messageOf, requireRepos } from './lookup.ts'
+import { messageOf } from '../util/errors.ts'
 import { checkAppManifest } from './manifest.ts'
+import type { ManifestRead } from './manifest.ts'
+import { MAX_REPO_FILE_BYTES, treeReader } from './tree.ts'
 
 /** Collaborators of the registry. */
 export interface RepoRegistryDeps {
-  /** The current `ctx.get('dshRepos')` value, looked up on every use. */
-  readonly repos: () => unknown
+  /** The `dshRepos` service, looked up on every use. */
+  readonly repos: ReposClient
   /** Called after any status change (sync start/end, configuration, leases). */
   readonly onChange: () => void
   readonly now?: () => number
@@ -32,6 +37,8 @@ export interface ReadyApp {
   readonly app: AppManifest
   readonly url: string
   readonly commit: string
+  /** Whether drafting setups and SKILL improvements may push to the repository. */
+  readonly writable: boolean
 }
 
 /** An application held by one dispatch, with the snapshot its child works in. */
@@ -48,12 +55,9 @@ export interface RepoLease {
 
 interface RepoEntry {
   readonly spec: RepoSpec
-  /** Mirror directory reported by the last successful sync. */
-  dir?: string
-  /** Branch the last successful sync resolved. */
-  branch?: string
+  writable: boolean
+  /** Commit the last successful sync read. */
   commit?: string
-  commitTime?: string
   app?: AppManifest
   error?: string
   syncedAt?: number
@@ -75,21 +79,22 @@ export class RepoRegistry {
 
   /**
    * Replace the configured repositories. An address keeps its status when its
-   * branch is unchanged.
+   * branch is unchanged; a change of access alone needs no sync.
    * @param repos - configured repositories.
    * @returns addresses that are new or changed and therefore need a sync.
    */
-  configure(repos: readonly RepoSpec[]): string[] {
+  configure(repos: readonly AppRepo[]): string[] {
     const previous = new Map(this.entries.map(entry => [entry.spec.url, entry]))
     const changed: string[] = []
-    this.entries = repos.map((spec) => {
+    this.entries = repos.map(({ writable, ...spec }) => {
       const kept = previous.get(spec.url)
       if (kept !== undefined && kept.spec.branch === spec.branch) {
         previous.delete(spec.url)
+        kept.writable = writable
         return kept
       }
       changed.push(spec.url)
-      return { spec: { ...spec }, activeRuns: 0, retired: false }
+      return { spec, writable, activeRuns: 0, retired: false }
     })
     for (const entry of previous.values()) entry.retired = true
     this.deps.onChange()
@@ -163,14 +168,13 @@ export class RepoRegistry {
       return {
         url: entry.spec.url,
         ...entry.spec.branch === undefined ? {} : { branch: entry.spec.branch },
-        ...entry.dir === undefined ? {} : { dir: entry.dir },
         phase,
         ...entry.commit === undefined ? {} : { commit: entry.commit },
-        ...entry.commitTime === undefined ? {} : { commitTime: entry.commitTime },
         ...entry.syncedAt === undefined ? {} : { syncedAt: entry.syncedAt },
         ...entry.app === undefined ? {} : { app: entry.app },
         ...error === undefined ? {} : { error },
         available: entry.app !== undefined && conflict === undefined,
+        writable: entry.writable,
         activeRuns: entry.activeRuns,
       }
     })
@@ -187,7 +191,7 @@ export class RepoRegistry {
     for (const entry of this.entries) {
       if (entry.app === undefined || entry.commit === undefined) continue
       if ((duplicates.get(entry.app.id)?.length ?? 0) > 1) continue
-      ready.push({ entry, ready: { app: entry.app, url: entry.spec.url, commit: entry.commit } })
+      ready.push({ entry, ready: { app: entry.app, url: entry.spec.url, commit: entry.commit, writable: entry.writable } })
     }
     return ready
   }
@@ -217,11 +221,11 @@ export class RepoRegistry {
     const ready = new Map(this.readyEntries().map(item => [item.ready.app.id, item]))
     const missing = unique.filter(id => !ready.has(id))
     if (missing.length > 0) throw new Error(this.unknownMessage(missing))
-    const service = requireRepos(this.deps.repos())
+    const service = this.deps.repos.require()
     const held = unique.map((id) => {
       const { entry, ready: app } = ready.get(id) as { entry: RepoEntry; ready: ReadyApp }
       entry.activeRuns += 1
-      return { id, entry, app, snapshot: service.acquireSnapshot(app.url, app.commit) }
+      return { id, entry, app, snapshot: service.snapshotAcquire({ repo: app.url, ref: app.commit }) }
     })
     this.deps.onChange()
     const outcomes = await Promise.allSettled(held.map(item => item.snapshot))
@@ -240,7 +244,7 @@ export class RepoRegistry {
       throw new Error(`应用「${held[index]?.id}」的代码快照创建失败：${messageOf(outcome.reason)}`)
     }
     return {
-      apps: new Map(held.map(({ id, app }, index) => [id, { ...app, dir: (leases[index] as SnapshotLease).dir }])),
+      apps: new Map(held.map(({ id, app }, index) => [id, { ...app, dir: (leases[index] as SnapshotLease).path }])),
       release,
     }
   }
@@ -255,26 +259,25 @@ export class RepoRegistry {
   }
 
   /**
-   * Addresses that synced but have no application: the description or its
-   * SKILL is missing or invalid at the latest synced commit.
+   * Writable addresses that synced but have no application: the description
+   * or its SKILL is missing or invalid at the latest synced commit, and a
+   * drafted setup can be pushed.
    * @returns those addresses, ordered as configured.
    */
   setupPending(): string[] {
-    return this.entries.filter(entry => entry.commit !== undefined && entry.app === undefined && entry.syncing === undefined).map(entry => entry.spec.url)
+    return this.entries.filter(entry => entry.writable && entry.commit !== undefined && entry.app === undefined && entry.syncing === undefined).map(entry => entry.spec.url)
   }
 
   /**
-   * The branch the last successful sync of a configured address resolved: the
-   * configured branch, or the remote's default branch when none is configured.
+   * The branch a configured address follows.
    * @param url - configured repository address.
-   * @returns the branch.
-   * @throws when the address is not configured or has not synced yet.
+   * @returns the catalog branch, or undefined when it follows the remote's default branch.
+   * @throws when the address is not configured.
    */
-  branchOf(url: string): string {
+  branchOf(url: string): string | undefined {
     const entry = this.entries.find(item => item.spec.url === url)
-    if (entry === undefined) throw new Error(`仓库 ${url} 已不在配置中`)
-    if (entry.branch === undefined) throw new Error(`仓库 ${url} 还没有同步成功`)
-    return entry.branch
+    if (entry === undefined) throw new Error(`仓库 ${url} 已不是观象的应用仓库`)
+    return entry.spec.branch
   }
 
   private unknownMessage(ids: readonly string[]): string {
@@ -309,11 +312,12 @@ export class RepoRegistry {
 
   private async runSync(entry: RepoEntry): Promise<void> {
     if (entry.retired) return
-    let service: DshRepos
-    let head: { dir: string; branch: string; commit: string; commitTime: string }
+    let head: { commit: string; manifest: ManifestRead }
     try {
-      service = requireRepos(this.deps.repos())
-      head = await service.syncMirror(entry.spec.url, entry.spec.branch === undefined ? {} : { branch: entry.spec.branch })
+      head = await this.deps.repos.withSnapshot(entry.spec.url, entry.spec.branch, undefined, async lease => ({
+        commit: lease.commit,
+        manifest: await checkAppManifest(treeReader(lease.path, MAX_REPO_FILE_BYTES)),
+      }))
     } catch (error) {
       entry.syncedAt = this.now()
       entry.error = entry.commit !== undefined && entry.app !== undefined
@@ -321,12 +325,9 @@ export class RepoRegistry {
         : messageOf(error)
       return
     }
-    const manifest = await checkAppManifest(path => service.readMirrorFile(entry.spec.url, head.commit, path))
+    const { manifest } = head
     entry.syncedAt = this.now()
-    entry.dir = head.dir
-    entry.branch = head.branch
     entry.commit = head.commit
-    entry.commitTime = head.commitTime
     if (manifest.ok) {
       entry.app = manifest.app
       entry.error = undefined
