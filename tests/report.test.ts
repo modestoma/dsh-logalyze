@@ -333,6 +333,23 @@ describe('report tracking', () => {
     expect(h.tracker.retry('0'.repeat(24))).toBe(false)
   })
 
+  it('signs new upload links when one expired, and uploads under the next key when retried by hand', async () => {
+    const h = await harness()
+    const record = await h.start(analysis('req-1', 1))
+    await writeFile(join(h.workDir, 'report', 'a.txt'), 'old')
+    h.platform.fail('put', 403)
+    h.turn(1, { reply: '结论' })
+    await h.completed(1)
+    expect(h.platform.revisions).toHaveLength(1)
+    expect(h.platform.calls('create')).toHaveLength(2)
+
+    await writeFile(join(h.workDir, 'report', 'a.txt'), 'new')
+    expect(h.tracker.retry(record.id)).toBe(true)
+    await h.completed(2)
+    expect(h.platform.revisions[1]?.key).toBe(`logalyze:${record.id}:L1:r1:g1`)
+    expect(h.platform.revisions[1]?.files.get('a.txt')?.toString('utf8')).toBe('new')
+  })
+
   it('moves to the next key when the platform refuses a key reused with other files', async () => {
     const h = await harness()
     const record = await h.start(analysis('req-1', 1))

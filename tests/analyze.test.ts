@@ -208,6 +208,9 @@ describe('analyze contract', () => {
     const many = parseAnalyzeRequest(REQUEST, undefined, 1)
     expect(many.ok === false && many.error).toBe('请求参数不合法：logIds 最多 1 个，本次 2 个')
     expect(parseAnalyzeRequest({ ...REQUEST, instructions: '  ' }, undefined, 10).ok).toBe(false)
+    // One root card row per log: the card holds at most 50.
+    expect(() => resolveConfig({ analyze: { maxLogs: 51 } })).toThrow()
+    expect(resolveConfig({ analyze: { maxLogs: 50 } }).analyze.maxLogs).toBe(50)
   })
 
   it('falls back to the default group only when the body has no chatId', () => {

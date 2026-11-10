@@ -481,6 +481,13 @@ export class ReportTracker {
       const forced = this.forced.delete(id)
       const due = record.logs.filter(log => forced || (log.uploadedRevision < record.revision && log.blocked !== true))
       if (due.length === 0) return
+      if (forced) {
+        // The current key of a log already uploaded at this revision replays
+        // the completed revision without uploading anything; a manual retry
+        // (attachments may have changed at equal size) needs the next key.
+        const current = new Set(due.filter(log => log.uploadedRevision >= record.revision).map(log => log.ref))
+        if (current.size > 0) await this.mutate(id, latest => ({ ...latest, logs: latest.logs.map(log => (current.has(log.ref) ? { ...log, generation: log.generation + 1 } : log)) }))
+      }
       this.running.add(id)
       let retry = false
       try {

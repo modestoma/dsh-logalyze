@@ -224,7 +224,7 @@ export class PlatformClient {
    * @param url - the revision's `upload_url`.
    * @param content - file bytes.
    * @param timeoutMs - per-upload timeout.
-   * @throws PlatformError; a 4xx usually means the link expired.
+   * @throws PlatformError, always retryable: a 4xx usually means the link expired, and recreating the revision signs a new one.
    */
   async put(url: string, content: Uint8Array, timeoutMs: number): Promise<void> {
     let response: Response
@@ -242,7 +242,9 @@ export class PlatformClient {
       await response.body?.cancel()
       return
     }
-    throw new PlatformError(`上传文件失败：HTTP ${response.status}${await errorDetail(response)}`, retryableStatus(response.status), response.status)
+    // An expired link usually answers 403; a retry creates the revision again
+    // under the same key, which signs new links, so every status is retryable.
+    throw new PlatformError(`上传文件失败：HTTP ${response.status}${await errorDetail(response)}`, true, response.status)
   }
 
   /** Forget the cached token, so the next call requests a new one (settings or secret changed). */

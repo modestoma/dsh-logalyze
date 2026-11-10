@@ -100,7 +100,7 @@ describe('platform client', () => {
     expect(await api.completeAnalysis(logUuid(1), created.analysis_id)).toBe(`${platform.base}/logs/${logUuid(1)}/analysis`)
     await expect(api.createAnalysis(logUuid(1), 'key-1', 'report.md', [{ path: 'report.md', sizeBytes: 4 }])).rejects.toMatchObject({ status: 409 })
     platform.fail('put', 403)
-    await expect(api.put(replayed.uploads[0]!.upload_url, Buffer.from('abc'), 5000)).rejects.toMatchObject({ status: 403, retryable: false })
+    await expect(api.put(replayed.uploads[0]!.upload_url, Buffer.from('abc'), 5000)).rejects.toMatchObject({ status: 403, retryable: true })
   })
 
   it('refuses a response without the agreed fields', async () => {

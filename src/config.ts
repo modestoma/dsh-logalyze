@@ -61,8 +61,8 @@ const uploadSchema = z.object({
   concurrency: z.number().int().min(1).max(16).default(4),
 }).strict()
 
-/** Largest `analyze.maxLogs`: the platform's limit of ids per metadata query. */
-export const MAX_LOGS_LIMIT = 100
+/** Largest `analyze.maxLogs`: the root card's row limit (one row per log), below the platform's 100 ids per metadata query. */
+export const MAX_LOGS_LIMIT = 50
 
 const analyzeSchema = z.object({
   enabled: z.boolean().default(false),

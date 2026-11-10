@@ -109,7 +109,7 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
     analyze:                           # 日志平台分析接口，见下文
       enabled: false                   # 默认关闭
       defaultChatId: oc_xxx            # 请求不带 chatId 时的目标群；不填则 chatId 必填
-      maxLogs: 10                      # 一次请求最多的 logIds（1–100）
+      maxLogs: 10                      # 一次请求最多的 logIds（1–50，根卡片每份日志一行）
       platform:                        # 日志平台开放 API（观象是它的 OAuth2 客户端）
         baseUrl: https://logs.example.com           # 在后面拼 /open-api/v1/…
         tokenUrl: https://auth.example.com/oauth/token
@@ -255,7 +255,7 @@ Content-Type: application/json
   - `machine`：从拿不到飞书 user_id 的平台发起（例如 APP），`triggerId` 是该平台自己的标识（1–128 字符、单行）。分析卡开头显示为 `[machine] <triggerId>`，不 @ 任何人，也不检查飞书权限（访问令牌就是凭据）；首轮以群身份提交、没有发言人，首轮里提交的代码只带群的尾注。
 - `triggeredAt`：平台上发起分析的时间，1–64 字符，原样显示在分析卡上（时区和格式由平台决定）。
 - `chatId`：可选，目标群，机器人需在群内。不带时发到设置面板的默认群；两者都没有时返回 `400`。群本身不需要授权，群话题的知识库与代码改动权限在飞书渠道插件设置面板的群权限里按群配置。
-- `logIds`：日志平台的日志 id（UUID，不区分大小写），1 到 `analyze.maxLogs`（默认 10，最多 100）个，不能重复。一个 log_id 是一个日志包（通常是 ZIP）。
+- `logIds`：日志平台的日志 id（UUID，不区分大小写），1 到 `analyze.maxLogs`（默认 10，最多 50）个，不能重复。一个 log_id 是一个日志包（通常是 ZIP）。
 - `instructions`：可选，调用方说明（1–20000 字符），放进首轮消息的「调用方说明」一节。
 - 除 `chatId` 和 `instructions` 外都必填，`triggerType`、`triggerId`、`triggeredAt`、最终用的群、`logIds`、`instructions` 共同组成幂等指纹。只接受以上 6 个字段；旧格式的 `prompt`、`logDetails`、`logId`、`app`、`errorCode` 返回 400 并说明改用什么，其他多余字段也返回 400。
 

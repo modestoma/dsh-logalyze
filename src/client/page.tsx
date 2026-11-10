@@ -594,7 +594,7 @@ function AnalyzeTab({ draft, setDraft, analyze, credentialsAvailable, overridden
             onClear={() => { onClearCredential(analyze.tokenEnv) }}
           />
           <TextRow label="默认群" summary="请求体不带 chatId 时，分析卡片发到这个群；机器人需在群内。留空时 chatId 必填。" placeholder="oc_xxx" value={draft.analyzeDefaultChatId} onChange={(value) => { setDraft({ ...draft, analyzeDefaultChatId: value }) }} />
-          <NumberRow label="单次日志数上限" summary="一次请求最多传的 logIds 个数（最多 100）。" unit="份" value={draft.maxLogs} onChange={(value) => { setDraft({ ...draft, maxLogs: value }) }} />
+          <NumberRow label="单次日志数上限" summary="一次请求最多传的 logIds 个数（最多 50）。" unit="份" value={draft.maxLogs} onChange={(value) => { setDraft({ ...draft, maxLogs: value }) }} />
         </div>
       </section>
       <section className="lz__sec">
