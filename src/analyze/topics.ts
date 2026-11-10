@@ -7,7 +7,7 @@
  * @module dsh-logalyze/analyze/topics
  */
 
-import type { FeishuTopicService, TopicLaunchResult, TopicLaunchSpec } from '../deps/topics-contract.ts'
+import type { FeishuTopicService, TopicLaunchResult, TopicLaunchSpec, TopicRequester } from '../deps/topics-contract.ts'
 import { REPORT_DIR, REPORT_ENTRY } from '../settings/contract.ts'
 import { analyzeRequestHash } from './contract.ts'
 import type { AnalyzeRequest, AnalyzeResponse } from './contract.ts'
@@ -29,6 +29,24 @@ export const REPORT_PROMPT_SECTION = `
 `
 
 /**
+ * The root card requester of one request: a `digital` trigger is the Feishu
+ * user it names, a `machine` trigger is shown as `[machine] <triggerId>`.
+ * @param request - the validated request.
+ * @returns the requester.
+ */
+export function analyzeRequester(request: Pick<AnalyzeRequest, 'triggerType' | 'triggerId'>): TopicRequester {
+  switch (request.triggerType) {
+    case 'digital': return { kind: 'feishu-user', userId: request.triggerId }
+    case 'machine': return { kind: 'external', label: `[machine] ${request.triggerId}` }
+    default: return assertNever(request.triggerType)
+  }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`unexpected trigger type: ${String(value)}`)
+}
+
+/**
  * The topic one analyze request starts.
  * @param request - the validated request.
  * @param idempotencyKey - the request's `Idempotency-Key`, used unchanged as the launch key.
@@ -39,7 +57,7 @@ export function analyzeTopicSpec(request: AnalyzeRequest, idempotencyKey: string
     key: idempotencyKey,
     fingerprint: analyzeRequestHash(request),
     chatId: request.chatId,
-    requesterUserId: request.requesterUserId,
+    requester: analyzeRequester(request),
     card: {
       title: '日志分析',
       taskName: '分析',

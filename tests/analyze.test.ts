@@ -15,7 +15,8 @@ import { tempDir } from './helpers.ts'
 type Handler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
 const REQUEST: AnalyzeRequest = {
-  requesterUserId: 'u_alice',
+  triggerType: 'digital',
+  triggerId: 'u_alice',
   triggeredAt: '2026-10-28 09:30',
   app: 'order-service',
   errorCode: 'E1001',
@@ -29,7 +30,7 @@ afterEach(async () => { await Promise.all(cleanups.splice(0).map(cleanup => clea
 
 function fakeTopics(result: TopicLaunchResult = { ok: true, replayed: false, chatId: 'oc_group1', messageId: 'om_root' }): FeishuTopicService & { specs: TopicLaunchSpec[]; next: TopicLaunchResult } {
   const service = {
-    version: 2 as const,
+    version: 3 as const,
     specs: [] as TopicLaunchSpec[],
     next: result,
     launch: async (spec: TopicLaunchSpec) => { service.specs.push(spec); return service.next },
@@ -112,15 +113,41 @@ async function errorOf(response: Response): Promise<string> {
 
 describe('analyze contract', () => {
   it('keeps a stable request fingerprint', () => {
-    expect(analyzeRequestHash(REQUEST)).toBe('8f934b9451fb62025000db4c0e24800a8d6f6e88330b3350d0fc3c8c32fdf454')
+    expect(analyzeRequestHash(REQUEST)).toBe('3f2514620afe5be42df23dff4cfa56b5dd4f3b65e8bf82d668a71375beb17530')
   })
 
   it('lists every invalid field', () => {
-    const parsed = parseAnalyzeRequest({ ...REQUEST, requesterUserId: 'ou_open', app: '..', logDetails: [], extra: 1 })
+    const parsed = parseAnalyzeRequest({ ...REQUEST, triggerId: 'ou_open', app: '..', logDetails: [], extra: 1 }, undefined)
     expect(parsed.ok).toBe(false)
     if (parsed.ok) return
     expect(parsed.error).toMatch(/^请求参数不合法：/)
-    for (const field of ['requesterUserId', 'app', 'logDetails', '(body)']) expect(parsed.error).toContain(field)
+    for (const field of ['triggerId', 'app', 'logDetails', '(body)']) expect(parsed.error).toContain(field)
+    const removed = parseAnalyzeRequest({ ...REQUEST, requesterUserId: 'u_alice' }, undefined)
+    expect(removed.ok === false && removed.error).toContain('requesterUserId')
+  })
+
+  it('validates the trigger by type', () => {
+    expect(parseAnalyzeRequest({ ...REQUEST, triggerType: 'machine', triggerId: 'ou_any id/1' }, undefined).ok).toBe(true)
+    for (const [triggerType, triggerId] of [['digital', 'ou_open'], ['digital', 'on_union'], ['machine', 'a\nb'], ['machine', '  '], ['machine', 'x'.repeat(129)], ['robot', 'x']]) {
+      const parsed = parseAnalyzeRequest({ ...REQUEST, triggerType, triggerId }, undefined)
+      expect(parsed.ok, `${triggerType} ${triggerId}`).toBe(false)
+    }
+    const { triggerType: _type, ...untyped } = REQUEST
+    expect(parseAnalyzeRequest(untyped, undefined).ok).toBe(false)
+  })
+
+  it('falls back to the default group only when the body has no chatId', () => {
+    const { chatId: _chatId, ...noChat } = REQUEST
+    expect(parseAnalyzeRequest(noChat, 'oc_default')).toEqual({ ok: true, value: { ...REQUEST, chatId: 'oc_default' } })
+    expect(parseAnalyzeRequest(REQUEST, 'oc_default')).toEqual({ ok: true, value: REQUEST })
+    const missing = parseAnalyzeRequest(noChat, undefined)
+    expect(missing.ok === false && missing.error).toContain('默认群')
+    expect(analyzeRequestHash({ ...REQUEST, chatId: 'oc_default' })).not.toBe(analyzeRequestHash(REQUEST))
+  })
+
+  it('shows a machine trigger as text and a digital trigger as the Feishu user', () => {
+    expect(analyzeTopicSpec({ ...REQUEST, triggerType: 'machine', triggerId: 'app-7' }, 'req-1').requester).toEqual({ kind: 'external', label: '[machine] app-7' })
+    expect(analyzeTopicSpec(REQUEST, 'req-1').requester).toEqual({ kind: 'feishu-user', userId: 'u_alice' })
   })
 
   it('builds the analysis topic with the card and the raw key', () => {
@@ -128,7 +155,7 @@ describe('analyze contract', () => {
       key: 'req-1',
       fingerprint: analyzeRequestHash(REQUEST),
       chatId: 'oc_group1',
-      requesterUserId: 'u_alice',
+      requester: { kind: 'feishu-user', userId: 'u_alice' },
       card: {
         title: '日志分析',
         taskName: '分析',
@@ -148,9 +175,9 @@ describe('analyze contract', () => {
   it('adds logId to the fingerprint only when present and asks for report files in the prompt', () => {
     const withLogId = { ...REQUEST, logId: 'L-1' }
     expect(analyzeRequestHash(withLogId)).not.toBe(analyzeRequestHash(REQUEST))
-    expect(parseAnalyzeRequest(withLogId)).toEqual({ ok: true, value: withLogId })
-    for (const logId of ['-x', '.x', 'a b', 'a/b', '']) expect(parseAnalyzeRequest({ ...REQUEST, logId }).ok).toBe(false)
-    const long = parseAnalyzeRequest({ ...withLogId, prompt: 'x'.repeat(ANALYZE_MAX_PROMPT_CHARS - REPORT_PROMPT_RESERVE + 1) })
+    expect(parseAnalyzeRequest(withLogId, undefined)).toEqual({ ok: true, value: withLogId })
+    for (const logId of ['-x', '.x', 'a b', 'a/b', '']) expect(parseAnalyzeRequest({ ...REQUEST, logId }, undefined).ok).toBe(false)
+    const long = parseAnalyzeRequest({ ...withLogId, prompt: 'x'.repeat(ANALYZE_MAX_PROMPT_CHARS - REPORT_PROMPT_RESERVE + 1) }, undefined)
     expect(long.ok === false && long.error).toContain('prompt')
     expect(REPORT_PROMPT_SECTION.length).toBeLessThan(REPORT_PROMPT_RESERVE)
     expect(analyzeTopicSpec(withLogId, 'req-1').prompt).toBe(`${REQUEST.prompt}${REPORT_PROMPT_SECTION}`)
@@ -164,9 +191,10 @@ describe('analyze contract', () => {
     expect(analyzeResponseOf({ ok: false, code: 'key-conflict', message: 'x' }).body).toEqual({ ok: false, error: 'Idempotency-Key 已被内容不同的请求使用' })
   })
 
-  it('accepts only a provider of contract version 2', () => {
+  it('accepts only a provider of contract version 3', () => {
     expect(lookupTopics(undefined).availability).toBe('missing')
     expect(lookupTopics({ version: 1, launch: () => undefined }).availability).toBe('incompatible')
+    expect(lookupTopics({ version: 2, launch: () => undefined }).availability).toBe('incompatible')
     expect(lookupTopics(fakeTopics()).availability).toBe('ready')
   })
 
@@ -243,10 +271,10 @@ describe('analyze route', () => {
     expect(await accepted.json()).toEqual({ ok: true, chatId: 'oc_group1', messageId: 'om_root' })
     expect(topics.specs).toEqual([analyzeTopicSpec(REQUEST, 'req-1')])
 
-    topics.next = { ok: false, code: 'forbidden-chat', message: '目标群未授权' }
+    topics.next = { ok: false, code: 'forbidden-chat', message: '发起人没有对话权限' }
     const forbidden = await post(h.base, REQUEST)
     expect(forbidden.status).toBe(403)
-    expect(await errorOf(forbidden)).toBe('目标群未授权')
+    expect(await errorOf(forbidden)).toBe('发起人没有对话权限')
 
     const cleared = await fetch(`${h.base}/logalyze/token`, { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tokenEnv: 'LOGALYZE_ANALYZE_TOKEN' }) })
     expect(cleared.status).toBe(200)
@@ -254,7 +282,28 @@ describe('analyze route', () => {
     expect((await post(h.base, REQUEST)).status).toBe(503)
   })
 
-  it('tracks the report of every accepted request with logId', async () => {
+  it('sends a request without chatId to the default group, and refuses it while none is set', async () => {
+    const credentials = fakeCredentials()
+    credentials.stored.set('LOGALYZE_ANALYZE_TOKEN', 'secret-token')
+    const topics = fakeTopics()
+    const h = await harness({ credentials, feishuTopics: topics }, { analyze: { enabled: true } })
+    const { chatId: _chatId, ...noChat } = REQUEST
+    const missing = await post(h.base, noChat)
+    expect(missing.status).toBe(400)
+    expect(await errorOf(missing)).toContain('默认群')
+
+    const state = await (await fetch(`${h.base}/logalyze/state`)).json() as StateWire
+    const put = (analyze: Record<string, unknown>): Promise<Response> => fetch(`${h.base}/logalyze/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...state.settings, analyze: { ...state.settings.analyze, ...analyze } }) })
+    expect((await put({ defaultChatId: 'ou_user' })).status).toBe(400)
+    const saved = await put({ defaultChatId: 'oc_default' })
+    expect(((await saved.json()) as { state: StateWire }).state.settings.analyze.defaultChatId).toBe('oc_default')
+    expect((await post(h.base, noChat)).status).toBe(202)
+    expect(topics.specs.at(-1)?.chatId).toBe('oc_default')
+    expect((await post(h.base, REQUEST, { 'idempotency-key': 'req-2' })).status).toBe(202)
+    expect(topics.specs.at(-1)?.chatId).toBe('oc_group1')
+  })
+
+    it('tracks the report of every accepted request with logId', async () => {
     const credentials = fakeCredentials()
     credentials.stored.set('LOGALYZE_ANALYZE_TOKEN', 'secret-token')
     const topics = fakeTopics()

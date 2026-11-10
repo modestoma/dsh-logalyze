@@ -293,6 +293,7 @@ export class LogalyzeService {
     return {
       enabled: () => this.settings.get().analyze.enabled,
       tokenEnv: () => this.token.ref,
+      defaultChatId: () => this.settings.get().analyze.defaultChatId,
       token: () => this.token.value(),
     }
   }

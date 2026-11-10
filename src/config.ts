@@ -8,7 +8,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { z } from 'zod'
-import { TOKEN_ENV_PATTERN, UPLOAD_PLACEHOLDERS } from './settings/contract.ts'
+import { CHAT_ID_PATTERN, TOKEN_ENV_PATTERN, UPLOAD_PLACEHOLDERS } from './settings/contract.ts'
 import type { EditableKey, EditableSettings } from './settings/contract.ts'
 
 /** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
@@ -64,6 +64,7 @@ const uploadSchema = z.object({
 
 const analyzeSchema = z.object({
   enabled: z.boolean().default(false),
+  defaultChatId: z.string().trim().regex(CHAT_ID_PATTERN, '默认群必须是飞书群的 chat_id（oc_ 开头）').optional(),
   upload: uploadSchema.prefault({}),
 }).strict()
 

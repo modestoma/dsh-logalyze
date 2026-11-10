@@ -1,5 +1,5 @@
 /**
- * The part of the Feishu channel plugin's `feishuTopics` service (contract version 2) this
+ * The part of the Feishu channel plugin's `feishuTopics` service (contract version 3) this
  * plugin uses, declared here so the plugin does not depend on that plugin's
  * package. The plugin provides the service under `feishuTopics` and emits
  * {@link FEISHU_TOPICS_STATUS_EVENT}; both are looked up at run time.
@@ -7,8 +7,8 @@
  * @module dsh-logalyze/deps/topics-contract
  */
 
-/** The contract version this plugin speaks. Version 2 dropped the `workspace` parameter: the channel derives the topic directory from the group and the topic. */
-export type FeishuTopicsVersion = 2
+/** The contract version this plugin speaks. Version 3 replaced `requesterUserId` with {@link TopicLaunchSpec.requester}; version 2 dropped the `workspace` parameter. */
+export type FeishuTopicsVersion = 3
 
 /** One run of the root card's lead sentence. */
 export interface TopicCardText {
@@ -30,7 +30,7 @@ export interface TopicRootCard {
   readonly title: string
   /** Word naming the work in the status texts (`分析` gives `分析中`). */
   readonly taskName: string
-  /** Lead sentence, shown after an @-mention of the requester. */
+  /** Lead sentence, shown after the requester (an @-mention, or the external requester's text). */
   readonly lead: readonly TopicCardText[]
   readonly links?: {
     readonly nameHeader: string
@@ -38,6 +38,13 @@ export interface TopicRootCard {
     readonly rows: readonly TopicCardLink[]
   }
 }
+
+/** Who a launch is for. */
+export type TopicRequester =
+  /** A Feishu user: @-mentioned on the root card; the first turn is submitted with them as the speaker, so they need chat access in the channel. */
+  | { readonly kind: 'feishu-user'; readonly userId: string }
+  /** A requester without a Feishu account: `label` (1–200 characters, one line) is shown literally instead of a mention; no channel access check applies. */
+  | { readonly kind: 'external'; readonly label: string }
 
 /** One topic to start. */
 export interface TopicLaunchSpec {
@@ -47,8 +54,7 @@ export interface TopicLaunchSpec {
   readonly fingerprint: string
   /** Target group chat (`oc_…`). */
   readonly chatId: string
-  /** Feishu `user_id` @-mentioned on the root card; the first turn is submitted as this user, so they need chat access in the channel. */
-  readonly requesterUserId: string
+  readonly requester: TopicRequester
   readonly card: TopicRootCard
   /** First user message of the Session, sent verbatim. */
   readonly prompt: string

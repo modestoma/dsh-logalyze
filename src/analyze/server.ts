@@ -29,6 +29,8 @@ export interface AnalyzeGate {
   enabled(): boolean
   /** Credential reference holding the bearer token, named in the 503 answer while it is unset. */
   tokenEnv(): string
+  /** @returns the group a request without `chatId` goes to, or undefined when none is set. */
+  defaultChatId(): string | undefined
   /**
    * Resolve the expected bearer token.
    * @returns the token, or undefined when it is not configured or cannot be read.
@@ -122,7 +124,7 @@ export async function handleAnalyzeHttp(
     refuse(res, 400, '请求体不是合法的 JSON')
     return
   }
-  const parsed = parseAnalyzeRequest(raw)
+  const parsed = parseAnalyzeRequest(raw, gate.defaultChatId())
   if (!parsed.ok) {
     refuse(res, 400, parsed.error)
     return

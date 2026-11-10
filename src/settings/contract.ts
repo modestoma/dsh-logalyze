@@ -28,6 +28,9 @@ export interface RepoSpec {
   branch?: string
 }
 
+/** Feishu group chat id (`oc_…`): an analyze request's `chatId` and the panel's default group. */
+export const CHAT_ID_PATTERN = /^oc_[A-Za-z0-9_-]{1,128}$/u
+
 /** Credential reference grammar of `@deepseek-ai/dsh-credentials` (a POSIX shell identifier). */
 export const TOKEN_ENV_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
@@ -84,6 +87,8 @@ export interface UploadSettings {
 export interface AnalyzeSettings {
   /** Whether the API accepts requests; switched off it answers 404. */
   enabled: boolean
+  /** Feishu group (`oc_…`) a request without `chatId` goes to; absent makes `chatId` required. */
+  defaultChatId?: string
   /** Report upload. */
   upload: UploadSettings
 }

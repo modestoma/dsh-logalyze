@@ -12,7 +12,7 @@ import type { FeishuTopicService, FeishuTopicsVersion, TopicLaunchState } from '
 export const FEISHU_TOPICS_SERVICE = 'feishuTopics'
 
 /** The `feishuTopics` contract version this plugin speaks. */
-export const FEISHU_TOPICS_VERSION: FeishuTopicsVersion = 2
+export const FEISHU_TOPICS_VERSION: FeishuTopicsVersion = 3
 
 /** Result of looking the service up. */
 export type TopicsLookup =
