@@ -364,6 +364,26 @@ describe('report tracking', () => {
     expect(h.store.get(record.id)?.skipped).toEqual(['big.txt：超过总大小上限 3000 字节'])
   })
 
+  it('keeps leaving out attachments until the report with its growing skipped list fits', async () => {
+    const h = await harness()
+    const record = await h.start(analysis('req-1', 1))
+    for (let index = 0; index < 6; index += 1) await writeFile(join(h.workDir, 'report', `0${index}.txt`), 'z'.repeat(50))
+    h.tracker.shutdown()
+    h.turn(1, { reply: '结论' })
+    await vi.waitFor(() => { expect(h.store.get(record.id)?.revision).toBe(1) })
+    const stored = h.store.get(record.id)!
+    const maxBytes = Buffer.byteLength(renderLogReport(stored, stored.logs[0]!, [])) + 299
+
+    const next = await harness({ storeDir: h.storeDir, platform: h.platform })
+    next.topic.state = h.topic.state
+    next.settings.maxBytes = maxBytes
+    await next.tracker.boot()
+    await next.completed(1)
+    const revision = next.platform.revisions[0]!
+    expect([...revision.sizes.values()].reduce((sum, size) => sum + size, 0)).toBeLessThanOrEqual(maxBytes)
+    expect(next.store.get(record.id)?.logs[0]?.error).toBeUndefined()
+  })
+
   it('moves to the next key when the platform refuses a key reused with other files', async () => {
     const h = await harness()
     const record = await h.start(analysis('req-1', 1))

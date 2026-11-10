@@ -548,15 +548,17 @@ export class ReportTracker {
   }
 
   /**
-   * Choose one log's files against its rendered entry: the entry lists the
-   * left-out files, so a larger entry can leave out more; a few rounds settle it.
+   * Choose one log's files against its rendered entry. The entry lists the
+   * left-out files, so a larger entry can leave out more; the reserve only
+   * grows and each growth leaves out at least one more file, so this ends
+   * within one round per file.
    */
   private fit(record: AnalysisRecord, log: AnalysisLog, listing: ReportListing, settings: UploadSettings): { manifest: Manifest; entry: Buffer } {
     let reserve = Buffer.byteLength(renderLogReport(record, log, []))
-    for (let round = 0; ; round += 1) {
+    for (;;) {
       const manifest = buildManifest(listing, settings, reserve)
       const entry = Buffer.from(renderLogReport(record, log, manifest.skipped))
-      if (entry.byteLength <= reserve || round >= 3) return { manifest, entry }
+      if (entry.byteLength <= reserve) return { manifest, entry }
       reserve = entry.byteLength
     }
   }
