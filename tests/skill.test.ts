@@ -14,7 +14,12 @@ describe('entry skill', () => {
   it('lists usable applications in the catalog', () => {
     expect(renderCatalog([order])).toContain('| `order-service` | 订单服务 | 下单 \\| 支付 | 订单 | `OrderController` |')
     expect(renderCatalog([])).toContain('当前没有可用的应用')
-    expect(renderCatalog([])).toContain('在 dsh-repo 的「代码仓库 → 仓库」中添加仓库并打开「日志分析」')
+    expect(renderCatalog([])).toContain('应用的代码仓库要由管理员在 dsh-repo 的「代码仓库 → 仓库」中添加，并打开「日志分析」')
+    // A repository already added but missing its description points to drafting instead of asking for it again.
+    const pending = renderCatalog([], ['https://git.example.com/shop/billing.git'])
+    expect(pending).toContain('已经添加，但还缺少应用描述或日志分析 SKILL：`https://git.example.com/shop/billing.git`')
+    expect(pending).toContain('用户同意后用 `logalyze_init_repo` 起草')
+    expect(pending).not.toContain('由管理员')
     expect(renderEntrySkill([order], 3, true)).toContain('推送前可能还会弹出审批请用户再批准一次')
     const body = renderEntrySkill([order], 3, false)
     expect(body).toContain('`logalyze_dispatch`')
@@ -39,7 +44,7 @@ describe('entry skill', () => {
   it('is user-invocable only and renders the live catalog on each load', async () => {
     let apps: AppManifest[] = []
     const ready = Promise.withResolvers<void>()
-    const { factory, invalidate } = createEntrySkillProvider({ prepare: signal => abortable(ready.promise, signal), apps: () => apps, maxAppsPerRequest: () => 4, skillUpdates: () => false, autoInvoke: false, inRepositories: () => false, bundled })
+    const { factory, invalidate } = createEntrySkillProvider({ prepare: signal => abortable(ready.promise, signal), apps: () => apps, setupPending: () => [], maxAppsPerRequest: () => 4, skillUpdates: () => false, autoInvoke: false, inRepositories: () => false, bundled })
     const control = { signal: new AbortController().signal, invalidate: vi.fn() }
     const provider = factory(control)
     const [candidate] = await provider.list({})
@@ -64,6 +69,7 @@ describe('entry skill', () => {
     const { factory, invalidate } = createEntrySkillProvider({
       prepare: () => Promise.resolve(),
       apps: () => apps,
+      setupPending: () => [],
       maxAppsPerRequest: () => 4,
       skillUpdates: () => false,
       autoInvoke: true,
@@ -100,7 +106,7 @@ describe('entry skill', () => {
   })
 
   it('serves the bundled guides everywhere for users and children, never for model choice', async () => {
-    const { factory } = createEntrySkillProvider({ prepare: () => Promise.resolve(), apps: () => [order], maxAppsPerRequest: () => 4, skillUpdates: () => false, autoInvoke: true, inRepositories: cwd => cwd.startsWith('/repos'), bundled })
+    const { factory } = createEntrySkillProvider({ prepare: () => Promise.resolve(), apps: () => [order], setupPending: () => [], maxAppsPerRequest: () => 4, skillUpdates: () => false, autoInvoke: true, inRepositories: cwd => cwd.startsWith('/repos'), bundled })
     const provider = factory({ signal: new AbortController().signal, invalidate: vi.fn() })
     const listed = await provider.list({ cwd: '/project' })
     expect(listed.map(skill => skill.name)).toEqual(['logalyze', 'logalyze-kit', 'logalyze-improve'])

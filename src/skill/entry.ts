@@ -9,7 +9,7 @@
 import type { SkillDefinition, SkillProvider, SkillProviderControl } from '../host.ts'
 import type { AppManifest } from '../settings/contract.ts'
 import type { BundledSkill } from './bundled.ts'
-import { ADD_REPO_TOOL_NAME, DISPATCH_TOOL_NAME, IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from '../tool-names.ts'
+import { DISPATCH_TOOL_NAME, IMPROVE_TOOL_NAME, INIT_REPO_TOOL_NAME, SHOW_TOOL_NAME } from '../tool-names.ts'
 
 /** Entry skill name, addressed as `/logalyze`. */
 export const ENTRY_SKILL_NAME = 'logalyze'
@@ -52,11 +52,15 @@ function cell(text: string): string {
 /**
  * Render the application catalog as a Markdown table.
  * @param apps - usable applications.
+ * @param pending - writable repositories whose description or SKILL is missing or invalid, which can be drafted.
  * @returns the table, or a notice when none is usable.
  */
-export function renderCatalog(apps: readonly AppManifest[]): string {
+export function renderCatalog(apps: readonly AppManifest[], pending: readonly string[] = []): string {
+  if (apps.length === 0 && pending.length > 0) {
+    return `当前没有可用的应用，不要自行分析日志。这些应用仓库已经添加，但还缺少应用描述或日志分析 SKILL：${pending.map(url => `\`${url}\``).join('、')}。告诉用户可以先起草接入；用户同意后用 \`${INIT_REPO_TOOL_NAME}\` 起草（可以附上用户给的样例日志），否则结束本次回复。`
+  }
   if (apps.length === 0) {
-    return `当前没有可用的应用，不要自行分析日志。用户给出了应用代码仓库的 https 地址时，用 \`${ADD_REPO_TOOL_NAME}\` 添加并按工具结果继续；否则请用户提供仓库的 https 地址（不支持 ssh 地址和本机路径），或在 dsh-repo 的「代码仓库 → 仓库」中添加仓库并打开「日志分析」，然后结束本次回复。`
+    return '当前没有可用的应用，不要自行分析日志。告诉用户：应用的代码仓库要由管理员在 dsh-repo 的「代码仓库 → 仓库」中添加，并打开「日志分析」；然后结束本次回复。'
   }
   const rows = apps.map(app => `| \`${app.id}\` | ${cell(app.name)} | ${cell(app.description)} | ${cell(app.aliases.join('、') || '—')} | ${cell(app.logHints.map(hint => `\`${hint}\``).join(' ') || '—')} |`)
   return ['| 应用 id | 名称 | 描述 | 别名 | 日志特征 |', '| --- | --- | --- | --- | --- |', ...rows].join('\n')
@@ -77,9 +81,10 @@ function improveStep(): string {
  * @param apps - usable applications at load time.
  * @param maxAppsPerRequest - dispatch task ceiling.
  * @param skillUpdates - whether SKILL improvement is enabled.
+ * @param pending - writable repositories that can be drafted, named while no application is usable.
  * @returns Markdown instructions.
  */
-export function renderEntrySkill(apps: readonly AppManifest[], maxAppsPerRequest: number, skillUpdates: boolean): string {
+export function renderEntrySkill(apps: readonly AppManifest[], maxAppsPerRequest: number, skillUpdates: boolean, pending: readonly string[] = []): string {
   return `# 观象：日志分析入口
 
 观其象，知其因。没有 \`${DISPATCH_TOOL_NAME}\` 工具可用时（例如你是子 Agent），忽略本 SKILL，按普通方式完成任务。
@@ -88,13 +93,13 @@ export function renderEntrySkill(apps: readonly AppManifest[], maxAppsPerRequest
 
 ## 应用目录
 
-${renderCatalog(apps)}
+${renderCatalog(apps, pending)}
 
 ## 步骤
 
 1. **读需求。** 从 \`/logalyze\` 之后的文字、消息附带的附件、消息里的下载 URL 中找出：要分析的现象、时间范围、关键标识（用户 id、订单号、请求 id 等）、日志位置。
 2. **确定应用。** 拆分单位是「日志来源 → 应用」。
-   - 用户或调用方已经写明应用 id 时直接使用；该 id 不在上表中时，告诉用户这个应用未注册（列出可用的应用 id），然后结束，不要改用别的应用。用户给出了该应用的 git 地址时，可以用 \`${ADD_REPO_TOOL_NAME}\` 接入。
+   - 用户或调用方已经写明应用 id 时直接使用；该 id 不在上表中时，告诉用户这个应用未注册（列出可用的应用 id），然后结束，不要改用别的应用。要接入新应用，请管理员在「代码仓库 → 仓库」中添加它的仓库并打开「日志分析」。
    - 否则按名称、别名、描述和日志特征匹配。只有附件文件名或内容能区分时，可以只看日志开头几十行来判断，不要通读或解压整个日志。
    - 用户没有输入 \`/logalyze\`、是你按任务匹配自行加载了本 SKILL，而日志明显不属于上表任何应用时，不要派发也不要追问，按普通方式完成用户的请求。
    - 其余无法确定或同时匹配多个应用的情况，用 \`ask_user_question\`（不可用时直接在回复中提问并结束）让用户选择，不要猜。
@@ -138,6 +143,8 @@ export interface EntrySkillSource {
   prepare(signal: AbortSignal | undefined): Promise<void>
   /** Usable applications. */
   apps(): readonly AppManifest[]
+  /** Writable repositories whose description or SKILL can be drafted. */
+  setupPending(): readonly string[]
   /** Current dispatch task ceiling. */
   maxAppsPerRequest(): number
   /** Whether SKILL improvement is enabled. */
@@ -211,7 +218,7 @@ export function createEntrySkillProvider(source: EntrySkillSource): {
           if (guide !== undefined) return { ...guide.summary, content: guide.content }
           if (requested.name !== ENTRY_SKILL_NAME) return undefined
           await source.prepare(options.signal)
-          return { ...summary(), content: renderEntrySkill(source.apps(), source.maxAppsPerRequest(), source.skillUpdates()) }
+          return { ...summary(), content: renderEntrySkill(source.apps(), source.maxAppsPerRequest(), source.skillUpdates(), source.setupPending()) }
         },
       }
     },

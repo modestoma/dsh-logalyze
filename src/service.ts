@@ -1,5 +1,5 @@
 /**
- * 观象运行时的组装：生效设置、应用注册表与仓库清单跟随、入口 SKILL、六个
+ * 观象运行时的组装：生效设置、应用注册表与仓库清单跟随、入口 SKILL、五个
  * 工具的注册条件、分析接口令牌和分析报告回传，并为设置面板提供状态与写入口。
  *
  * @module dsh-logalyze/service
@@ -12,7 +12,7 @@ import { CatalogFollower } from './apps/catalog.ts'
 import { RepoRegistry } from './apps/registry.ts'
 import type { LogalyzeConfig } from './config.ts'
 import { describeIssue } from './config.ts'
-import { DSH_REPOS_SERVICE, LOG_ANALYSIS_FEATURE, ReposClient } from './deps/repos.ts'
+import { DSH_REPOS_SERVICE, ReposClient } from './deps/repos.ts'
 import type { DshRepos } from './deps/repos-contract.ts'
 import { FEISHU_TOPICS_STATUS_EVENT } from './deps/topics-contract.ts'
 import { FEISHU_TOPICS_SERVICE, lookupTopics, topicStatesOf } from './deps/topics.ts'
@@ -21,7 +21,6 @@ import { Dispatcher } from './dispatch/tool.ts'
 import type { HostContext, HostCredentials, ToolActivationContext, ToolDefinition, WorkingDirectoryService } from './host.ts'
 import { SkillViewer } from './improve/show.ts'
 import { SkillImprover } from './improve/tool.ts'
-import { RepoAdder } from './onboard/add.ts'
 import { RepoInitializer } from './onboard/init.ts'
 import type { CommandRunner } from './report/command.ts'
 import { defaultReportsDir, ReportStore } from './report/store.ts'
@@ -64,7 +63,6 @@ export class LogalyzeService {
   private readonly dispatcher: Dispatcher
   private readonly improver: SkillImprover
   private readonly viewer: SkillViewer
-  private readonly adder: RepoAdder
   private readonly initializer: RepoInitializer
   private readonly skill: ReturnType<typeof createEntrySkillProvider>
   private readonly reports: ReportTracker
@@ -105,7 +103,6 @@ export class LogalyzeService {
     this.improver = new SkillImprover({ ...children, repos: this.repos })
     this.viewer = new SkillViewer({ registry: this.registry, repos: this.repos })
     this.dispatcher = new Dispatcher({ ...children, gaps: this.improver })
-    this.adder = new RepoAdder({ registry: this.registry, addRepo: (spec, caller) => this.catalog.add(spec, caller) })
     this.initializer = new RepoInitializer({ ...children, repos: this.repos })
     this.reports = new ReportTracker({
       store: new ReportStore(options.reportsDir ?? defaultReportsDir(), warn),
@@ -117,6 +114,7 @@ export class LogalyzeService {
     this.skill = createEntrySkillProvider({
       prepare: signal => this.prepareCatalog(signal),
       apps: () => this.registry.readyApps().map(ready => ready.app),
+      setupPending: () => this.registry.setupPending(),
       maxAppsPerRequest: () => this.settings.get().maxAppsPerRequest,
       skillUpdates: () => this.settings.get().skillUpdates.enabled,
       autoInvoke: config.autoInvoke,
@@ -135,7 +133,7 @@ export class LogalyzeService {
   }
 
   /**
-   * Register the six tools and the Session listeners they need; called once
+   * Register the five tools and the Session listeners they need; called once
    * from `apply()`. The definitions stay fixed because a step drops a tool
    * whose registration changed after the step resolved its tools. The
    * improvement tool counts finished turns from `turn/end` Session events.
@@ -153,7 +151,6 @@ export class LogalyzeService {
     register(this.dispatcher.definition(), hasApps, 'dispatch')
     register(this.improver.definition(), () => this.settings.get().skillUpdates.enabled && this.registry.readyApps().some(ready => ready.writable), 'skill improvement')
     register(this.viewer.definition(), hasApps, 'skill view')
-    register(this.adder.definition(), () => true, 'add repository')
     register(this.initializer.initDefinition(), () => this.registry.setupPending().length > 0, 'draft repository setup')
     register(this.initializer.submitDefinition(), context => this.initializer.hasDraft(context.agent.session.header.id), 'submit repository setup')
   }
@@ -340,16 +337,6 @@ export class LogalyzeService {
   async reset(): Promise<StateWire> {
     await this.settings.reset()
     return await this.state()
-  }
-
-  /**
-   * Sync one application repository again, or all of them, in the background.
-   * @param url - address to sync; omitted syncs every repository.
-   * @throws SettingsError when the address is not an application repository.
-   */
-  sync(url?: string): void {
-    if (url !== undefined && !this.registry.has(url)) throw new SettingsError(`仓库清单中没有打开「${LOG_ANALYSIS_FEATURE.title}」的仓库：${url}`)
-    void (url === undefined ? this.registry.syncAll() : this.registry.syncUrls([url]))
   }
 
   private onRegistryChange(): void {

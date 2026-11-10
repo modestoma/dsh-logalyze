@@ -15,7 +15,7 @@ import type { DshRepos, DshReposVersion, SnapshotLease } from './repos-contract.
 export const DSH_REPOS_SERVICE = 'dshRepos'
 
 /** The `dshRepos` contract version this plugin speaks. */
-export const DSH_REPOS_VERSION: DshReposVersion = 6
+export const DSH_REPOS_VERSION: DshReposVersion = 7
 
 /** The feature this plugin registers; it uses the catalog repositories that have it turned on. */
 export const LOG_ANALYSIS_FEATURE = { id: 'log-analysis', title: '日志分析', description: '观象从这些仓库读取应用描述和日志分析 SKILL，并在派发时读取代码' } as const
@@ -50,7 +50,7 @@ export function lookupRepos(value: unknown): ReposLookup {
  */
 export function unavailableMessage(availability: 'missing' | 'incompatible'): string {
   return availability === 'missing'
-    ? `观象需要 dsh-repo 插件提供的 ${DSH_REPOS_SERVICE} 服务来拉取仓库和提交 SKILL 修改；请安装 dsh-repo`
+    ? `观象需要 dsh-repo 插件提供的 ${DSH_REPOS_SERVICE} 服务来读取仓库和提交 SKILL 修改；请安装 dsh-repo`
     : `dsh-repo 的 ${DSH_REPOS_SERVICE} 服务与观象不兼容（需要服务版本 ${DSH_REPOS_VERSION}）；请换用兼容的 dsh-repo`
 }
 
@@ -99,14 +99,18 @@ export class ReposClient {
 
   /**
    * The application repositories: the catalog repositories with the log
-   * analysis feature turned on, following the catalog branch.
+   * analysis feature turned on, each read at the feature's branch, else the
+   * entry's baseline branch.
    * @returns them in catalog order; empty while the service is missing or incompatible.
    */
   async appRepos(): Promise<AppRepo[]> {
     const lookup = this.lookup()
     if (lookup.availability !== 'ready') return []
     const repos = await lookup.service.repoList({ feature: LOG_ANALYSIS_FEATURE.id })
-    return repos.map(repo => ({ url: repo.url, ...repo.branch === undefined ? {} : { branch: repo.branch }, writable: repo.access !== 'read' }))
+    return repos.map((repo) => {
+      const branch = repo.features.find(feature => feature.id === LOG_ANALYSIS_FEATURE.id)?.branch ?? repo.base
+      return { url: repo.url, ...branch === undefined ? {} : { branch }, writable: repo.access !== 'read' }
+    })
   }
 
   /** @returns the provider's mirror directory, or undefined while the service or the directory is unavailable. */
@@ -126,7 +130,7 @@ export class ReposClient {
   /**
    * Hold a snapshot while `use` runs.
    * @param repo - catalog address.
-   * @param ref - branch, tag, or commit; undefined: the catalog entry's branch.
+   * @param ref - branch, tag, or commit; undefined: the catalog entry's baseline branch.
    * @param signal - cancellation.
    * @param use - work on the held snapshot.
    * @returns what `use` returned; the snapshot is released afterwards.

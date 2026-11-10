@@ -1,6 +1,8 @@
 /**
- * SKILL 改进和接入起草共用的工作区准备：在运行目录里经 `dshRepos` 从指定提交
- * 创建工作区 `repo/`（推送到观象起好名字的新分支），并把样例日志放进运行目录；
+ * SKILL 改进和接入起草共用的工作区准备：在运行目录里经 `dshRepos` 创建工作区
+ * `repo/`，起点是仓库清单里基线分支的最新提交，推送的分支由 dsh-repo 按它的
+ * 分支命名模板生成（同一会话的工作区用同一个分支），合并请求合回基线分支；
+ * 并把样例日志放进运行目录；
  * 子 Agent 结束后把检查过的改动写成 `changes.diff`。
  *
  * @module dsh-logalyze/runs/workspace
@@ -25,12 +27,6 @@ export interface WorkspaceRequest {
   readonly exec: ToolRunContext
   /** Catalog address of the repository. */
   readonly repo: string
-  /** Branch the work merges into; undefined: the remote's default branch. */
-  readonly base: string | undefined
-  /** Commit the workspace starts from. */
-  readonly commit: string
-  /** New remote branch the workspace pushes to. */
-  readonly branch: string
   /** Run directory holding the workspace, the logs, and the reason and diff files. */
   readonly workDir: string
   /** Admitted sample logs, downloaded into {@link workDir}. */
@@ -52,7 +48,7 @@ export interface OpenedWorkspace {
 
 /**
  * Create the run directory and the workspace, then download the sample logs.
- * @param request - repository, start commit, branch, and logs.
+ * @param request - repository, run directory, and logs.
  * @returns the workspace and the logs.
  * @throws the cancellation reason, the workspace failure naming {@link WorkspaceRequest.subject}, or a download failure.
  */
@@ -65,9 +61,6 @@ export async function openWorkspace(request: WorkspaceRequest): Promise<OpenedWo
     workspace = await request.repos.require().workspaceCreate({
       repo: request.repo,
       path: repoDir,
-      ...request.base === undefined ? {} : { base: request.base },
-      commit: request.commit,
-      branch: request.branch,
       agent: request.parent,
       ...exec.callId === undefined ? {} : { callId: exec.callId },
       signal: exec.signal,

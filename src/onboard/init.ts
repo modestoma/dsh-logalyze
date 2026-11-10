@@ -30,7 +30,7 @@ import type { PushStatus } from '../runs/push.ts'
 import { newRunId, resolveRunBase, RUNS_SEGMENTS, topLevelAgent } from '../runs/run-dir.ts'
 import { openWorkspace, writeDiff } from '../runs/workspace.ts'
 import type { AppManifest, EditableSettings } from '../settings/contract.ts'
-import { ADD_REPO_TOOL_NAME, INIT_REPO_TOOL_NAME, SUBMIT_INIT_TOOL_NAME } from '../tool-names.ts'
+import { INIT_REPO_TOOL_NAME, SUBMIT_INIT_TOOL_NAME } from '../tool-names.ts'
 import { messageOf } from '../util/errors.ts'
 import { AGENTS_DIR, checkInitDraft } from './draft.ts'
 import type { InitDraft } from './draft.ts'
@@ -193,7 +193,7 @@ export function renderInitRepoValue(value: InitRepoValue): ContentBlock[] {
 export function renderSubmitInitValue(value: SubmitInitValue): ContentBlock[] {
   const where = `${value.repo} 的分支 ${value.branch}（目标 ${value.target}）`
   const text = {
-    opened: `已提交到 ${where} 并创建合并请求：${value.mergeRequestUrl ?? ''}。合并后观象下一次加载 /logalyze 时启用应用 ${value.app}。`,
+    opened: `已提交到 ${where} 并创建合并请求：${value.mergeRequestUrl ?? ''}。合并后，日志分析读取的分支包含这些文件时，观象在下一次加载 /logalyze 时启用应用 ${value.app}。`,
     pushed: `已提交到 ${where}，但创建合并请求失败（${value.mergeRequestError ?? '未知原因'}）；请在代码托管平台上从该分支手动创建。`,
     exists: `${where} 在远端已有其他提交，或这份初稿已经提交过，本次没有提交。`,
     rejected: '授权被拒绝，没有提交：用户拒绝了，或会话的审批策略为 never（例如「完全访问」权限模式）。初稿文件仍在运行目录中，可以手动提交。',
@@ -283,7 +283,7 @@ export class RepoInitializer {
     const parent = topLevelAgent(exec, INIT_REPO_TOOL_NAME)
     const { registry } = this.deps
     const status = registry.statusOf(url)
-    if (status === undefined) throw new Error(`${url} 不在观象的应用仓库列表中，先用 ${ADD_REPO_TOOL_NAME} 添加`)
+    if (status === undefined) throw new Error(`${url} 不在观象的应用仓库列表中；请管理员在 dsh-repo「代码仓库 → 仓库」中添加它并打开「日志分析」`)
     if (status.available) throw new Error(`${url} 的应用「${status.app?.id ?? ''}」已经可用；改进它的 SKILL 走派发结果中的 SKILL 改进`)
     if (!status.writable) throw new Error(`${url} 在 dsh-repo 仓库清单中的权限是「只读」，不能推送接入草稿；请在 dsh-repo「代码仓库 → 仓库」把权限改为「可改代码」`)
     if (!registry.setupPending().includes(url)) throw new Error(`${url} 还不能起草：${status.error ?? status.phase}`)
@@ -292,8 +292,6 @@ export class RepoInitializer {
     const { effectiveDir, baseDir } = await resolveRunBase(parent, this.deps.workingDirectory(), exec.signal)
     const sources = await admitLogs(parsed.data.logs ?? [], effectiveDir, settings.download)
 
-    // `setupPending` lists only repositories with a synced commit.
-    const commit = status.commit as string
     const runId = newRunId(this.deps.now?.() ?? new Date())
     const workDir = join(baseDir, ...RUNS_SEGMENTS, runId, 'init')
     const { workspace, repoDir, logs } = await openWorkspace({
@@ -301,15 +299,13 @@ export class RepoInitializer {
       parent,
       exec,
       repo: url,
-      base: registry.branchOf(url),
-      commit,
-      branch: `logalyze/init-${runId}`,
       workDir,
       sources,
       download: settings.download,
       ...this.deps.fetch === undefined ? {} : { fetch: this.deps.fetch },
       subject: `仓库 ${url} `,
     })
+    const commit = workspace.baseCommit
     const prompt = renderInitPrompt({
       url,
       commit,
@@ -393,7 +389,7 @@ export class RepoInitializer {
       dir: join(task.workDir, WORKSPACE_DIR),
       message: `${title}\n\n${reason}\n\nProposed-by: 观象 Logalyze\nBase-commit: ${changes.base}\n`,
       title,
-      body: `由观象起草的应用描述 ${AGENTS_DIR}/logalyze.yaml 与日志分析 SKILL ${AGENTS_DIR}/skills/${app.skill}/（基于提交 ${changes.base.slice(0, 12)}，会话 ${task.sessionId}）。合并后观象下一次加载 /logalyze 时启用该应用。说明：${reason.slice(0, REASON_DESCRIPTION_CHARS)}`,
+      body: `由观象起草的应用描述 ${AGENTS_DIR}/logalyze.yaml 与日志分析 SKILL ${AGENTS_DIR}/skills/${app.skill}/（基于提交 ${changes.base.slice(0, 12)}，会话 ${task.sessionId}）。合并后，日志分析读取的分支包含这些文件时，观象在下一次加载 /logalyze 时启用该应用。说明：${reason.slice(0, REASON_DESCRIPTION_CHARS)}`,
     })
     if (outcome.status === 'opened' || outcome.status === 'pushed') task.submitted = true
     return { ...base, ...outcome }

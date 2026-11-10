@@ -16,44 +16,6 @@ export const MAX_TIMER_DELAY_MS = 2_147_483_647
 
 const HOST_NAME = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]*[a-z0-9])?$/
 
-/**
- * Whether a string is a repository address the `dshRepos` service mirrors:
- * an `https` URL. SSH, scp-like `user@host:path`, `git://`, `file:`, local
- * paths, and other transports are refused.
- * @param value - candidate repository address.
- * @returns whether it is accepted.
- */
-export function isAcceptedGitUrl(value: string): boolean {
-  if (value.startsWith('-') || /\s/.test(value)) return false
-  try {
-    return new URL(value).protocol === 'https:'
-  } catch {
-    // Not a URL (an scp-like address or a local path): refused.
-    return false
-  }
-}
-
-/**
- * Whether a branch name is safe to pass as a git ref argument.
- * @param value - candidate branch name.
- * @returns whether it is accepted.
- */
-export function isAcceptedBranch(value: string): boolean {
-  return value !== ''
-    && !value.startsWith('-')
-    && !value.includes('..')
-    && !/[\s~^:?*[\\]/.test(value)
-    && !value.endsWith('/')
-    && !value.endsWith('.lock')
-}
-
-/** Arguments of `logalyze_add_repo`: git address and optional branch. */
-export const repoSchema = z.object({
-  url: z.string().trim().min(1, 'git 地址不能为空').refine(isAcceptedGitUrl, '不支持的 git 地址（只支持 https 地址，不支持 ssh、user@host:path 和本机路径）'),
-  branch: z.string().trim().optional().transform(value => value === '' ? undefined : value)
-    .refine(value => value === undefined || isAcceptedBranch(value), '分支名不合法'),
-}).strict()
-
 const hostSchema = z.string().trim().toLowerCase()
   .transform(value => value.replace(/^\*\./, ''))
   .refine(value => HOST_NAME.test(value), '域名不合法：只填主机名，例如 oss.example.com')

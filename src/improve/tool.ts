@@ -34,9 +34,10 @@
  */
 
 import { randomBytes } from 'node:crypto'
-import { basename, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { z } from 'zod'
-import { disablesUserInvocation, skillDir, skillNameOf } from '../apps/manifest.ts'
+import { checkAppManifest, disablesUserInvocation, skillDir, skillNameOf } from '../apps/manifest.ts'
+import { MAX_REPO_FILE_BYTES, treeReader } from '../apps/tree.ts'
 import type { RepoRegistry } from '../apps/registry.ts'
 import { describeIssue } from '../config.ts'
 import type { ReposClient } from '../deps/repos.ts'
@@ -435,23 +436,24 @@ export class SkillImprover {
     const { bases, feedback } = request
     const tasks = bases.map(basis => basis.record.task)
     const caseRequired = tasks.length > 0
-    const { app, url, commit } = this.deps.registry.readyApp(request.app.id)
-    const base = this.deps.registry.branchOf(url)
+    const { app: analyzed, url } = this.deps.registry.readyApp(request.app.id)
     const improveDir = join(request.parentDir, `improve-${randomBytes(3).toString('hex')}`)
     const { workspace, repoDir, logs: extra } = await openWorkspace({
       repos: this.deps.repos,
       parent,
       exec,
       repo: url,
-      base,
-      commit,
-      branch: `logalyze/skill-${app.id}-${basename(request.parentDir)}`,
       workDir: improveDir,
       sources: request.sources,
       download: settings.download,
       ...this.deps.fetch === undefined ? {} : { fetch: this.deps.fetch },
-      subject: `应用「${app.id}」`,
+      subject: `应用「${analyzed.id}」`,
     })
+    // The workspace starts from the baseline branch, whose description may name another SKILL than the analysed branch.
+    const baseline = await checkAppManifest(treeReader(repoDir, MAX_REPO_FILE_BYTES))
+    if (!baseline.ok) throw new Error(`基线分支 ${workspace.base} 上应用「${analyzed.id}」的描述或 SKILL 不可用：${baseline.error}；先在基线分支上修好再改进 SKILL`)
+    if (baseline.app.id !== analyzed.id) throw new Error(`基线分支 ${workspace.base} 上的应用描述声明的是应用「${baseline.app.id}」，不是「${analyzed.id}」；先让两个分支的应用描述一致再改进 SKILL`)
+    const { app } = baseline
     const logs: ChildLog[] = [...distinct(tasks.flatMap(task => task.logs)).map(path => ({ path })), ...extra]
     const analyses: ImproveAnalysis[] = bases.map(({ record: { task }, gap }) => ({
       commit: task.commit,
@@ -462,7 +464,7 @@ export class SkillImprover {
     }))
     const prompt = renderImprovePrompt({
       app,
-      commit,
+      commit: workspace.baseCommit,
       analyses,
       ...feedback === undefined ? {} : { feedback },
       logs,

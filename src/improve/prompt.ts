@@ -53,7 +53,7 @@ export interface ImprovePromptInput {
 }
 
 function analysisSection(analysis: ImproveAnalysis, index: number, commit: string): string {
-  const version = analysis.commit === commit ? '' : `\n\n这次分析时的提交是 \`${analysis.commit.slice(0, 12)}\`，之后仓库有更新；以当前工作区中的 SKILL 为准修改。`
+  const version = analysis.commit === commit ? '' : `\n\n这次分析时的提交是 \`${analysis.commit.slice(0, 12)}\`，和工作区的提交不同（仓库有更新，或分析读的分支不是基线分支）；以当前工作区中的 SKILL 为准修改。`
   const gap = analysis.gapPath === undefined
     ? '分析子 Agent 当时没有发现 SKILL 的不足，是按 SKILL 现有的记录分析的；改进的依据是下面的用户反馈。'
     : `分析子 Agent 认为 SKILL 没能很好地覆盖这个问题，记录写在 \`${analysis.gapPath}\`，先读它。`

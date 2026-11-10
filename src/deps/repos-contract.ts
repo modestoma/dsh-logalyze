@@ -1,11 +1,12 @@
 /**
- * 观象对 `dshRepos` 服务（version 6）的需求：只声明观象调用的方法和读取的
+ * 观象对 `dshRepos` 服务（version 7）的需求：只声明观象调用的方法和读取的
  * 字段。服务在运行时经 `ctx.get('dshRepos')` 取得，由任何按这一约定提供该服务
  * 的插件实现；观象不依赖提供方的包。
  *
- * 服务方维护仓库清单：只有清单里的仓库可以访问，每个仓库有权限（读、改代码、
- * 合并）和其他插件注册的功能开关。观象注册「日志分析」功能，只使用打开了这个
- * 功能的仓库。
+ * 服务方维护仓库清单：只有清单里的仓库可以访问，仓库只能在服务方的设置页添加。
+ * 每个仓库有基线分支（改代码的起点和合并请求的目标）、权限（读、改代码、合并）
+ * 和其他插件注册的功能开关，每个打开的功能可以有自己的分支。观象注册「日志分析」
+ * 功能，只使用打开了这个功能的仓库，分析时读这个功能的分支。
  *
  * 快照是某个提交的只读普通文件（没有 `.git`），每次取用前服务方先从远端拉取。
  * 工作区是普通 git 克隆，`origin` 经服务方的本机 git 代理访问远端；推送和合并
@@ -17,7 +18,7 @@
  */
 
 /** The `dshRepos` service version this plugin calls. */
-export type DshReposVersion = 6
+export type DshReposVersion = 7
 
 /** Options every call accepts. */
 export interface CallOptions {
@@ -74,7 +75,7 @@ export interface SnapshotLease {
 /** Parameters of {@link DshRepos.snapshotAcquire}. */
 export interface SnapshotAcquireParams extends CallOptions {
   readonly repo: string
-  /** Branch, tag, or full commit id; default: the catalog entry's branch, or the remote's default branch. */
+  /** Branch, tag, or full commit id; default: the catalog entry's baseline branch, or the remote's default branch. */
   readonly ref?: string
 }
 
@@ -83,12 +84,17 @@ export interface WorkspaceCreateParams extends AgentWriteOptions {
   readonly repo: string
   /** Absolute directory of the new workspace: missing or empty (its parent is created). */
   readonly path: string
-  /** Branch the work merges into; default: the remote's default branch. */
+  /** Branch the work starts from and merges into; default: the catalog entry's baseline branch, or the remote's default branch. */
   readonly base?: string
-  /** Full commit id on {@link base} to start from. */
+  /** Full commit id on {@link base} to start from; default: the head of {@link base}. */
   readonly commit?: string
-  /** New remote branch the workspace pushes to; created by the first push. Never the default branch, {@link base}, or a protected branch. */
-  readonly branch: string
+  /**
+   * Remote branch the workspace pushes to; default: a name the provider
+   * generates from its branch name template, the same for every workspace
+   * of one Session. A branch the remote has is continued from its head; a new
+   * one must match the provider's branch name pattern.
+   */
+  readonly branch?: string
 }
 
 /** A workspace: an ordinary git clone whose `origin` reaches the remote through the provider. */
@@ -171,42 +177,23 @@ export interface RepoFeature {
   readonly description?: string
 }
 
+/** A feature turned on for a catalog repository. */
+export interface RepoFeatureSwitch {
+  readonly id: string
+  /** Branch the feature uses; absent uses the entry's baseline branch. */
+  readonly branch?: string
+}
+
 /** One catalog repository, as {@link DshRepos.repoList} returns it. */
 export interface CatalogRepo {
   readonly id: string
   /** Address as the catalog stores it. */
   readonly url: string
-  /** Branch to follow; absent follows the remote's default branch. */
-  readonly branch?: string
+  /** Baseline branch: where code changes start and merge into; absent uses the remote's default branch. */
+  readonly base?: string
   readonly access: RepoAccess
-  /** Feature ids turned on for the repository. */
-  readonly features: readonly string[]
-}
-
-/**
- * Parameters of {@link DshRepos.repoAdd}. With an Agent the provider asks
- * `access/authorize` (level `admin`) for its Session and, while its settings
- * say so, shows its approval card (a refusal rejects with `declined`, writes
- * turned off with `forbidden`).
- */
-export interface RepoAddParams extends CallOptions {
-  /** HTTPS address on a configured host. */
-  readonly repo: string
-  readonly branch?: string
-  /** Access of a new entry; an existing entry keeps its access. Default `read`. */
-  readonly access?: RepoAccess
-  /** Feature ids to turn on. */
-  readonly features?: readonly string[]
-  /** The Agent the change is made for. */
-  readonly agent?: CallerAgent
-  /** The calling tool call, so the approval card shows that call. */
-  readonly callId?: string
-}
-
-/** Outcome of {@link DshRepos.repoAdd}. */
-export interface RepoAddResult {
-  readonly status: 'added' | 'updated' | 'unchanged'
-  readonly repo: CatalogRepo
+  /** Features turned on for the repository. */
+  readonly features: readonly RepoFeatureSwitch[]
 }
 
 /** The `dshRepos` methods this plugin calls. */
@@ -229,12 +216,6 @@ export interface DshRepos {
    * @returns disposer that stops the observation.
    */
   repoOnChange(listener: () => void): () => void
-  /**
-   * Add a repository to the catalog, or turn features on for the entry holding it.
-   * @returns the outcome and the entry.
-   * @throws `conflict` when the entry follows another branch; `not-allowed` for an address on an unconfigured host; with an Agent, `declined` when the user did not approve and `forbidden` when writes are off or `access/authorize` refused.
-   */
-  repoAdd(params: RepoAddParams): Promise<RepoAddResult>
   /** @returns the settings this plugin reads. */
   settingsGet(): RepoPublicSettings
   /**
