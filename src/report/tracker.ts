@@ -86,7 +86,7 @@ interface TurnEndData {
 type UploadOutcome = { readonly ok: true; readonly reportUrl: string } | { readonly ok: false; readonly error: string; readonly retryable: boolean }
 
 /** A report directory checked for one upload pass. */
-type Prepared = { readonly ok: true; readonly dir: string; readonly manifest: Manifest } | { readonly ok: false; readonly error: string; readonly retryable: boolean }
+type Prepared = { readonly ok: true; readonly dir: string; readonly listing: ReportListing } | { readonly ok: false; readonly error: string; readonly retryable: boolean }
 
 function textOf(content: unknown): string {
   if (!Array.isArray(content)) return ''
@@ -535,19 +535,30 @@ export class ReportTracker {
     })
   }
 
-  /** Check the report directory and choose the files of this upload pass. */
+  /** Check and list the report directory once for this upload pass. */
   private async prepare(record: AnalysisRecord): Promise<Prepared> {
     const dir = this.dirOf(record)
-    let manifest: Manifest
     try {
       await mkdir(dir, { recursive: true })
       if (!(await lstat(dir)).isDirectory()) return { ok: false, retryable: false, error: `报告目录 ${dir} 不是普通目录（可能是符号链接），没有上传` }
-      manifest = buildManifest(await listReport(dir), this.deps.upload())
+      return { ok: true, dir, listing: await listReport(dir) }
     } catch (error) {
       return { ok: false, retryable: true, error: `读取报告目录失败：${messageOf(error)}` }
     }
-    await this.mutate(record.id, current => ({ ...current, skipped: [...manifest.skipped] }))
-    return { ok: true, dir, manifest }
+  }
+
+  /**
+   * Choose one log's files against its rendered entry: the entry lists the
+   * left-out files, so a larger entry can leave out more; a few rounds settle it.
+   */
+  private fit(record: AnalysisRecord, log: AnalysisLog, listing: ReportListing, settings: UploadSettings): { manifest: Manifest; entry: Buffer } {
+    let reserve = Buffer.byteLength(renderLogReport(record, log, []))
+    for (let round = 0; ; round += 1) {
+      const manifest = buildManifest(listing, settings, reserve)
+      const entry = Buffer.from(renderLogReport(record, log, manifest.skipped))
+      if (entry.byteLength <= reserve || round >= 3) return { manifest, entry }
+      reserve = entry.byteLength
+    }
   }
 
   /** Upload the report of one log as a revision of the record's current content. */
@@ -556,9 +567,11 @@ export class ReportTracker {
     for (let attempt = 0; ; attempt += 1) {
       const log = this.deps.store.get(id)?.logs.find(item => item.ref === ref)
       if (log === undefined) return { ok: false, retryable: false, error: `分析记录里没有日志 ${ref}` }
-      const entry = Buffer.from(renderLogReport(record, log, prepared.manifest.skipped))
+      const { manifest, entry } = this.fit(record, log, prepared.listing, settings)
+      const skipped = [...manifest.skipped]
+      await this.mutate(id, current => (sameList(current.skipped, skipped) ? undefined : { ...current, skipped }))
       if (entry.byteLength > settings.maxMarkdownBytes) return { ok: false, retryable: false, error: `报告入口 ${entry.byteLength} 字节，超过 Markdown 文件上限 ${settings.maxMarkdownBytes}，没有上传` }
-      const total = entry.byteLength + prepared.manifest.files.reduce((sum, file) => sum + file.size, 0)
+      const total = entry.byteLength + manifest.files.reduce((sum, file) => sum + file.size, 0)
       if (total > settings.maxBytes) return { ok: false, retryable: false, error: `报告共 ${total} 字节，超过总大小上限 ${settings.maxBytes}，没有上传` }
       try {
         const reportUrl = await uploadRevision(this.deps.platform, {
@@ -566,7 +579,7 @@ export class ReportTracker {
           key: `logalyze:${record.id}:${ref}:r${record.revision}:g${log.generation}`,
           entry,
           dir: prepared.dir,
-          files: prepared.manifest.files,
+          files: manifest.files,
           timeoutMs: settings.timeoutMs,
           concurrency: settings.concurrency,
         })
@@ -603,6 +616,10 @@ export class ReportTracker {
     const shown = new Set(record.logs.filter(log => log.reportUrl !== undefined).map(log => log.ref))
     await this.mutate(id, current => ({ ...current, logs: current.logs.map(log => (shown.has(log.ref) ? { ...log, linked: true } : log)) }))
   }
+}
+
+function sameList(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((item, index) => item === right[index])
 }
 
 /** A log whose next upload is due again because the content changed. */

@@ -13,9 +13,6 @@ import { REPORT_EXTENSIONS, REPORT_PATH_MAX_BYTES, REPORT_PATH_MAX_SEGMENTS } fr
 import type { UploadSettings } from '../settings/contract.ts'
 import type { ReportListing } from './files.ts'
 
-/** Bytes kept free for the entry when choosing files, before the entry is rendered. */
-export const ENTRY_RESERVE_BYTES = 256 * 1024
-
 const SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/u
 
 /**
@@ -51,14 +48,15 @@ export interface Manifest {
  * Choose the files of one revision from a report directory listing.
  * @param listing - the directory listing.
  * @param limits - upload limits.
+ * @param entryBytes - size of the entry, counted against the total before any file.
  * @returns chosen and left-out files.
  */
-export function buildManifest(listing: ReportListing, limits: UploadSettings): Manifest {
+export function buildManifest(listing: ReportListing, limits: UploadSettings, entryBytes: number): Manifest {
   const files: ManifestFile[] = []
   const skipped: string[] = [
     ...listing.refused.map(path => `${path}：符号链接或特殊文件`),
   ]
-  let total = ENTRY_RESERVE_BYTES
+  let total = entryBytes
   for (const path of Object.keys(listing.sizes).sort()) {
     const size = listing.sizes[path] ?? 0
     const problem = pathProblem(path)

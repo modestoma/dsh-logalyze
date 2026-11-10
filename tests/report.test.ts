@@ -12,7 +12,7 @@ import { PlatformClient, PlatformError } from '../src/platform/client.ts'
 import type { PlatformLog } from '../src/platform/client.ts'
 import { listReport } from '../src/report/files.ts'
 import { LegacyReports } from '../src/report/legacy.ts'
-import { buildManifest, ENTRY_RESERVE_BYTES, pathProblem } from '../src/report/manifest.ts'
+import { buildManifest, pathProblem } from '../src/report/manifest.ts'
 import { questionOf, renderLogReport, rewriteReply } from '../src/report/render.ts'
 import { analysisIdOf, AnalysisStore, MAX_REPORT_RECORDS, REPORT_RETENTION_MS } from '../src/report/store.ts'
 import type { AnalysisRecord } from '../src/report/store.ts'
@@ -113,24 +113,24 @@ describe('report manifest', () => {
   })
 
   it('chooses files within the limits and lists the rest with the reason', () => {
-    const limits = { ...LIMITS, maxFiles: 3, maxFileBytes: 100, maxMarkdownBytes: 50, maxBytes: ENTRY_RESERVE_BYTES + 150 }
+    const limits = { ...LIMITS, maxFiles: 3, maxFileBytes: 100, maxMarkdownBytes: 50, maxBytes: 1150 }
     const manifest = buildManifest({
       files: {},
       sizes: { 'a.png': 90, 'b.md': 60, 'c.txt': 0, 'd.log': 101, 'e.json': 70, 'f.csv': 10, 'g.exe': 1 },
       count: 7,
       bytes: 0,
       refused: ['link.png'],
-    }, limits)
+    }, limits, 1000)
     expect(manifest.files).toEqual([{ path: 'a.png', size: 90 }, { path: 'f.csv', size: 10 }])
     expect(manifest.skipped).toEqual([
       'b.md：超过 Markdown 文件上限 50 字节',
       'c.txt：空文件',
       'd.log：超过单文件上限 100 字节',
-      'e.json：超过总大小上限 262294 字节',
+      'e.json：超过总大小上限 1150 字节',
       'g.exe：扩展名只能是 md/png/jpg/jpeg/gif/webp/csv/txt/json/log',
       'link.png：符号链接或特殊文件',
     ])
-    const counted = buildManifest({ files: {}, sizes: { 'a.txt': 1, 'b.txt': 1, 'c.txt': 1 }, count: 3, bytes: 3, refused: [] }, { ...LIMITS, maxFiles: 3 })
+    const counted = buildManifest({ files: {}, sizes: { 'a.txt': 1, 'b.txt': 1, 'c.txt': 1 }, count: 3, bytes: 3, refused: [] }, { ...LIMITS, maxFiles: 3 }, 0)
     expect(counted.skipped).toEqual(['c.txt：超过文件数上限 3'])
   })
 })
@@ -348,6 +348,20 @@ describe('report tracking', () => {
     await h.completed(2)
     expect(h.platform.revisions[1]?.key).toBe(`logalyze:${record.id}:L1:r1:g1`)
     expect(h.platform.revisions[1]?.files.get('a.txt')?.toString('utf8')).toBe('new')
+  })
+
+  it('leaves out attachments that do not fit beside the rendered entry instead of refusing the report', async () => {
+    const h = await harness()
+    h.settings.maxBytes = 3000
+    const record = await h.start(analysis('req-1', 1))
+    await writeFile(join(h.workDir, 'report', 'big.txt'), 'x'.repeat(2800))
+    await writeFile(join(h.workDir, 'report', 'small.txt'), 'y')
+    h.turn(1, { reply: '结论' })
+    await h.completed(1)
+    const revision = h.platform.revisions[0]!
+    expect([...revision.sizes.keys()].sort()).toEqual(['report.md', 'small.txt'])
+    expect(h.platform.entryOf(revision)).toContain('big.txt：超过总大小上限 3000 字节')
+    expect(h.store.get(record.id)?.skipped).toEqual(['big.txt：超过总大小上限 3000 字节'])
   })
 
   it('moves to the next key when the platform refuses a key reused with other files', async () => {
