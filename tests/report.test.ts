@@ -18,7 +18,8 @@ const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { await Promise.all(cleanups.splice(0).map(cleanup => cleanup())) })
 
 const REQUEST: AnalyzeRequest & { logId: string } = {
-  requesterUserId: 'u_alice',
+  triggerType: 'digital',
+  triggerId: 'u_alice',
   triggeredAt: '2026-10-28 09:30',
   app: 'order-service',
   errorCode: 'E1001',

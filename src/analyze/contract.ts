@@ -3,8 +3,9 @@
  *
  * `POST /open-api/logalyze`（DSH Web 服务器上），带
  * `Authorization: Bearer <令牌>`、`Idempotency-Key` 请求头和 JSON 请求体：
- * 发起人、触发时间、应用与错误码、日志详情页、目标群和提示词。合法请求把
- * 分析根卡片发进群并回 `202`，分析随后在卡片下的话题里流式进行。日志包由
+ * 发起方类型与标识、触发时间、应用与错误码、日志详情页、目标群（可省略，
+ * 用设置面板的默认群）和提示词。合法请求把分析根卡片发进群并回 `202`，
+ * 分析随后在卡片下的话题里流式进行。日志包由
  * 提示词调用的分析 SKILL 自行获取，详情页只列在卡片上。带 `logId` 的请求在
  * 分析结束后把报告目录交给回传命令（见 `../report/`）。
  *
@@ -13,6 +14,8 @@
 
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
+
+import { CHAT_ID_PATTERN } from '../settings/contract.ts'
 
 export { ANALYZE_ROUTE } from '../settings/contract.ts'
 
@@ -48,8 +51,20 @@ const SUBJECT_SEGMENT = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$/u
 /** Most detail pages one request may list on its root card. */
 export const ANALYZE_MAX_LOG_DETAILS = 50
 
-/** Feishu group chat id (`oc_…`). */
-const CHAT_ID = /^oc_[A-Za-z0-9_-]{1,128}$/u
+
+/**
+ * Where an analysis was triggered: `digital` from the digital platform, whose
+ * `triggerId` is the person's Feishu `user_id`; `machine` from a platform
+ * without Feishu identities, whose `triggerId` is that platform's own id of
+ * the trigger.
+ */
+export const TRIGGER_TYPES = ['digital', 'machine'] as const
+
+/** Longest `machine` trigger id, in characters. */
+export const MACHINE_TRIGGER_ID_MAX = 128
+
+/** Characters a `machine` trigger id may not contain (it is shown on one card line). */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/u
 
 /**
  * Caller-side id of the analysis, passed to the upload command as one
@@ -59,8 +74,10 @@ export const LOG_ID_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/u
 
 /** JSON body of one analyze request. */
 export const analyzeRequestSchema = z.object({
-  /** Feishu user_id of the person who started the analysis on the platform. */
-  requesterUserId: z.string().regex(FEISHU_USER_ID, 'must be a Feishu user_id').max(128),
+  /** Kind of platform that triggered the analysis; decides what {@link triggerId} is. */
+  triggerType: z.enum(TRIGGER_TYPES),
+  /** `digital`: the person's Feishu user_id. `machine`: the platform's id of the trigger, shown as `[machine] <id>`. */
+  triggerId: z.string().min(1).max(MACHINE_TRIGGER_ID_MAX).refine(value => value.trim() !== '', 'must not be blank'),
   /** When the analysis was started on the platform, shown verbatim on the root card. */
   triggeredAt: z.string().min(1).max(64).refine(value => value.trim() !== '', 'must not be blank'),
   /** Application the logs belong to (workspace directory segment). */
@@ -74,21 +91,30 @@ export const analyzeRequestSchema = z.object({
     /** Detail page address. */
     url: z.url({ protocol: /^https?$/u, error: 'must be an http(s) URL' }).max(2048),
   }).strict()).min(1).max(ANALYZE_MAX_LOG_DETAILS),
-  /** Target group chat (`oc_…`); must be an authorized group. */
-  chatId: z.string().regex(CHAT_ID, 'must be a Feishu group chat_id (oc_...)'),
+  /** Target group chat (`oc_…`) the bot is in; omitted uses the panel's default group. */
+  chatId: z.string().regex(CHAT_ID_PATTERN, 'must be a Feishu group chat_id (oc_...)').optional(),
   /** Prompt forwarded verbatim as the analysis Session's first user message. */
   prompt: z.string().min(1).max(ANALYZE_MAX_PROMPT_CHARS)
     .refine(value => value.trim() !== '', 'must not be blank'),
   /** Caller-side analysis id; present means the report is uploaded after every turn. */
   logId: z.string().regex(LOG_ID_PATTERN, 'must be 1-128 of A-Z a-z 0-9 . _ - and start with a letter, digit, or _').optional(),
 }).strict().superRefine((request, issues) => {
+  if (request.triggerType === 'digital' && !FEISHU_USER_ID.test(request.triggerId)) {
+    issues.addIssue({ code: 'custom', path: ['triggerId'], message: 'must be a Feishu user_id when triggerType is digital' })
+  }
+  if (request.triggerType === 'machine' && CONTROL_CHARS.test(request.triggerId)) {
+    issues.addIssue({ code: 'custom', path: ['triggerId'], message: 'must be one line without control characters' })
+  }
   if (request.logId !== undefined && request.prompt.length > ANALYZE_MAX_PROMPT_CHARS - REPORT_PROMPT_RESERVE) {
     issues.addIssue({ code: 'custom', path: ['prompt'], message: `must be at most ${ANALYZE_MAX_PROMPT_CHARS - REPORT_PROMPT_RESERVE} characters when logId is given` })
   }
 })
 
-/** One validated analyze request. */
-export type AnalyzeRequest = z.infer<typeof analyzeRequestSchema>
+/** One validated request body, as the caller sent it. */
+export type AnalyzeRequestBody = z.infer<typeof analyzeRequestSchema>
+
+/** One validated analyze request with its target group resolved. */
+export type AnalyzeRequest = AnalyzeRequestBody & { readonly chatId: string }
 
 /** Body of an accepted (or replayed) request. */
 export interface AnalyzeAccepted {
@@ -115,14 +141,15 @@ export interface AnalyzeResponse {
 /**
  * Fingerprint of one validated request, used to tell a retry of the same
  * request from a reused `Idempotency-Key`. Field order is fixed so stored
- * digests stay comparable; `logId` is appended only when present, so requests
- * without it keep their earlier digests.
+ * digests stay comparable; the resolved group is hashed, so a retry after the
+ * default group changed is a different request; `logId` is appended only
+ * when present.
  * @param request - the validated request.
  * @returns SHA-256 hex digest.
  */
 export function analyzeRequestHash(request: AnalyzeRequest): string {
   const canonical = JSON.stringify([
-    request.requesterUserId, request.triggeredAt, request.app, request.errorCode,
+    request.triggerType, request.triggerId, request.triggeredAt, request.app, request.errorCode,
     request.logDetails.map(detail => [detail.name, detail.url]), request.chatId, request.prompt,
     ...request.logId === undefined ? [] : [request.logId],
   ])
@@ -130,13 +157,18 @@ export function analyzeRequestHash(request: AnalyzeRequest): string {
 }
 
 /**
- * Validate one decoded JSON body.
+ * Validate one decoded JSON body and resolve its target group.
  * @param raw - the decoded body.
- * @returns the request, or a readable list of field errors.
+ * @param defaultChatId - the panel's default group, used when the body has no `chatId`.
+ * @returns the request, or a readable reason.
  */
-export function parseAnalyzeRequest(raw: unknown): { ok: true; value: AnalyzeRequest } | { ok: false; error: string } {
+export function parseAnalyzeRequest(raw: unknown, defaultChatId: string | undefined): { ok: true; value: AnalyzeRequest } | { ok: false; error: string } {
   const parsed = analyzeRequestSchema.safeParse(raw)
-  if (parsed.success) return { ok: true, value: parsed.data }
+  if (parsed.success) {
+    const chatId = parsed.data.chatId ?? defaultChatId
+    if (chatId === undefined) return { ok: false, error: '请求没有 chatId，观象设置面板「分析接口」也没有设置默认群' }
+    return { ok: true, value: { ...parsed.data, chatId } }
+  }
   const details = parsed.error.issues
     .map(issue => `${issue.path.join('.') || '(body)'}: ${issue.message}`)
     .join('; ')

@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { AnalyzeWire, EditableKey, EditableSettings, ReportStatus, ReportWire, RepoStatusWire, StateWire, TokenStatusWire, UploadPhase } from '../settings/contract.ts'
 import { clearToken, fetchState, messageOf, resetSettings, retryReport, saveSettings, saveToken } from './api.ts'
+import { CHAT_ID_PATTERN } from '../settings/contract.ts'
 
 /** Sidebar label and page title. */
 export const PANEL_TITLE = '观象'
@@ -39,6 +40,8 @@ interface Draft {
   skillMaxFiles: string
   skillMaxKb: string
   analyzeEnabled: boolean
+  /** Default group chat id; blank means none. */
+  analyzeDefaultChatId: string
   /** Upload command, one argument per line. */
   uploadCommand: string
   uploadTimeoutSec: string
@@ -64,6 +67,7 @@ function toDraft(settings: EditableSettings): Draft {
     skillMaxFiles: String(settings.skillUpdates.maxFiles),
     skillMaxKb: trimNumber(settings.skillUpdates.maxFileBytes / KB),
     analyzeEnabled: settings.analyze.enabled,
+    analyzeDefaultChatId: settings.analyze.defaultChatId ?? '',
     uploadCommand: settings.analyze.upload.command.join('\n'),
     uploadTimeoutSec: trimNumber(settings.analyze.upload.timeoutMs / 1000),
     uploadRetries: String(settings.analyze.upload.retries),
@@ -90,6 +94,8 @@ function fromDraft(draft: Draft): EditableSettings {
   if (!Number.isInteger(maxApps)) throw new Error('单次应用数上限必须是整数')
   const maxFiles = positive(draft.skillMaxFiles, '改进文件数上限')
   if (!Number.isInteger(maxFiles)) throw new Error('改进文件数上限必须是整数')
+  const defaultChatId = draft.analyzeDefaultChatId.trim()
+  if (defaultChatId !== '' && !CHAT_ID_PATTERN.test(defaultChatId)) throw new Error('默认群必须是飞书群的 chat_id（oc_ 开头）')
   return {
     fetchIntervalMs: Math.round(positive(draft.fetchIntervalMin, '更新间隔', true) * MINUTE),
     maxAppsPerRequest: maxApps,
@@ -106,6 +112,7 @@ function fromDraft(draft: Draft): EditableSettings {
     },
     analyze: {
       enabled: draft.analyzeEnabled,
+      ...defaultChatId === '' ? {} : { defaultChatId },
       upload: {
         command: draft.uploadCommand.split('\n').map(arg => arg.trim()).filter(arg => arg !== ''),
         timeoutMs: Math.round(positive(draft.uploadTimeoutSec, '回传超时') * 1000),
@@ -488,6 +495,15 @@ function AnalyzeTab({ draft, setDraft, analyze, credentialsAvailable, overridden
                 : null}
             </div>
           </div>
+          <div className="lz__row lz__row--top">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">默认群 <Overridden keys={overridden} name="analyze" /></div>
+              <div className="lz__rowSummary">请求体不带 <span className="lz__mono">chatId</span> 时，分析卡片发到这个群；机器人需在群内。留空时 <span className="lz__mono">chatId</span> 必填。</div>
+              <div className="lz__addRow lz__addRow--flush">
+                <input className="lz__input lz__mono" spellCheck={false} placeholder="oc_xxx" aria-label="默认群" value={draft.analyzeDefaultChatId} onChange={(event) => { setDraft({ ...draft, analyzeDefaultChatId: event.target.value }) }} />
+              </div>
+            </div>
+          </div>
         </div>
       </section>
       <section className="lz__sec">
@@ -519,8 +535,8 @@ function AnalyzeTab({ draft, setDraft, analyze, credentialsAvailable, overridden
         <div className="lz__list">
           <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">地址</div><div className="lz__rowSummary lz__mono">POST {endpoint}</div></div></div>
           <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">请求头</div><div className="lz__rowSummary lz__mono">Authorization: Bearer &lt;令牌&gt; · Idempotency-Key: &lt;1-200 个可见 ASCII 字符&gt; · Content-Type: application/json</div></div></div>
-          <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">请求体</div><div className="lz__rowSummary lz__mono">requesterUserId, triggeredAt, app, errorCode, logDetails[{'{'}name, url{'}'}], chatId, prompt, logId（可选，带上即回传报告）</div></div></div>
-          <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">响应</div><div className="lz__rowSummary">202 已发出分析卡片（同一 Idempotency-Key 重试返回同一张卡片）；400/401/404/405/409/413/415 请求问题；403 目标群未授权；502 卡片发送失败；503 飞书未连接或令牌未设置。字段说明见观象 README。</div></div></div>
+          <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">请求体</div><div className="lz__rowSummary lz__mono">triggerType（digital | machine）, triggerId, triggeredAt, app, errorCode, logDetails[{'{'}name, url{'}'}], prompt, chatId（可选，默认用上面的默认群）, logId（可选，带上即回传报告）</div></div></div>
+          <div className="lz__row"><div className="lz__rowText"><div className="lz__rowLabel">响应</div><div className="lz__rowSummary">202 已发出分析卡片（同一 Idempotency-Key 重试返回同一张卡片）；400/401/404/405/409/413/415 请求问题；403 发起人没有对话权限（只针对 digital）；502 卡片发送失败；503 飞书未连接或令牌未设置。字段说明见观象 README。</div></div></div>
         </div>
       </section>
     </>
