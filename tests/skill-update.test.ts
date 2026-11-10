@@ -477,6 +477,41 @@ describe('logalyze_improve_skill', () => {
     expect(repos.workspacePush).not.toHaveBeenCalled()
   })
 
+  /** Give the origin a `dev` branch whose description is changed by `edit`, and make it the catalog's baseline while the analysis reads `main`. */
+  async function baselineBranch({ origin, repos }: Setup, edit: (manifest: string) => string, renameSkill: boolean): Promise<void> {
+    git(origin, 'checkout', '-q', '-b', 'dev')
+    if (renameSkill) {
+      git(origin, 'mv', '.agents/skills/log-analysis', '.agents/skills/logs-v2')
+      const skillPath = join(origin, '.agents/skills/logs-v2/SKILL.md')
+      await writeFile(skillPath, (await readFile(skillPath, 'utf8')).replace('name: log-analysis', 'name: logs-v2'))
+    }
+    const manifestPath = join(origin, '.agents/logalyze.yaml')
+    await writeFile(manifestPath, edit(await readFile(manifestPath, 'utf8')))
+    git(origin, 'add', '-A')
+    git(origin, 'commit', '-qm', 'baseline change')
+    git(origin, 'checkout', '-q', 'main')
+    repos.service.catalog = [{ id: '000000000001', url: origin, base: 'dev', access: 'write', features: [{ id: 'log-analysis', branch: 'main' }] }]
+  }
+
+  it('improves the SKILL the baseline branch names when it differs from the analysed branch', async () => {
+    const context = await setup()
+    const { improver, agent, started } = context
+    await baselineBranch(context, manifest => manifest.replace('skill: log-analysis', 'skill: logs-v2'), true)
+    const running = improver.execute({ app: 'order-service' }, { signal: new AbortController().signal, agent })
+    await waitForStarts(started, 1)
+    expect(started[0]?.spec.prompt[0]?.text).toContain('.agents/skills/logs-v2/')
+    await finishChild(started, 0, { '.agents/skills/logs-v2/cases/2026-10-31-trace-id.md': '# c\n' })
+    expect(await running).toMatchObject({ status: 'opened', target: 'dev', files: [{ path: '.agents/skills/logs-v2/cases/2026-10-31-trace-id.md' }] })
+  })
+
+  it('stops before starting a child when the baseline branch describes another application', async () => {
+    const context = await setup()
+    const { improver, agent, started } = context
+    await baselineBranch(context, manifest => manifest.replace('id: order-service', 'id: other-service'), false)
+    await expect(improver.execute({ app: 'order-service' }, { signal: new AbortController().signal, agent })).rejects.toThrow('声明的是应用「other-service」')
+    expect(started).toHaveLength(0)
+  })
+
   it('tells the child when the repository moved on since the analysis', async () => {
     const { task, improver, agent, started } = await setup()
     await improver.inspect({ ...task, commit: 'a'.repeat(40) })

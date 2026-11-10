@@ -9,7 +9,7 @@
 import type { SkillDefinition, SkillProvider, SkillProviderControl } from '../host.ts'
 import type { AppManifest } from '../settings/contract.ts'
 import type { BundledSkill } from './bundled.ts'
-import { DISPATCH_TOOL_NAME, IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from '../tool-names.ts'
+import { DISPATCH_TOOL_NAME, IMPROVE_TOOL_NAME, INIT_REPO_TOOL_NAME, SHOW_TOOL_NAME } from '../tool-names.ts'
 
 /** Entry skill name, addressed as `/logalyze`. */
 export const ENTRY_SKILL_NAME = 'logalyze'
@@ -52,9 +52,13 @@ function cell(text: string): string {
 /**
  * Render the application catalog as a Markdown table.
  * @param apps - usable applications.
+ * @param pending - writable repositories whose description or SKILL is missing or invalid, which can be drafted.
  * @returns the table, or a notice when none is usable.
  */
-export function renderCatalog(apps: readonly AppManifest[]): string {
+export function renderCatalog(apps: readonly AppManifest[], pending: readonly string[] = []): string {
+  if (apps.length === 0 && pending.length > 0) {
+    return `当前没有可用的应用，不要自行分析日志。这些应用仓库已经添加，但还缺少应用描述或日志分析 SKILL：${pending.map(url => `\`${url}\``).join('、')}。告诉用户可以先起草接入；用户同意后用 \`${INIT_REPO_TOOL_NAME}\` 起草（可以附上用户给的样例日志），否则结束本次回复。`
+  }
   if (apps.length === 0) {
     return '当前没有可用的应用，不要自行分析日志。告诉用户：应用的代码仓库要由管理员在 dsh-repo 的「代码仓库 → 仓库」中添加，并打开「日志分析」；然后结束本次回复。'
   }
@@ -77,9 +81,10 @@ function improveStep(): string {
  * @param apps - usable applications at load time.
  * @param maxAppsPerRequest - dispatch task ceiling.
  * @param skillUpdates - whether SKILL improvement is enabled.
+ * @param pending - writable repositories that can be drafted, named while no application is usable.
  * @returns Markdown instructions.
  */
-export function renderEntrySkill(apps: readonly AppManifest[], maxAppsPerRequest: number, skillUpdates: boolean): string {
+export function renderEntrySkill(apps: readonly AppManifest[], maxAppsPerRequest: number, skillUpdates: boolean, pending: readonly string[] = []): string {
   return `# 观象：日志分析入口
 
 观其象，知其因。没有 \`${DISPATCH_TOOL_NAME}\` 工具可用时（例如你是子 Agent），忽略本 SKILL，按普通方式完成任务。
@@ -88,7 +93,7 @@ export function renderEntrySkill(apps: readonly AppManifest[], maxAppsPerRequest
 
 ## 应用目录
 
-${renderCatalog(apps)}
+${renderCatalog(apps, pending)}
 
 ## 步骤
 
@@ -138,6 +143,8 @@ export interface EntrySkillSource {
   prepare(signal: AbortSignal | undefined): Promise<void>
   /** Usable applications. */
   apps(): readonly AppManifest[]
+  /** Writable repositories whose description or SKILL can be drafted. */
+  setupPending(): readonly string[]
   /** Current dispatch task ceiling. */
   maxAppsPerRequest(): number
   /** Whether SKILL improvement is enabled. */
@@ -211,7 +218,7 @@ export function createEntrySkillProvider(source: EntrySkillSource): {
           if (guide !== undefined) return { ...guide.summary, content: guide.content }
           if (requested.name !== ENTRY_SKILL_NAME) return undefined
           await source.prepare(options.signal)
-          return { ...summary(), content: renderEntrySkill(source.apps(), source.maxAppsPerRequest(), source.skillUpdates()) }
+          return { ...summary(), content: renderEntrySkill(source.apps(), source.maxAppsPerRequest(), source.skillUpdates(), source.setupPending()) }
         },
       }
     },

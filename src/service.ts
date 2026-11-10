@@ -114,6 +114,7 @@ export class LogalyzeService {
     this.skill = createEntrySkillProvider({
       prepare: signal => this.prepareCatalog(signal),
       apps: () => this.registry.readyApps().map(ready => ready.app),
+      setupPending: () => this.registry.setupPending(),
       maxAppsPerRequest: () => this.settings.get().maxAppsPerRequest,
       skillUpdates: () => this.settings.get().skillUpdates.enabled,
       autoInvoke: config.autoInvoke,
