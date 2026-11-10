@@ -1,12 +1,13 @@
 /**
  * 飞书渠道插件 `feishuTopics` 服务的查找。服务接口在 `./topics-contract.ts`
- * 本地声明；服务在运行时经 `ctx.get('feishuTopics')` 取得，版本不符时不调用。
+ * 本地声明；服务在运行时经 `ctx.get('feishuTopics')` 取得，版本不符或缺少
+ * 话题状态与链接表方法（较早的版本 3）时不调用。
  *
  * @module dsh-logalyze/deps/topics
  */
 
 import type { TopicsAvailability } from '../settings/contract.ts'
-import type { FeishuTopicService, FeishuTopicsVersion, TopicLaunchState } from './topics-contract.ts'
+import type { FeishuTopicService, FeishuTopicsVersion } from './topics-contract.ts'
 
 /** Name the Feishu channel plugin provides the service under. */
 export const FEISHU_TOPICS_SERVICE = 'feishuTopics'
@@ -21,30 +22,15 @@ export type TopicsLookup =
 
 /**
  * Classify the value `ctx.get('feishuTopics')` returned. The provider is
- * another package, so its contract version is checked at run time.
+ * another package, so its contract version and the methods added within it
+ * are checked at run time.
  * @param value - the looked-up service, or undefined.
  * @returns the usable service, or why there is none.
  */
 export function lookupTopics(value: unknown): TopicsLookup {
   if (value === undefined || value === null) return { availability: 'missing' }
-  if ((value as { version?: unknown }).version !== FEISHU_TOPICS_VERSION) return { availability: 'incompatible' }
+  const service = value as Partial<Record<keyof FeishuTopicService, unknown>>
+  if (service.version !== FEISHU_TOPICS_VERSION) return { availability: 'incompatible' }
+  if (typeof service.state !== 'function' || typeof service.launchKeyOf !== 'function' || typeof service.updateLinks !== 'function') return { availability: 'incompatible' }
   return { availability: 'ready', service: value as FeishuTopicService }
-}
-
-/** The launch-state methods report tracking reads. */
-export interface TopicStates {
-  state(key: string): TopicLaunchState | undefined
-  launchKeyOf(sessionId: string): string | undefined
-}
-
-/**
- * The launch-state methods of a usable provider.
- * @param lookup - the lookup result.
- * @returns both methods, or undefined while the service is unusable or an older version-2 provider lacks either.
- */
-export function topicStatesOf(lookup: TopicsLookup): TopicStates | undefined {
-  if (lookup.availability !== 'ready') return undefined
-  const { state, launchKeyOf } = lookup.service
-  if (state === undefined || launchKeyOf === undefined) return undefined
-  return { state: key => state.call(lookup.service, key), launchKeyOf: sessionId => launchKeyOf.call(lookup.service, sessionId) }
 }

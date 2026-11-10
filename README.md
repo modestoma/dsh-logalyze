@@ -108,14 +108,26 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
       maxFileBytes: 262144             # 改进中单个文件和 SKILL 不足记录的大小上限
     analyze:                           # 日志平台分析接口，见下文
       enabled: false                   # 默认关闭
-      upload:                          # 报告回传（请求带 logId 时），见下文
-        command: [cli, log-analysis, upload, --log-id, '{logId}', --dir, '{dir}', --entry, '{entry}']
-        timeoutMs: 300000              # 单次上传超时
+      defaultChatId: oc_xxx            # 请求不带 chatId 时的目标群；不填则 chatId 必填
+      maxLogs: 10                      # 一次请求最多的 logIds（1–100）
+      platform:                        # 日志平台开放 API（观象是它的 OAuth2 客户端）
+        baseUrl: https://logs.example.com           # 在后面拼 /open-api/v1/…
+        tokenUrl: https://auth.example.com/oauth/token
+        clientId: logalyze
+        clientAuth: body               # body = 表单字段；basic = HTTP Basic
+        scope: log:search log:download log:upload
+        timeoutMs: 30000               # 单次接口调用 / 换令牌超时
+      upload:                          # 报告回传，见下文；上限默认与日志平台一致
+        timeoutMs: 300000              # 单个文件上传超时
         retries: 3                     # 失败后再试的次数
         retryDelayMs: 60000            # 第一次重试前的等待，之后每次加倍
-        maxFiles: 200                  # 报告目录文件数上限
-        maxBytes: 209715200            # 报告目录总大小上限
-    analyzeTokenRef: LOGALYZE_ANALYZE_TOKEN  # 接口访问令牌在 DSH 凭据库中的名称
+        maxFiles: 50                   # 每个修订的文件数上限（含 report.md）
+        maxBytes: 104857600            # 每个修订的总大小上限
+        maxFileBytes: 52428800         # 单文件上限
+        maxMarkdownBytes: 20971520     # Markdown 文件（含 report.md）上限
+        concurrency: 4                 # 同时上传的文件数
+    analyzeTokenRef: LOGALYZE_ANALYZE_TOKEN             # 接口访问令牌在 DSH 凭据库中的名称
+    platformSecretRef: LOGALYZE_PLATFORM_CLIENT_SECRET  # 日志平台 client_secret 在 DSH 凭据库中的名称
 ```
 
 配置在加载时校验，不合法时插件加载失败。应用仓库不在这里配置：以前的 `repos` 键会让插件加载失败，错误说明改到 dsh-repo 的「代码仓库 → 仓库」中添加这些仓库并打开「日志分析」；面板设置文件 `settings.json` 里留有 `repos` 时整个文件不生效，面板显示同样的原因，保存一次即覆盖。旧的仓库列表不会自动迁移。
@@ -200,14 +212,25 @@ skill: log-analysis             # 对应 .agents/skills/log-analysis/SKILL.md
 
 ## 日志平台分析接口
 
-日志平台调用观象的分析接口：观象经飞书渠道插件的 `feishuTopics` 服务（例如由 [dsh_channels](https://github.com/modestoma/dsh_channels) 提供）在指定群里发一张分析卡（发起人、触发时间、应用、错误码和日志详情页表格），在卡片下开话题，把平台给的 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 SKILL，例如 `/logalyze`），分析过程在话题内流式输出。分析结束后分析卡的状态标签随之更新，群里通过准入的成员都可以在该话题内追问。日志包地址写在 prompt 里，下载、解压、超时都由 prompt 调用的 SKILL 处理（Session 的沙箱需要能访问日志存储地址）。
+日志平台调用观象的分析接口，传一批同一应用、同一错误码的日志 id（`logIds`）。观象作为 OAuth2 客户端向日志平台查出这批日志的元数据，按 `component_code` 找到应用，经飞书渠道插件的 `feishuTopics` 服务（例如由 [dsh_channels](https://github.com/modestoma/dsh_channels) 提供）在指定群里发一张分析卡，在卡片下开话题，用观象生成的首轮消息（`/logalyze` 加日志表和分析要求）开始分析，过程在话题内流式输出。每一轮结束后，观象把报告作为新修订传到这批日志的每一份（见[报告回传](#报告回传)）。群里通过准入的成员都可以在该话题内追问，追问的结论同样回传。
 
 **前提**：
 
-- 飞书渠道插件已加载并提供 `feishuTopics` 服务（版本 3）。没有这个服务时观象不注册接口；服务版本不兼容时观象记一条警告，也不注册。设置面板「分析接口」分页显示飞书渠道是否就绪。
+- 飞书渠道插件已加载并提供 `feishuTopics` 服务：版本 3，且带 `state`、`launchKeyOf`、`updateLinks`（更新根卡片链接表）。没有这个服务时观象不注册接口；服务版本不兼容或缺少这些方法时观象记一条警告，也不注册。设置面板「分析接口」分页显示飞书渠道是否就绪。
+- 日志平台为观象开了一个 OAuth2 client_credentials 客户端，授权范围 `log:search log:download log:upload`，挂在能下载相关日志的账号下。
 - 只有带 Web 的 profile（web、desktop）有这个接口，headless 没有。
 
 **开启**：在设置面板「分析接口」打开开关（`analyze.enabled`，默认关，保存后立即生效），可以填一个默认群（`analyze.defaultChatId`，`oc_` 开头，请求不带 `chatId` 时用它），并在同一页保存访问令牌（建议 32 位以上随机串）。令牌存入 DSH 凭据库的 `LOGALYZE_ANALYZE_TOKEN`（名称可用 `analyzeTokenRef` 修改），也可以设置同名环境变量或写进 `.env`。接口挂在 DSH Web 服务上（与 Web 界面同一端口），路径 `/open-api/logalyze` 放在 DSH 的 `/api` 之外，网关可以把它与需要登录的 DSH 接口分开放行；DSH 通过反向代理挂在前缀下时，地址随之带上前缀（如 `https://<域名>/dsh/open-api/logalyze`）。该路由不走 DSH 登录 cookie，访问令牌是唯一凭据。开关关闭时所有请求返回 404；令牌每次请求都重新读取，轮换后下一次请求生效；令牌未设置时所有请求返回 503。
+
+**日志平台**：同一页「日志平台」一节填接口地址（`analyze.platform.baseUrl`，观象在后面拼 `/open-api/v1/…`）、令牌地址（`tokenUrl`）、`client_id`，并保存 `client_secret`（存入 DSH 凭据库的 `LOGALYZE_PLATFORM_CLIENT_SECRET`，名称可用 `platformSecretRef` 修改，不能和访问令牌同名）。客户端认证方式默认把 `client_id` / `client_secret` 放在表单里，也可以改成 HTTP Basic。访问令牌缓存在内存里，剩余不到 60 秒或接口返回 401 时重新换取（401 只重试一次）。三项没填齐时接口返回 503，面板写明缺什么。观象调用的平台接口：
+
+| 用途 | 接口 | scope |
+| --- | --- | --- |
+| 按 id 查日志元数据 | `GET /open-api/v1/logs?log_id=…&log_id=…` | `log:search` |
+| 取 10 分钟下载链接 | `GET /open-api/v1/logs/{log_id}/download-url` | `log:download` |
+| 创建分析修订 | `POST /open-api/v1/logs/{log_id}/analyses`（带 `Idempotency-Key`） | `log:upload` |
+| 直传文件 | `PUT <uploads[].upload_url>`（不带平台令牌） | — |
+| 完成分析修订 | `POST /open-api/v1/logs/{log_id}/analyses/{analysis_id}/complete` | `log:upload` |
 
 **请求**：
 
@@ -221,64 +244,66 @@ Content-Type: application/json
   "triggerType": "digital",
   "triggerId": "a1b2c3d4",
   "triggeredAt": "2026-10-22 19:30",
-  "app": "camera",
-  "errorCode": "E1001",
-  "logDetails": [
-    { "name": "设备 A 崩溃日志", "url": "https://logs.example.com/detail/1" },
-    { "name": "设备 B 崩溃日志", "url": "https://logs.example.com/detail/2" }
-  ],
   "chatId": "oc_xxx",
-  "prompt": "/logalyze https://logs.example.com/1.zip https://logs.example.com/2.zip 请分析这些日志",
-  "logId": "LA-20261022-0001"
+  "logIds": ["019a42e0-0000-7000-8000-000000000001", "019a42e0-0000-7000-8000-000000000002"],
+  "instructions": "两台设备都在升级后出现，重点看升级流程"
 }
 ```
 
 - `triggerType`：发起方类型，`digital` 或 `machine`。
   - `digital`：从数字化平台发起，`triggerId` 是发起人的飞书 user_id（不能是 `ou_` / `on_` 开头的 open_id / union_id）。分析卡 @ 此人，首轮以此人为发言人提交，所以此人要在飞书渠道插件的用户表里有对话权限（否则返回 `403`）。
   - `machine`：从拿不到飞书 user_id 的平台发起（例如 APP），`triggerId` 是该平台自己的标识（1–128 字符、单行）。分析卡开头显示为 `[machine] <triggerId>`，不 @ 任何人，也不检查飞书权限（访问令牌就是凭据）；首轮以群身份提交、没有发言人，首轮里提交的代码只带群的尾注。
-- `triggerId`：见上；参与请求指纹。话题归群，群里有对话权限的成员都能追问。
 - `triggeredAt`：平台上发起分析的时间，1–64 字符，原样显示在分析卡上（时区和格式由平台决定）。
-- `app` / `errorCode`：只允许 `A-Z a-z 0-9 . _ -`（1–128 字符），显示在分析卡上并参与请求指纹。每次分析的话题目录由飞书渠道插件按群和话题决定（`<baseDir>/groups/<chat_id>/<话题 id>/`），观象不再指定工作区。
-- `logDetails`：触发分析的日志在日志平台上的详情页，1–50 条，每条 `name`（1–200 字符）+ `url`（http/https）。只在分析卡的表格里列出，观象不会访问这些地址。
-- `chatId`：可选，目标群，机器人需在群内。不带时发到设置面板的默认群；两者都没有时返回 `400`。群本身不需要授权，群话题的知识库与代码改动权限在飞书渠道插件设置面板的群权限里按群配置。最终用的群计入幂等指纹。
-- `prompt`：1–100000 字符，原样作为首条用户消息；带 `logId` 时最多 98000 字符，观象在后面追加一节「报告文件」，说明报告目录的写法（见[报告回传](#报告回传)），不带时不追加任何内容。
-- `logId`：可选，日志平台上这次分析的 id，1–128 个 `A-Z a-z 0-9 . _ -`，不能以 `-` 或 `.` 开头。带上后观象在每一轮结束时把报告回传给平台；它计入幂等指纹。
-- 只接受以上 9 个字段，多余字段（包括已删除的 `requesterUserId`）返回 400。
+- `chatId`：可选，目标群，机器人需在群内。不带时发到设置面板的默认群；两者都没有时返回 `400`。群本身不需要授权，群话题的知识库与代码改动权限在飞书渠道插件设置面板的群权限里按群配置。
+- `logIds`：日志平台的日志 id（UUID，不区分大小写），1 到 `analyze.maxLogs`（默认 10，最多 100）个，不能重复。一个 log_id 是一个日志包（通常是 ZIP）。
+- `instructions`：可选，调用方说明（1–20000 字符），放进首轮消息的「调用方说明」一节。
+- 除 `chatId` 和 `instructions` 外都必填，`triggerType`、`triggerId`、`triggeredAt`、最终用的群、`logIds`、`instructions` 共同组成幂等指纹。只接受以上 6 个字段；旧格式的 `prompt`、`logDetails`、`logId`、`app`、`errorCode` 返回 400 并说明改用什么，其他多余字段也返回 400。
 
-**响应**：校验通过、分析卡发出后立即返回 `202`：
+**核对日志**：参数校验通过后，观象按 `logIds` 查日志平台，下面任何一条不满足都返回 `422`，不发卡片：
+
+- 每份日志都查得到（查不到或客户端无权查看的会列出），`storage_type` 是 `fds` 且 `status` 是 `completed`，`component_code` 不为空。
+- 整批的 `component_code` 一致，`error_code` 一致（整批都为空也可以，卡片上显示「未标注」）。
+- `component_code` 与应用目录里恰好一个应用的 id 或 `aliases`（`.agents/logalyze.yaml`）逐字相等。没有对应的应用时，在该应用的 `aliases` 里加上它；同时对应多个应用时只保留一个。应用的仓库也要在 dsh-repo 中打开「日志分析」并同步完成。
+
+`422` 的响应除了 `error` 还有 `invalidLogs`（`[{ logId, reason }]`），列出不能分析的日志。日志平台不可达或暂时出错时返回 `503`，拒绝请求（如凭据无效）时返回 `502`。
+
+**响应**：分析卡发出后立即返回 `202`：
 
 ```json
 { "ok": true, "chatId": "oc_xxx", "messageId": "om_xxx" }
 ```
 
-`messageId` 是分析卡的消息 id，分析话题挂在它下面。同步错误都带中文 `error`：`401` 令牌无效、`404` 接口开关未打开（或接口未注册）、`405` 不是 POST、`400` 参数或 `Idempotency-Key` 不合法、`403` 发起人（`digital` 的 `triggerId`）没有对话权限、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 1 MiB、`415` 不是 JSON、`502` 分析卡发送失败（如机器人不在群里）、`503` 飞书未连接或未设置令牌。
+`messageId` 是分析卡的消息 id，分析话题挂在它下面。同步错误都带中文 `error`：`401` 令牌无效、`404` 接口开关未打开（或接口未注册）、`405` 不是 POST、`400` 参数或 `Idempotency-Key` 不合法、`403` 发起人（`digital` 的 `triggerId`）没有对话权限、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 256 KiB、`415` 不是 JSON、`422` 日志不能分析（见上）、`502` 日志平台拒绝或分析卡发送失败（如机器人不在群里）、`503` 飞书未连接、令牌或日志平台未配置、日志平台暂时不可用。
 
-**去重**：同一个 `Idempotency-Key` 再次请求（包括并发重试）原样返回第一次的结果，不会再发卡、再分析。记录由飞书渠道插件永久保存。分析卡发出后的失败（话题创建、Session 创建）不会回滚这条记录：分析卡的状态变成「失败」并写明原因，需要重试时请换一个新的 `Idempotency-Key`。
+**去重**：同一个 `Idempotency-Key` 再次请求（包括并发重试）原样返回第一次的结果，不会再查平台、再发卡、再分析。观象的分析记录和飞书渠道插件的发起记录都按这个键保存。分析卡发出后的失败（话题创建、Session 创建）不会回滚记录：分析卡的状态变成「失败」并写明原因，需要重试时请换一个新的 `Idempotency-Key`。
 
-**群里看到的**：先是分析卡「@发起人 于 <triggeredAt> 发起了对 X 应用 Y 错误码不良日志的分析」（`machine` 发起时开头是 `[machine] <triggerId>`），下面是日志详情页表格，标题栏标签为「分析中」；紧接着话题内一张流式卡片，首轮分析在这里流式输出，带停止按钮。首轮结束后分析卡的标签变成「已完成」「已停止」或「失败」；DSH 在首轮进行中重启时，重新连上飞书后仍是「分析中」的分析卡会改成「已中断」，在话题内回复即可继续。分析话题是群内共享的：群里任何通过 dsh_channels 准入的成员都可以在话题内追问、停止或回答审批卡。卡片、话题与权限的细节见 dsh_channels README 的「群话题服务（feishuTopics）」。
+**首轮消息**：观象生成，以 `/logalyze` 开头，依次是应用（及对应的 `component_code`）、错误码和发起时间，日志表（编号 L1…Ln、文件名、设备 SN、硬件 / 软件 / 组件版本、类型、大小、上传时间），「调用方说明」，「分析要求」（应用已确定，一次派发把全部编号交给该应用；多份日志时按根因分组，最终回复附「日志归属」表），以及「报告文件」的规则。下载链接不写进消息：入口 SKILL 派发时日志项写成 `{ "ref": "L1" }`，`logalyze_dispatch` 按本话题的分析记录找到 log_id，现取 10 分钟的下载链接，立刻下载到运行目录，文件名用平台给的 `file_name`（前面加编号），大小和超时沿用「日志下载」的设置；平台给的下载地址不受下载白名单限制。编号只在分析接口发起的话题里可用。
+
+**群里看到的**：先是分析卡「@发起人 于 <triggeredAt> 发起了对 X 应用 Y 错误码 N 份日志的分析」（`machine` 发起时开头是 `[machine] <triggerId>`），下面的表格每份日志一行：「编号 · 文件名 · 设备 SN」、「详情页」（日志平台元数据里的 `detail_url`）和「分析报告」（这份日志第一次完成修订后补上 complete 返回的 `detail_url`，每份日志固定，只补一次）。标题栏标签为「分析中」；紧接着话题内一张流式卡片，首轮分析在这里流式输出，带停止按钮。首轮结束后分析卡的标签变成「已完成」「已停止」或「失败」；DSH 在首轮进行中重启时，重新连上飞书后仍是「分析中」的分析卡会改成「已中断」，在话题内回复即可继续。分析话题是群内共享的：群里任何通过 dsh_channels 准入的成员都可以在话题内追问、停止或回答审批卡。卡片、话题与权限的细节见 dsh_channels README 的「群话题服务（feishuTopics）」。
 
 ## 报告回传
 
-请求带 `logId` 时，观象把分析结论整理成一个报告目录，在分析话题的每一轮结束后调用回传命令上传整个目录，平台网页端渲染其中的入口文件。
+分析话题的每一轮结束后，观象为这批日志的每一份生成一份报告，作为这份日志的一个新分析修订传到日志平台；平台详情页显示最新完成的修订，追问后的结论就这样回刷。
 
-**报告目录**：话题的实际工作目录下的 `report/`（`<渠道 baseDir>/analyze/<app>/<errorCode>/topics/<话题>/report/`）；话题没能建立时改用 `$DSH_HOME/logalyze/reports/<报告 id>/report/`。
+**报告目录**：话题工作目录下的 `report/`（`<渠道 baseDir>/groups/<chat_id>/<话题 id>/report/`）；话题没能建立时改用 `$DSH_HOME/logalyze/analyses/<分析 id>/report/`。分析 Agent 按首轮消息「报告文件」一节的要求写入：
 
-- 入口 `report.md` 只由观象生成：开头是应用、错误码、发起时间和首轮状态，接着是「分析结论」（首轮的最终回复），之后每有一轮追问就追加一节「追问 N」（用户的问题加这一轮的最终回复）。每次上传前按记录重写这个文件，模型写进目录的同名文件会被替换。
-- 其他文件由分析 Agent 写入：追加在 prompt 后的「报告文件」一节要求它把图片、日志片段、较长的分析过程等放进 `report/`，并在回复中用 `report/` 开头的相对路径引用。写入 `report.md` 时这些链接会去掉 `report/` 前缀，变成相对报告目录的路径。本轮新增或改动、回复里却没有引用的文件，追加在该节末尾的「本轮文件」里，图片内嵌，其他文件列成链接。
-- 回复里引用本机绝对路径、`report/` 以外的路径或不存在的文件时照常上传，并在回传记录里列出这些链接。
-- 首轮失败、被停止或话题没能建立时，「分析结论」写明状态和原因；DSH 在首轮进行中重启时写明已中断，在话题内回复继续后，后续轮次照常追加。
+- 图片、日志片段、较长的分析过程等附件放进 `report/`，在回复中用 `report/` 开头的相对路径引用。生成报告时这些链接去掉 `report/` 前缀，变成相对报告根的路径。本轮新增或改动、回复里却没有引用的文件，追加在该节末尾的「本轮文件」里。
+- 多份日志时，每份日志一份简短结论 `report/logs/L1.md`、`report/logs/L2.md`…，每轮结束时读取最新内容。
+- 回复或结论引用本机绝对路径、`report/` 以外的路径或不存在的文件时照常上传，并在回传记录里列出这些链接。
 
-**回传命令**：`analyze.upload.command` 是参数列表，不经过 shell 执行，工作目录是报告目录。`{logId}` 换成请求的 `logId`，`{dir}` 换成报告目录的绝对路径，`{entry}` 换成 `report.md`；命令必须包含 `{logId}` 和 `{dir}`，可执行文件本身不能含占位符。默认命令是 `cli log-analysis upload --log-id {logId} --dir {dir} --entry {entry}`，每一轮都以相同参数调用，由平台的 CLI 处理更新。命令在 DSH 进程的环境变量下运行，需要能在 `PATH` 中找到。
+**每份日志的 `report.md`**：只由观象生成，不写进报告目录（目录根下的同名文件不上传）。开头是这份日志的编号、文件名、应用、错误码、发起时间、首轮状态、日志 id、设备 SN 和版本；多份日志时接着是「本日志结论」（`report/logs/<编号>.md`，没有时提示见整批结论）和「整批结论」（首轮的最终回复，含日志归属表），只有一份日志时是「分析结论」；之后每有一轮追问就追加一节「追问 N」（用户的问题加这一轮的最终回复）。首轮失败、被停止或话题没能建立时，首轮一节写明状态和原因；DSH 在首轮进行中重启时写明已中断。没有上传的文件列在最后的「未上传的文件」里。
 
-**上传规则**：
+**文件规则**（日志平台的要求，固定）：路径最多 255 字节、1–4 段，每段只含英文字母、数字和 `. _ -` 且不以点开头；扩展名为 md/png/jpg/jpeg/gif/webp/csv/txt/json/log；文件不能为空。数量和大小按 `analyze.upload` 的上限（默认与平台一致：每个修订最多 50 个文件含 `report.md`、共 100 MiB，单文件 50 MiB，Markdown 20 MiB）。不符合规则或超出上限的文件、符号链接和特殊文件都不上传，列在报告末尾和回传记录里；报告入口本身超限时这份日志不上传，回传记录写明原因。
 
-- 同一份报告的上传串行执行；上传进行中又有新的轮次结束时，结束后再上传一次最新内容。
-- 命令失败（非零退出、超时、找不到命令）后按 `retryDelayMs` 起步、每次加倍的间隔重试 `retries` 次；仍失败时停在「上传失败」，下一轮结束或在面板点「重新上传」时再试。
-- 报告目录里有符号链接或其他非普通文件，或者文件数、总大小超过 `maxFiles` / `maxBytes` 时不上传，回传记录写明原因，等内容变化或手动重新上传。
-- 回传记录保存在 `$DSH_HOME/logalyze/reports/`，DSH 重启后继续上传没有完成的报告，并核对仍在等待首轮的报告：首轮在观象未运行时结束的，「分析结论」注明没有记录到回复。
-- 回传记录最多保留 200 份，最近活动（接受请求或记录一轮）超过 30 天的记录被清理；启动时和每接受一份新报告时清理，正在上传的记录这次跳过。清理删除记录文件和 `$DSH_HOME/logalyze/reports/<报告 id>/`，话题工作目录里的 `report/` 归话题所有，不删除。
+**上传**：每份日志依次：创建修订（`entry_path` 为 `report.md`，`files` 是 `report.md` 加选中的附件，幂等键由分析 id、编号和记录版本组成）→ 按返回的 `uploads[]` 直传文件（同时最多 `concurrency` 个，不带平台令牌）→ 完成修订，记下 `detail_url`。
 
-**前提**：飞书渠道插件的 `feishuTopics` 服务（版本 3）要提供话题状态查询（`state`、`launchKeyOf` 和 `feishu-topics/status` 事件）。缺少这些功能时，接口照常接受请求，但报告不会回传，面板会提示升级。
+- 同一次分析的上传串行执行，日志逐份上传；上传进行中又有新的轮次结束时，结束后再上传一次最新内容。
+- 网络错误、超时、408、429 和 5xx 按 `retryDelayMs` 起步、每次加倍的间隔重试 `retries` 次；重试用同一个幂等键，平台返回同一个修订并重新签发还没上传的文件的链接，所以链接过期或完成时缺文件也能续上。平台以 409 拒绝同一个键配不同的文件（重试之间目录变了）时，换下一个键立即重来一次。
+- 其他失败（凭据无效、4xx、响应字段不符、报告超限）标在这份日志上，不再自动重试，等下一轮结束或在面板点「重新回传」。
+- 一份日志第一次完成修订后，观象经 `feishuTopics.updateLinks` 把它的分析页补进分析卡的「分析报告」列；飞书暂时不可用时，下次上传成功或飞书渠道重新加载时再补。
+- 分析记录保存在 `$DSH_HOME/logalyze/analyses/`，DSH 重启后继续上传没有完成的报告，并核对仍在等待首轮的分析：首轮在观象未运行时结束的，首轮一节注明没有记录到回复。
+- 分析记录最多保留 200 份，最近活动（接受请求或记录一轮）超过 30 天的记录被清理；启动时和每接受一次新分析时清理，正在上传的记录这次跳过。清理删除记录文件和 `$DSH_HOME/logalyze/analyses/<分析 id>/`，话题工作目录里的 `report/` 归话题所有，不删除。
+- 旧版回传命令留下的记录（`$DSH_HOME/logalyze/reports/`）只在面板展示，不再上传，30 天无活动后在启动时删除。
 
 ## 通过飞书使用
 
@@ -318,7 +343,7 @@ pnpm check        # 类型检查（Host 与 Client）+ 单元测试 + 构建 + �
 | `skills/logalyze-kit/` | 接入套件 SKILL 正文 |
 | `skills/logalyze-improve/` | SKILL 改进指南正文 |
 | `src/analyze/` | 日志平台分析接口：请求校验、令牌、到 `feishuTopics` 的转换 |
-| `src/report/` | 报告回传：轮次记录、`report.md` 生成、目录检查、回传命令、持久化 |
+| `src/report/` | 报告回传：轮次记录、每份日志的 `report.md` 生成、文件清单、修订上传、持久化 |
 | `src/settings/` | 面板契约、生效设置与覆盖文件、HTTP 路由 |
 | `src/util/` | 取消、文件读写、HTTP 等通用小工具 |
 | `src/client/` | 左侧栏入口与设置页面 |

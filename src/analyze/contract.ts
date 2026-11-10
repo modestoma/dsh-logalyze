@@ -3,11 +3,11 @@
  *
  * `POST /open-api/logalyze`（DSH Web 服务器上），带
  * `Authorization: Bearer <令牌>`、`Idempotency-Key` 请求头和 JSON 请求体：
- * 发起方类型与标识、触发时间、应用与错误码、日志详情页、目标群（可省略，
- * 用设置面板的默认群）和提示词。合法请求把分析根卡片发进群并回 `202`，
- * 分析随后在卡片下的话题里流式进行。日志包由
- * 提示词调用的分析 SKILL 自行获取，详情页只列在卡片上。带 `logId` 的请求在
- * 分析结束后把报告目录交给回传命令（见 `../report/`）。
+ * 发起方类型与标识、触发时间、目标群（可省略，用设置面板的默认群）、同一
+ * 应用同一错误码的一批日志平台 `logIds` 和可选的调用方说明。观象按 log_id
+ * 向日志平台查元数据（见 `./batch.ts`），合法请求把分析根卡片发进群并回
+ * `202`，分析随后在卡片下的话题里流式进行；每轮结束后每份日志各自收到一份
+ * 报告修订（见 `../report/`）。
  *
  * @module dsh-logalyze/analyze/contract
  */
@@ -15,22 +15,16 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 
+import { MAX_LOGS_LIMIT } from '../config.ts'
 import { CHAT_ID_PATTERN } from '../settings/contract.ts'
 
 export { ANALYZE_ROUTE } from '../settings/contract.ts'
 
-/** Largest accepted request body (the prompt dominates it). */
-export const ANALYZE_MAX_BODY_BYTES = 1024 * 1024
+/** Largest accepted request body. */
+export const ANALYZE_MAX_BODY_BYTES = 256 * 1024
 
-/** Largest accepted prompt, in characters. */
-export const ANALYZE_MAX_PROMPT_CHARS = 100_000
-
-/**
- * Characters kept free in the prompt of a request with `logId` for the
- * report section appended to it, so the launched prompt stays within the
- * `feishuTopics` limit of {@link ANALYZE_MAX_PROMPT_CHARS}.
- */
-export const REPORT_PROMPT_RESERVE = 2000
+/** Largest `instructions`, in characters. */
+export const ANALYZE_MAX_INSTRUCTIONS_CHARS = 20_000
 
 /**
  * `Idempotency-Key` format: 1–200 visible ASCII characters without spaces, so
@@ -41,16 +35,8 @@ export const IDEMPOTENCY_KEY_PATTERN = /^[\x21-\x7E]{1,200}$/u
 /** Feishu `user_id`: not an `open_id` (`ou_`), `union_id` (`on_`), or chat id (`oc_`). */
 const FEISHU_USER_ID = /^(?!ou_|on_|oc_)[A-Za-z0-9_-]+$/u
 
-/**
- * Application / error-code segment: it names a workspace directory
- * (`<baseDir>/analyze/<app>/<errorCode>` below the Feishu channel's
- * `baseDir`), so only path-safe characters pass.
- */
-const SUBJECT_SEGMENT = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$/u
-
-/** Most detail pages one request may list on its root card. */
-export const ANALYZE_MAX_LOG_DETAILS = 50
-
+/** Platform log id: a UUID. */
+const LOG_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u
 
 /**
  * Where an analysis was triggered: `digital` from the digital platform, whose
@@ -67,10 +53,18 @@ export const MACHINE_TRIGGER_ID_MAX = 128
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/u
 
 /**
- * Caller-side id of the analysis, passed to the upload command as one
- * argument: path-safe characters only, never starting with `-` or `.`.
+ * Body fields of the former request format. A request carrying any of them
+ * is refused with this explanation instead of the generic unknown-field
+ * message: the logs, the application, and the error code now come from the
+ * log platform by `logIds`, and reports are uploaded to each log.
  */
-export const LOG_ID_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/u
+const RETIRED_FIELDS: Readonly<Record<string, string>> = {
+  prompt: '提示词由观象按日志生成，补充说明放在 instructions',
+  logDetails: '日志详情页由观象从日志平台读取',
+  logId: '报告按 logIds 回传到每份日志',
+  app: '应用由日志的 component_code 对应到应用别名',
+  errorCode: '错误码取自日志元数据',
+}
 
 /** JSON body of one analyze request. */
 export const analyzeRequestSchema = z.object({
@@ -80,24 +74,13 @@ export const analyzeRequestSchema = z.object({
   triggerId: z.string().min(1).max(MACHINE_TRIGGER_ID_MAX).refine(value => value.trim() !== '', 'must not be blank'),
   /** When the analysis was started on the platform, shown verbatim on the root card. */
   triggeredAt: z.string().min(1).max(64).refine(value => value.trim() !== '', 'must not be blank'),
-  /** Application the logs belong to (workspace directory segment). */
-  app: z.string().regex(SUBJECT_SEGMENT, 'must be 1-128 of A-Z a-z 0-9 . _ -'),
-  /** Error code of the logs (workspace directory segment). */
-  errorCode: z.string().regex(SUBJECT_SEGMENT, 'must be 1-128 of A-Z a-z 0-9 . _ -'),
-  /** Log-platform detail pages of the logs that triggered the analysis (listed on the root card). */
-  logDetails: z.array(z.object({
-    /** Row label. */
-    name: z.string().min(1).max(200).refine(value => value.trim() !== '', 'must not be blank'),
-    /** Detail page address. */
-    url: z.url({ protocol: /^https?$/u, error: 'must be an http(s) URL' }).max(2048),
-  }).strict()).min(1).max(ANALYZE_MAX_LOG_DETAILS),
   /** Target group chat (`oc_…`) the bot is in; omitted uses the panel's default group. */
   chatId: z.string().regex(CHAT_ID_PATTERN, 'must be a Feishu group chat_id (oc_...)').optional(),
-  /** Prompt forwarded verbatim as the analysis Session's first user message. */
-  prompt: z.string().min(1).max(ANALYZE_MAX_PROMPT_CHARS)
-    .refine(value => value.trim() !== '', 'must not be blank'),
-  /** Caller-side analysis id; present means the report is uploaded after every turn. */
-  logId: z.string().regex(LOG_ID_PATTERN, 'must be 1-128 of A-Z a-z 0-9 . _ - and start with a letter, digit, or _').optional(),
+  /** Platform log ids (UUIDs) of one application and one error code; compared in lowercase. */
+  logIds: z.array(z.string().transform(value => value.toLowerCase()).pipe(z.string().regex(LOG_ID, 'must be a log UUID')))
+    .min(1).max(MAX_LOGS_LIMIT),
+  /** The caller's notes for the analysis, shown to the analysis as written. */
+  instructions: z.string().max(ANALYZE_MAX_INSTRUCTIONS_CHARS).refine(value => value.trim() !== '', 'must not be blank').optional(),
 }).strict().superRefine((request, issues) => {
   if (request.triggerType === 'digital' && !FEISHU_USER_ID.test(request.triggerId)) {
     issues.addIssue({ code: 'custom', path: ['triggerId'], message: 'must be a Feishu user_id when triggerType is digital' })
@@ -105,8 +88,10 @@ export const analyzeRequestSchema = z.object({
   if (request.triggerType === 'machine' && CONTROL_CHARS.test(request.triggerId)) {
     issues.addIssue({ code: 'custom', path: ['triggerId'], message: 'must be one line without control characters' })
   }
-  if (request.logId !== undefined && request.prompt.length > ANALYZE_MAX_PROMPT_CHARS - REPORT_PROMPT_RESERVE) {
-    issues.addIssue({ code: 'custom', path: ['prompt'], message: `must be at most ${ANALYZE_MAX_PROMPT_CHARS - REPORT_PROMPT_RESERVE} characters when logId is given` })
+  const seen = new Set<string>()
+  for (const [index, id] of request.logIds.entries()) {
+    if (seen.has(id)) issues.addIssue({ code: 'custom', path: ['logIds', index], message: `duplicate log id ${id}` })
+    seen.add(id)
   }
 })
 
@@ -130,6 +115,8 @@ export interface AnalyzeRefused {
   readonly ok: false
   /** Readable reason (Chinese, shown to platform operators). */
   readonly error: string
+  /** With status 422: the logs that cannot be analyzed and why. */
+  readonly invalidLogs?: readonly { readonly logId: string; readonly reason: string }[]
 }
 
 /** One HTTP answer of the analyze handler. */
@@ -142,16 +129,14 @@ export interface AnalyzeResponse {
  * Fingerprint of one validated request, used to tell a retry of the same
  * request from a reused `Idempotency-Key`. Field order is fixed so stored
  * digests stay comparable; the resolved group is hashed, so a retry after the
- * default group changed is a different request; `logId` is appended only
- * when present.
+ * default group changed is a different request. The leading format tag keeps
+ * keys used with the former request format from matching.
  * @param request - the validated request.
  * @returns SHA-256 hex digest.
  */
 export function analyzeRequestHash(request: AnalyzeRequest): string {
   const canonical = JSON.stringify([
-    request.triggerType, request.triggerId, request.triggeredAt, request.app, request.errorCode,
-    request.logDetails.map(detail => [detail.name, detail.url]), request.chatId, request.prompt,
-    ...request.logId === undefined ? [] : [request.logId],
+    'logIds-v1', request.triggerType, request.triggerId, request.triggeredAt, request.chatId, request.logIds, request.instructions ?? null,
   ])
   return createHash('sha256').update(canonical).digest('hex')
 }
@@ -160,11 +145,19 @@ export function analyzeRequestHash(request: AnalyzeRequest): string {
  * Validate one decoded JSON body and resolve its target group.
  * @param raw - the decoded body.
  * @param defaultChatId - the panel's default group, used when the body has no `chatId`.
+ * @param maxLogs - most `logIds` one request may name (`analyze.maxLogs`).
  * @returns the request, or a readable reason.
  */
-export function parseAnalyzeRequest(raw: unknown, defaultChatId: string | undefined): { ok: true; value: AnalyzeRequest } | { ok: false; error: string } {
+export function parseAnalyzeRequest(raw: unknown, defaultChatId: string | undefined, maxLogs: number): { ok: true; value: AnalyzeRequest } | { ok: false; error: string } {
+  if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+    const retired = Object.keys(raw).filter(key => Object.hasOwn(RETIRED_FIELDS, key))
+    if (retired.length > 0) {
+      return { ok: false, error: `请求参数不合法：${retired.map(key => `${key} 已不再支持（${RETIRED_FIELDS[key]}）`).join('；')}；请改用 logIds 传日志平台的日志 id` }
+    }
+  }
   const parsed = analyzeRequestSchema.safeParse(raw)
   if (parsed.success) {
+    if (parsed.data.logIds.length > maxLogs) return { ok: false, error: `请求参数不合法：logIds 最多 ${maxLogs} 个，本次 ${parsed.data.logIds.length} 个` }
     const chatId = parsed.data.chatId ?? defaultChatId
     if (chatId === undefined) return { ok: false, error: '请求没有 chatId，观象设置面板「分析接口」也没有设置默认群' }
     return { ok: true, value: { ...parsed.data, chatId } }

@@ -1,6 +1,7 @@
 /**
- * 分析接口的 Bearer 令牌：保存在 DSH 凭据库中，凭据名是配置项
- * `analyzeTokenRef`；面板只能看到是否已配置和来源，看不到值。
+ * 保存在 DSH 凭据库中的凭据：分析接口的 Bearer 令牌（凭据名是配置项
+ * `analyzeTokenRef`）和日志平台的 client_secret（`platformSecretRef`）。面板只能
+ * 看到是否已配置和来源，看不到值。
  *
  * @module dsh-logalyze/analyze/token
  */
@@ -20,15 +21,17 @@ const tokenValue = z.string().trim()
 const tokenClearSchema = z.object({ tokenEnv: z.string() }).strict()
 const tokenSetSchema = tokenClearSchema.extend({ value: tokenValue }).strict()
 
-/** The analyze API's bearer token in DSH's credential store. */
-export class AnalyzeToken {
+/** One credential in DSH's credential store. */
+export class StoredCredential {
   /**
-   * @param ref - credential reference (`analyzeTokenRef`).
+   * @param ref - credential reference (`analyzeTokenRef` or `platformSecretRef`).
+   * @param label - what the credential is, in messages (e.g. `分析接口令牌`).
    * @param credentials - DSH's credential store, looked up per use.
    * @param warn - receives credential store failures.
    */
   constructor(
     readonly ref: string,
+    private readonly label: string,
     private readonly credentials: () => HostCredentials | undefined,
     private readonly warn: (message: string) => void,
   ) {}
@@ -39,14 +42,14 @@ export class AnalyzeToken {
   }
 
   /**
-   * Resolve the expected token, read per request.
-   * @returns the token, or undefined when it is not configured or cannot be read.
+   * Resolve the value, read per use.
+   * @returns the value, or undefined when it is not configured or cannot be read.
    */
   async value(): Promise<string | undefined> {
     try {
       return (await this.credentials()?.resolve(this.ref))?.value
     } catch (error) {
-      this.warn(`logalyze: 读取分析接口令牌 ${this.ref} 失败：${messageOf(error)}`)
+      this.warn(`logalyze: 读取${this.label} ${this.ref} 失败：${messageOf(error)}`)
       return undefined
     }
   }
@@ -64,7 +67,7 @@ export class AnalyzeToken {
   }
 
   /**
-   * Store the token; it applies from the next request.
+   * Store the value; it applies from the next use.
    * @param raw - request body `{ tokenEnv, value }`.
    * @throws SettingsError when the body is invalid, the name is not {@link ref}, or no credential store is loaded.
    */
@@ -75,7 +78,7 @@ export class AnalyzeToken {
   }
 
   /**
-   * Remove the stored token; an environment variable of the same name applies again afterwards.
+   * Remove the stored value; an environment variable of the same name applies again afterwards.
    * @param raw - request body `{ tokenEnv }`.
    * @throws SettingsError on the same conditions as {@link set}.
    */
@@ -86,9 +89,9 @@ export class AnalyzeToken {
   }
 
   private async write(tokenEnv: string, value: string | undefined): Promise<void> {
-    if (tokenEnv !== this.ref) throw new SettingsError(`${tokenEnv} 不是分析接口令牌的名称`)
+    if (tokenEnv !== this.ref) throw new SettingsError(`${tokenEnv} 不是${this.label}的名称`)
     const store = this.credentials()
-    if (store === undefined) throw new SettingsError('当前 DSH 组合没有凭据服务（@deepseek-ai/dsh-credentials-local），无法保存令牌')
+    if (store === undefined) throw new SettingsError(`当前 DSH 组合没有凭据服务（@deepseek-ai/dsh-credentials-local），无法保存${this.label}`)
     if (value === undefined) await store.unset(tokenEnv)
     else await store.set(tokenEnv, value)
   }

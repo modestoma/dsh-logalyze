@@ -12,9 +12,10 @@
  * 打开了「日志分析」功能的仓库，只能在 dsh-repo 的设置页添加，镜像由 dsh-repo
  * 拉取；应用描述来自各仓库日志分析分支上的 `.agents/logalyze.yaml`。顶层 Agent
  * 还可以用 `logalyze_init_repo` / `logalyze_submit_init` 为缺少应用描述
- * 的仓库在工作区里起草并推送接入合并请求。另提供日志平台分析接口 `POST /open-api/logalyze`，
- * 经飞书渠道插件的 `feishuTopics` 服务在飞书群话题中开始分析；带 `logId` 的请求在
- * 话题每轮结束后把报告目录交给回传命令。
+ * 的仓库在工作区里起草并推送接入合并请求。另提供日志平台分析接口 `POST /open-api/logalyze`：
+ * 调用方传一批日志平台的 log_id，观象作为 OAuth2 客户端向日志平台查元数据，
+ * 经飞书渠道插件的 `feishuTopics` 服务在飞书群话题中开始分析，话题每轮结束后
+ * 把报告作为新修订传到每份日志。
  *
  * @module dsh-logalyze
  */
@@ -66,7 +67,7 @@ export function apply(ctx: HostContext, config?: unknown, options: LogalyzePlugi
   service.registerSkill()
   service.registerTools()
   mountSettingsRoutes(ctx, service)
-  mountAnalyzeRoute(ctx, service.analyzeGate(), (request, key) => service.trackReport(request, key))
+  mountAnalyzeRoute(ctx, service.analyzeGate(), async (topics, request, key) => await service.acceptAnalysis(topics, request, key))
   ctx.effect(() => {
     void service.boot().catch((error: unknown) => {
       ctx.logger?.error?.('logalyze: 启动失败：%s', messageOf(error))
