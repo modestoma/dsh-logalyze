@@ -1,11 +1,11 @@
 /**
- * 应用注册表：经 dsh-repo 取仓库清单里打开了日志分析的仓库在跟踪分支最新提交
- * 的只读快照，从中读取各仓库的应用描述，对外提供「已就绪的应用」，并为每次
+ * 应用注册表：经 dsh-repo 取仓库清单里打开了日志分析的仓库在日志分析分支最新
+ * 提交的只读快照，从中读取各仓库的应用描述，对外提供「已就绪的应用」，并为每次
  * 派发持有该提交的快照。
  *
- * - 镜像、快照和令牌都由 dsh-repo 管理：每次同步取跟踪分支的快照（dsh-repo 先
- *   从远端拉取），读完应用描述与 SKILL 即释放，不受正在进行的分析影响。快照在
- *   所有持有者释放后由 dsh-repo 清理。
+ * - 镜像、拉取、快照和令牌都由 dsh-repo 管理：每次读取取日志分析分支的快照，
+ *   读完应用描述与 SKILL 即释放，不受正在进行的分析影响。快照在所有持有者释放
+ *   后由 dsh-repo 清理。
  * - dsh-repo 不可用或更新失败时继续使用已有提交，并在状态里给出原因；应用描述
  *   或 SKILL 不合法时该应用不可用。
  * - 多个仓库声明同一个应用 id 时，这些仓库全部不可用。
@@ -266,18 +266,6 @@ export class RepoRegistry {
    */
   setupPending(): string[] {
     return this.entries.filter(entry => entry.writable && entry.commit !== undefined && entry.app === undefined && entry.syncing === undefined).map(entry => entry.spec.url)
-  }
-
-  /**
-   * The branch a configured address follows.
-   * @param url - configured repository address.
-   * @returns the catalog branch, or undefined when it follows the remote's default branch.
-   * @throws when the address is not configured.
-   */
-  branchOf(url: string): string | undefined {
-    const entry = this.entries.find(item => item.spec.url === url)
-    if (entry === undefined) throw new Error(`仓库 ${url} 已不是观象的应用仓库`)
-    return entry.spec.branch
   }
 
   private unknownMessage(ids: readonly string[]): string {

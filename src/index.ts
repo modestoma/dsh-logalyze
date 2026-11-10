@@ -9,9 +9,9 @@
  * 用户于分析结论之后的消息中同意改进时，由一个改进子 Agent 把该应用的所有改进点
  * 在运行目录的可写工作区里按 `/logalyze-improve` 改进 SKILL 并沉淀案例，经
  * `dshRepos` 服务推送到新分支并创建合并请求。应用仓库是 dsh-repo 仓库清单中
- * 打开了「日志分析」功能的仓库，由插件拉取；应用描述来自各仓库的
- * `.agents/logalyze.yaml`。顶层 Agent 还可以用 `logalyze_add_repo` 在对话中
- * 把仓库加入 dsh-repo 的仓库清单，并用 `logalyze_init_repo` / `logalyze_submit_init` 为缺少应用描述
+ * 打开了「日志分析」功能的仓库，只能在 dsh-repo 的设置页添加，镜像由 dsh-repo
+ * 拉取；应用描述来自各仓库日志分析分支上的 `.agents/logalyze.yaml`。顶层 Agent
+ * 还可以用 `logalyze_init_repo` / `logalyze_submit_init` 为缺少应用描述
  * 的仓库在工作区里起草并推送接入合并请求。另提供日志平台分析接口 `POST /open-api/logalyze`，
  * 经飞书渠道插件的 `feishuTopics` 服务在飞书群话题中开始分析；带 `logId` 的请求在
  * 话题每轮结束后把报告目录交给回传命令。

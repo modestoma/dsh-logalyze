@@ -4,7 +4,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { defaultsOf, resolveConfig } from '../src/config.ts'
 import type { Agent, SubagentActivation, SubagentResult, SubagentService } from '../src/host.ts'
 import { CatalogFollower } from '../src/apps/catalog.ts'
-import { renderAddRepoValue, RepoAdder } from '../src/onboard/add.ts'
 import { checkInitDraft } from '../src/onboard/draft.ts'
 import { renderInitRepoValue, renderSubmitInitValue, RepoInitializer } from '../src/onboard/init.ts'
 import { renderInitPrompt } from '../src/onboard/prompt.ts'
@@ -53,94 +52,6 @@ async function writeDraft(workDir: string, files: Record<string, string>, reason
 const parent: Agent = { id: 'parent', session: { header: { id: 'parent' } } }
 const child: Agent = { id: 'child', session: { header: { id: 'parent', delegationDepth: 1 } } }
 const run = (agent: Agent = parent) => ({ signal: new AbortController().signal, agent, callId: 'call-1' })
-
-describe('logalyze_add_repo', () => {
-  const READY = 'https://git.example.com/shop/order-service.git'
-  const BARE = 'https://git.example.com/shop/billing.git'
-  const MISSING = 'https://git.example.com/shop/missing.git'
-
-  async function setup() {
-    const root = await dir()
-    const repos = new FakeRepos(join(root, 'mirrors'))
-    repos.origins.set(READY, await createAppRepo(join(root, 'order-service')))
-    repos.origins.set(BARE, await bareRepo(join(root, 'billing')))
-    const client = new ReposClient(() => repos)
-    const registry = new RepoRegistry({ repos: client, onChange: () => {} })
-    const catalog = new CatalogFollower({ registry, repos: client, active: () => true, error: () => {} })
-    const adder = new RepoAdder({ registry, addRepo: (spec, caller) => catalog.add(spec, caller) })
-    return { repos, registry, adder }
-  }
-
-  it('adds the repository through dsh-repo for the calling Agent and reports the usable application', async () => {
-    const { repos, adder } = await setup()
-    const added = await adder.execute({ url: READY }, run())
-    expect(repos.addRepoCalls).toEqual([expect.objectContaining({ repo: READY, access: 'write', features: ['log-analysis'], agent: parent, callId: 'call-1' })])
-    expect(added).toMatchObject({ status: 'added', setup: 'ready', repo: { phase: 'ready', app: { id: 'order-service' } } })
-    expect(renderAddRepoValue(added)[0]?.text).toContain('应用「订单服务」（id: order-service）可用')
-
-    // A repository already in the list is re-synced without asking dsh-repo again.
-    const again = await adder.execute({ url: READY }, run())
-    expect(again).toMatchObject({ status: 'exists', setup: 'ready' })
-    expect(repos.addRepoCalls).toHaveLength(1)
-    expect(renderAddRepoValue(again)[0]?.text).toContain('已是观象的应用仓库')
-  })
-
-  it('reports a declined approval without adding, and passes other dsh-repo refusals on', async () => {
-    const { repos, registry, adder } = await setup()
-    repos.addRepoError = declinedError('rejected')
-    expect(await adder.execute({ url: READY }, run())).toEqual({ status: 'rejected', url: READY })
-    repos.addRepoError = declinedError('unavailable')
-    expect(await adder.execute({ url: READY }, run())).toEqual({ status: 'unavailable', url: READY })
-    repos.addRepoError = repoError('forbidden', 'dsh-repo 已关闭写操作')
-    await expect(adder.execute({ url: READY }, run())).rejects.toThrow('dsh-repo 已关闭写操作')
-    expect(registry.has(READY)).toBe(false)
-  })
-
-  it('stops waiting when the call is cancelled while dsh-repo asks', async () => {
-    const { repos, adder } = await setup()
-    repos.addRepoError = declinedError('cancelled')
-    const controller = new AbortController()
-    controller.abort(new Error('用户取消'))
-    await expect(adder.execute({ url: READY }, { ...run(), signal: controller.signal })).rejects.toThrow('用户取消')
-  })
-
-  it('points to drafting when the repository synced without a description, and to tokens when the sync failed', async () => {
-    const { adder } = await setup()
-    const value = await adder.execute({ url: BARE }, run())
-    expect(value).toMatchObject({ status: 'added', setup: 'needs-setup', repo: { phase: 'failed', error: '仓库缺少应用描述 .agents/logalyze.yaml' } })
-    expect(renderAddRepoValue(value)[0]?.text).toContain('调用 logalyze_init_repo 起草')
-
-    const missing = await adder.execute({ url: MISSING }, run())
-    expect(missing).toMatchObject({ status: 'added', setup: 'failed' })
-    expect(renderAddRepoValue(missing)[0]?.text).toContain('dsh-repo 插件页为该主机配置令牌')
-  })
-
-  it('points to dsh-repo access when a read-only catalog entry lacks a description', async () => {
-    const { repos, adder } = await setup()
-    repos.catalog.push({ id: 'ffffffffffff', url: BARE, access: 'read', features: [] })
-    const value = await adder.execute({ url: BARE }, run())
-    expect(value).toMatchObject({ status: 'added', setup: 'read-only', repo: { writable: false } })
-    expect(renderAddRepoValue(value)[0]?.text).toContain('权限是「只读」，观象不能为它起草')
-  })
-
-  it('refuses invalid calls before asking dsh-repo', async () => {
-    const { repos, adder } = await setup()
-    await adder.execute({ url: READY }, run())
-    await expect(adder.execute({ url: READY, branch: 'release' }, run())).rejects.toThrow('改分支请在 dsh-repo')
-    await expect(adder.execute({ url: 'ext::sh -c id' }, run())).rejects.toThrow('不支持的 git 地址')
-    await expect(adder.execute({ url: 'git@github.com:example/order-service.git' }, run())).rejects.toThrow('不支持 ssh')
-    await expect(adder.execute({ url: '/srv/git/app' }, run())).rejects.toThrow('不支持的 git 地址')
-    await expect(adder.execute({ url: 'file:///srv/git/app' }, run())).rejects.toThrow('不支持的 git 地址')
-    await expect(adder.execute({ url: READY, extra: 1 }, run())).rejects.toThrow('参数不合法')
-    await expect(adder.execute({ url: BARE }, run(child))).rejects.toThrow('不能在子 Agent 中调用')
-    expect(repos.addRepoCalls).toHaveLength(1)
-  })
-
-  it('renders declined outcomes without claiming the repository was added', () => {
-    expect(renderAddRepoValue({ status: 'unavailable', url: READY })[0]?.text).toContain('没有添加')
-    expect(renderAddRepoValue({ status: 'cancelled', url: READY })[0]?.text).toContain('撤回')
-  })
-})
 
 describe('init drafts', () => {
   /** A workspace of a repository without `.agents/`, opened in a run directory. */
@@ -274,7 +185,9 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     const [started] = children.started
     expect(started?.spec).toMatchObject({ provider: 'spawn', label: '观象接入起草', delivery: 'caller', parent: agent, maxDepth: 1 })
     expect(started?.spec.cwd).toBe(join(workDir, 'repo'))
-    expect(repos.creates).toEqual([{ repo: origin, path: join(workDir, 'repo'), commit: value.commit, branch: `logalyze/init-${workDir.split('/').at(-2)}`, agent, callId: 'call-2', signal: exec.signal }])
+    // dsh-repo picks the baseline branch and names the branch from its template.
+    expect(repos.creates).toEqual([{ repo: origin, path: join(workDir, 'repo'), agent, callId: 'call-2', signal: exec.signal }])
+    expect(value.commit).toBe(git(origin, 'rev-parse', 'main').trim())
     expect(started?.spec.prompt[0]?.text).toContain('支付回调最常出问题')
     expect(started?.dispose).toHaveBeenCalled()
     expect(renderInitRepoValue(value)[0]?.text).toContain(`调用 logalyze_submit_init（workDir 为 ${workDir}）`)
@@ -283,14 +196,14 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     // dsh-repo asks the user; a declined push pushes nothing and can be submitted again.
     repos.pushError = declinedError('rejected')
     const rejected = await initializer.submit({ workDir }, exec)
-    expect(rejected).toMatchObject({ status: 'rejected', app: 'billing-service', target: 'main', branch: repos.creates[0]?.branch })
+    expect(rejected).toMatchObject({ status: 'rejected', app: 'billing-service', target: 'main', branch: 'dsh/parent' })
     expect(repos.pushes).toEqual([])
     expect(renderSubmitInitValue(rejected)[0]?.text).toContain('可以手动提交')
 
     repos.pushError = undefined
     const opened = await initializer.submit({ workDir }, exec)
     expect(opened).toMatchObject({ status: 'opened', mergeRequestUrl: MR_URL, branch: rejected.branch })
-    expect(workspacePush).toHaveBeenLastCalledWith({ path: join(workDir, 'repo'), message: expect.any(String), mr: { title: 'chore: 接入观象日志分析：订单服务（billing-service）', body: expect.stringContaining('合并后观象下一次加载 /logalyze 时启用该应用') }, agent, callId: 'call-2', signal: exec.signal })
+    expect(workspacePush).toHaveBeenLastCalledWith({ path: join(workDir, 'repo'), message: expect.any(String), mr: { title: 'chore: 接入观象日志分析：订单服务（billing-service）', body: expect.stringContaining('日志分析读取的分支包含这些文件时') }, agent, callId: 'call-2', signal: exec.signal })
     const [push] = repos.pushes
     expect(push?.session).toBe('parent')
     expect(push?.files).toEqual({
@@ -301,7 +214,7 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
     expect(push?.message).toMatch(new RegExp(`^chore: 接入观象日志分析：订单服务（billing-service）\\n\\n按 Controller[\\s\\S]*Base-commit: ${value.commit}\\n`))
     expect(git(origin, 'rev-parse', `${opened.branch}^`).trim()).toBe(value.commit)
     expect(openMr).toHaveBeenCalledWith(expect.objectContaining({ repo: origin, branch: opened.branch, base: 'main', title: 'chore: 接入观象日志分析：订单服务（billing-service）' }))
-    expect(renderSubmitInitValue(opened)[0]?.text).toContain('合并后观象下一次加载 /logalyze 时启用应用 billing-service')
+    expect(renderSubmitInitValue(opened)[0]?.text).toContain('观象在下一次加载 /logalyze 时启用应用 billing-service')
 
     // The draft was pushed; submitting again does not push.
     const again = await initializer.submit({ workDir }, exec)
@@ -363,7 +276,7 @@ describe('logalyze_init_repo and logalyze_submit_init', () => {
   it('refuses repositories that are not configured, not synced, or read-only, child agents, and missing services', async () => {
     const { initializer, agent, registry, origin, other, children } = await setup(goodDraft)
     const exec = { signal: new AbortController().signal, agent }
-    await expect(initializer.draft({ url: '/nowhere' }, exec)).rejects.toThrow('先用 logalyze_add_repo 添加')
+    await expect(initializer.draft({ url: '/nowhere' }, exec)).rejects.toThrow('请管理员在 dsh-repo「代码仓库 → 仓库」中添加它')
     registry.configure([{ url: origin, writable: false }, { url: other, writable: true }])
     await expect(initializer.draft({ url: origin }, exec)).rejects.toThrow('权限是「只读」')
     expect(children.started).toHaveLength(0)

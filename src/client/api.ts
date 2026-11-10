@@ -4,7 +4,7 @@
  * @module dsh-logalyze/client/api
  */
 
-import { REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
+import { REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
 import type { EditableSettings, MutationError, MutationOk, StateWire } from '../settings/contract.ts'
 
 /**
@@ -65,15 +65,6 @@ export async function saveSettings(settings: EditableSettings): Promise<StateWir
 /** @returns the state after removing every panel override. */
 export async function resetSettings(): Promise<StateWire> {
   return (await request<MutationOk>(SETTINGS_ROUTE, { method: 'DELETE' })).state
-}
-
-/**
- * Re-sync one repository or all of them.
- * @param url - repository address; omitted syncs all.
- * @returns the state right after the sync started.
- */
-export async function syncRepos(url?: string): Promise<StateWire> {
-  return (await request<MutationOk>(SYNC_ROUTE, { method: 'POST', body: JSON.stringify(url === undefined ? {} : { url }) })).state
 }
 
 /**

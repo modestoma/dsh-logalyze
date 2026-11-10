@@ -34,7 +34,7 @@
  */
 
 import { randomBytes } from 'node:crypto'
-import { basename, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { z } from 'zod'
 import { disablesUserInvocation, skillDir, skillNameOf } from '../apps/manifest.ts'
 import type { RepoRegistry } from '../apps/registry.ts'
@@ -435,17 +435,13 @@ export class SkillImprover {
     const { bases, feedback } = request
     const tasks = bases.map(basis => basis.record.task)
     const caseRequired = tasks.length > 0
-    const { app, url, commit } = this.deps.registry.readyApp(request.app.id)
-    const base = this.deps.registry.branchOf(url)
+    const { app, url } = this.deps.registry.readyApp(request.app.id)
     const improveDir = join(request.parentDir, `improve-${randomBytes(3).toString('hex')}`)
     const { workspace, repoDir, logs: extra } = await openWorkspace({
       repos: this.deps.repos,
       parent,
       exec,
       repo: url,
-      base,
-      commit,
-      branch: `logalyze/skill-${app.id}-${basename(request.parentDir)}`,
       workDir: improveDir,
       sources: request.sources,
       download: settings.download,
@@ -462,7 +458,7 @@ export class SkillImprover {
     }))
     const prompt = renderImprovePrompt({
       app,
-      commit,
+      commit: workspace.baseCommit,
       analyses,
       ...feedback === undefined ? {} : { feedback },
       logs,

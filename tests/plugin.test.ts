@@ -140,8 +140,8 @@ describe('plugin', () => {
     h.repos.setCatalog([{ url: origin }])
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
     expect(h.skills.map(skill => skill.name)).toEqual(['dsh-logalyze'])
-    expect(h.tools.map(tool => tool.definition.name)).toEqual(['logalyze_dispatch', 'logalyze_improve_skill', 'logalyze_show_skill', 'logalyze_add_repo', 'logalyze_init_repo', 'logalyze_submit_init'])
-    const [tool, improve, show, add, init, submit] = h.tools
+    expect(h.tools.map(tool => tool.definition.name)).toEqual(['logalyze_dispatch', 'logalyze_improve_skill', 'logalyze_show_skill', 'logalyze_init_repo', 'logalyze_submit_init'])
+    const [tool, improve, show, init, submit] = h.tools
     const signal = new AbortController().signal
     const step = (depth?: number) => ({ agent: { id: 'a', session: { header: { id: 'a', ...depth === undefined ? {} : { delegationDepth: depth } } } }, signal })
     // The condition waits for the first sync, so a step prepared during startup still sees the cloned application.
@@ -152,9 +152,7 @@ describe('plugin', () => {
     expect(await improve!.when?.(step(1))).toBe(false)
     expect(await show!.when?.(step())).toBe(true)
     expect(await show!.when?.(step(1))).toBe(false)
-    // Adding is always offered at the top level; drafting needs a repository without an application, submitting a draft.
-    expect(await add!.when?.(step())).toBe(true)
-    expect(await add!.when?.(step(1))).toBe(false)
+    // Drafting needs a repository without an application, submitting a draft.
     expect(await init!.when?.(step())).toBe(false)
     expect(await submit!.when?.(step())).toBe(false)
     const [candidate] = await h.skills[0]!.list({})
@@ -187,7 +185,7 @@ describe('plugin', () => {
     }
   })
 
-  it('adds a repository from a conversation to the dsh-repo catalog and offers drafting while it lacks a description', async () => {
+  it('offers drafting while a writable catalog repository lacks a description', async () => {
     const { dir, cleanup } = await tempDir()
     cleanups.push(cleanup)
     const local = await createAppRepo(join(dir, 'order-service'))
@@ -196,30 +194,19 @@ describe('plugin', () => {
     const h = await harness()
     cleanups.push(h.dispose)
     h.repos.origins.set(origin, local)
-    const overlayPath = join(dir, 'settings.json')
-    apply(h.ctx, {}, { overlayPath })
-    const [, , , add, init] = h.tools
+    h.repos.setCatalog([{ url: origin }])
+    apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
+    const [, , , init] = h.tools
     const step = { agent: { id: 'a', session: { header: { id: 'a' } } }, signal: new AbortController().signal, callId: 'call-1' }
-    expect(await init!.when?.(step)).toBe(false)
-    const value = await add!.definition.execute({ url: origin }, step)
-    expect(value).toMatchObject({ status: 'added', setup: 'needs-setup' })
-    expect(h.repos.addRepoCalls).toEqual([{ repo: origin, access: 'write', features: ['log-analysis'], agent: step.agent, callId: 'call-1', signal: step.signal }])
-    expect(h.repos.catalog).toMatchObject([{ url: origin, access: 'write', features: ['log-analysis'] }])
-    const state = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
-    expect(state.repos).toMatchObject([{ url: origin, available: false }])
-    expect(state.settings).not.toHaveProperty('repos')
     expect(await init!.when?.(step)).toBe(true)
+    const state = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
+    expect(state.repos).toMatchObject([{ url: origin, available: false, writable: true }])
+    expect(state.settings).not.toHaveProperty('repos')
 
-    // A catalog entry without the feature gets it turned on and keeps its access.
-    const other = 'https://git.example.com/shop/other.git'
-    h.repos.origins.set(other, await createAppRepo(join(dir, 'other')))
-    h.repos.catalog.push({ id: 'ffffffffffff', url: other, access: 'read', features: [] })
-    expect(await add!.definition.execute({ url: other }, step)).toMatchObject({ status: 'added', setup: 'ready' })
-    expect(h.repos.catalog.find(repo => repo.url === other)).toMatchObject({ access: 'read', features: ['log-analysis'] })
-
-    // dsh-repo refusing the addition fails the call.
-    h.repos.addRepoError = Object.assign(new Error('addRepo 未获授权，没有执行：不是管理员'), { name: 'RepoError', code: 'forbidden' })
-    await expect(add!.definition.execute({ url: 'https://git.example.com/shop/third.git' }, step)).rejects.toThrow('不是管理员')
+    // A read-only entry is analyzed only, so nothing is drafted for it.
+    h.repos.catalog = h.repos.catalog.map(repo => ({ ...repo, access: 'read' }))
+    h.repos.emitReposChange()
+    await waitFor(async () => await init!.when?.(step) === false)
   })
 
   it('follows the dsh-repo catalog: repositories with the log analysis feature are the application repositories', async () => {
@@ -236,10 +223,14 @@ describe('plugin', () => {
     expect(await h.tools[0]!.when?.(step)).toBe(false)
     expect((await state()).repos).toEqual([])
 
-    h.repos.catalog = [{ id: '000000000001', url: origin, branch: 'main', access: 'read', features: ['log-analysis'] }, ...h.repos.catalog]
+    // The analysis reads the feature's branch, else the baseline branch.
+    h.repos.catalog = [{ id: '000000000001', url: origin, base: 'dev', access: 'read', features: [{ id: 'log-analysis', branch: 'main' }] }, ...h.repos.catalog]
     h.repos.emitReposChange()
     await waitFor(async () => await h.tools[0]!.when?.(step) === true)
     expect((await state()).repos).toMatchObject([{ url: origin, branch: 'main', phase: 'ready' }])
+    h.repos.catalog = [{ id: '000000000001', url: origin, base: 'main', access: 'read', features: [{ id: 'log-analysis' }] }, ...h.repos.catalog.slice(1)]
+    h.repos.emitReposChange()
+    await waitFor(async () => (await state()).repos[0]?.branch === 'main' && (await state()).repos[0]?.phase === 'ready')
 
     h.repos.setCatalog([{ url: origin }, { url: other }], [])
     expect((await state()).repos).toEqual([])
@@ -326,10 +317,9 @@ describe('plugin', () => {
     expect(invalid.status).toBe(400)
     expect((await json<{ error: string }>(invalid)).error).toMatch(/^maxAppsPerRequest: /)
 
-    const crossSite = await fetch(`${h.base}/logalyze/sync`, { method: 'POST', headers: { origin: 'https://evil.example' } })
+    const crossSite = await fetch(`${h.base}/logalyze/settings`, { method: 'PUT', headers: { origin: 'https://evil.example' } })
     expect(crossSite.status).toBe(403)
-    const unknown = await fetch(`${h.base}/logalyze/sync`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: '/nope' }) })
-    expect(unknown.status).toBe(400)
+    expect((await fetch(`${h.base}/logalyze/sync`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status).toBe(404)
     expect((await fetch(`${h.base}/logalyze/state`, { method: 'POST' })).status).toBe(405)
 
     const reset = await fetch(`${h.base}/logalyze/settings`, { method: 'DELETE' })

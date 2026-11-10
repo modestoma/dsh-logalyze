@@ -243,10 +243,11 @@ describe('logalyze_improve_skill', () => {
     const improveDir = improveDirOf(child!)
     expect(improveDir).toMatch(new RegExp(`^${escape(join(agent.session.header.cwd as string, '.logalyze', 'runs'))}/20261031-220000-[0-9a-f]{6}/improve-[0-9a-f]{6}$`))
     expect(child?.spec.cwd).toBe(join(improveDir, 'repo'))
-    // The workspace is a clone at the latest synced commit, pushing to a new branch named after the run.
+    // The workspace is a clone of the baseline head.
     expect(await readFile(join(improveDir, 'repo', SKILL), 'utf8')).toBe(skill)
     expect(await stat(join(improveDir, 'repo', '.git')).then(() => true, () => false)).toBe(true)
-    expect(repos.service.creates).toEqual([{ repo: origin, path: join(improveDir, 'repo'), commit: status.commit, branch: expect.stringMatching(/^logalyze\/skill-order-service-20261031-220000-[0-9a-f]{6}$/), agent, callId: 'call-1', signal: exec.signal }])
+    // dsh-repo starts from the baseline head and names the branch from its template.
+    expect(repos.service.creates).toEqual([{ repo: origin, path: join(improveDir, 'repo'), agent, callId: 'call-1', signal: exec.signal }])
     const prompt = child?.spec.prompt[0]?.text as string
     expect(prompt.split('\n')[0]).toBe('/logalyze-improve')
     expect(prompt).toContain('本会话的一次日志分析之后，分析子 Agent 认为这个 SKILL 没能很好地覆盖遇到的问题，用户同意改进。下面列出的所有改进点都在这一次修改中完成。')
@@ -278,7 +279,7 @@ describe('logalyze_improve_skill', () => {
       files: [{ path: SKILL, added: 4, removed: 0 }, { path: `.agents/skills/log-analysis/${CASE}`, added: 1, removed: 0 }],
       output: '- SKILL.md：补充 traceId\n- cases/2026-10-31-trace-id.md：新增案例',
     })
-    expect(value.branch).toBe(repos.service.creates[0]?.branch)
+    expect(value.branch).toBe('dsh/parent')
     expect(await readFile(value.diffPath!, 'utf8')).toContain('+# traceId 串联')
     expect(child?.dispose).toHaveBeenCalledTimes(1)
     expect(registry.status()[0]?.activeRuns).toBe(0)
@@ -417,12 +418,13 @@ describe('logalyze_improve_skill', () => {
       improver.turnEnded('parent')
       repos.service.pushError = error
       const again = improver.execute({ app: 'order-service', workDirs: [task.workDir] }, exec)
-      await finishChild(started, index, { [IN_SKILL(CASE)]: '# c\n' })
+      // Later improvements of the Session continue its branch, so each one changes the case again.
+      await finishChild(started, index, { [IN_SKILL(CASE)]: `# c${index}\n` })
       return await again
     }
     const exists = await attempt(1, repoError('conflict', '远端分支已经变化'))
     expect(exists.status).toBe('exists')
-    expect(exists.branch).not.toBe(pushed.branch)
+    expect(exists.branch).toBe(pushed.branch)
     expect(renderImproveValue(exists)[0]?.text).toContain('在远端已有其他提交')
     const rejected = await attempt(2, declinedError('rejected'))
     expect(rejected.status).toBe('rejected')
@@ -481,7 +483,7 @@ describe('logalyze_improve_skill', () => {
     improver.turnEnded('parent')
     const running = improver.execute({ app: 'order-service' }, { signal: new AbortController().signal, agent })
     await waitForStarts(started, 1)
-    expect(started[0]?.spec.prompt[0]?.text).toContain(`这次分析时的提交是 \`${'a'.repeat(12)}\`，之后仓库有更新`)
+    expect(started[0]?.spec.prompt[0]?.text).toContain(`这次分析时的提交是 \`${'a'.repeat(12)}\`，和工作区的提交不同`)
     started[0]?.settle({ stopReason: 'completed', output: [] })
     expect((await running).status).toBe('failed')
   })

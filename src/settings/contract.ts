@@ -9,8 +9,6 @@
 export const STATE_ROUTE = '/logalyze/state'
 /** PUT：保存可编辑设置；DELETE：清除面板覆盖、恢复 cordis.yml 默认值。应用仓库不在这里编辑，来自 dsh-repo 的仓库清单。 */
 export const SETTINGS_ROUTE = '/logalyze/settings'
-/** POST：立即重新拉取全部仓库，或 body `{ url }` 指定的一个仓库。 */
-export const SYNC_ROUTE = '/logalyze/sync'
 /** POST：body `{ id }` 立即重新上传一份分析报告，不论上次是否成功。 */
 export const REPORT_UPLOAD_ROUTE = '/logalyze/reports/upload'
 /** PUT：body `{ tokenEnv, value }` 把分析接口令牌存入 DSH 凭据库；DELETE：body `{ tokenEnv }` 删除已存的值。只接受分析接口令牌的名称。 */
@@ -26,7 +24,7 @@ export const ANALYZE_ROUTE = '/open-api/logalyze'
 export interface RepoSpec {
   /** Git remote address as the catalog stores it, mirrored by dsh-repo. */
   url: string
-  /** Remote branch to follow; omitted follows the remote's default branch. */
+  /** Branch the analysis reads: the log analysis feature's branch, else the catalog entry's baseline branch; omitted reads the remote's default branch. */
   branch?: string
 }
 
@@ -92,7 +90,7 @@ export interface AnalyzeSettings {
 
 /** The settings the Web panel can override; every field is required on the wire. */
 export interface EditableSettings {
-  /** Minimum age of a repository's last sync before loading `/logalyze` syncs it again, in milliseconds; 0 syncs on every load. */
+  /** Minimum age of a repository's last read of its application description before loading `/logalyze` reads it again, in milliseconds; 0 reads on every load. */
   fetchIntervalMs: number
   /** Maximum number of child analyses one dispatch may start. */
   maxAppsPerRequest: number

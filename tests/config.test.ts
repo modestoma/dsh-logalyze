@@ -1,38 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { applyOverlay, defaultsOf, isAcceptedBranch, isAcceptedGitUrl, overlaySchema, resolveConfig } from '../src/config.ts'
+import { applyOverlay, defaultsOf, overlaySchema, resolveConfig } from '../src/config.ts'
 import { diffOverlay } from '../src/settings/overlay.ts'
-
-describe('git address policy', () => {
-  it.each([
-    'https://github.com/example/pay-service.git',
-    'https://gitlab.example.com:8443/team/app.git',
-  ])('accepts %s', (url) => {
-    expect(isAcceptedGitUrl(url)).toBe(true)
-  })
-
-  it.each([
-    'git@github.com:example/order-service.git',
-    'ssh://git@git.example.com:2222/team/app.git',
-    'git://example.com/a.git',
-    'http://example.com/a.git',
-    'ext::sh -c id',
-    '--upload-pack=touch /tmp/x',
-    'relative/path',
-    'ftp://example.com/a.git',
-    'file:///srv/git/app.git',
-    '/srv/git/app',
-    '',
-  ])('refuses %s', (url) => {
-    expect(isAcceptedGitUrl(url)).toBe(false)
-  })
-
-  it('refuses branch names that could be read as options or ranges', () => {
-    expect(isAcceptedBranch('release/1.2')).toBe(true)
-    expect(isAcceptedBranch('-f')).toBe(false)
-    expect(isAcceptedBranch('a..b')).toBe(false)
-    expect(isAcceptedBranch('a b')).toBe(false)
-  })
-})
 
 describe('configuration', () => {
   it('defaults every field', () => {

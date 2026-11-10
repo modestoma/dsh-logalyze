@@ -11,7 +11,7 @@ import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
 import type { LogalyzeService } from '../service.ts'
 import { HttpError, mediaTypeOf, readBody, sendJson } from '../util/http.ts'
 import { SettingsError } from './controller.ts'
-import { REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_ROUTE, TOKEN_ROUTE } from './contract.ts'
+import { REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
@@ -37,12 +37,9 @@ export function isSameOriginRequest(req: IncomingMessage): boolean {
   }
 }
 
-async function readJsonBody(req: IncomingMessage, optional: boolean): Promise<unknown> {
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const text = await readBody(req, MAX_BODY_BYTES)
-  if (text === '') {
-    if (optional) return undefined
-    throw new HttpError(400, '请求体为空')
-  }
+  if (text === '') throw new HttpError(400, '请求体为空')
   if (mediaTypeOf(req) !== 'application/json') throw new HttpError(415, '请求体必须是 application/json')
   try {
     return JSON.parse(text)
@@ -103,27 +100,15 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
         const state = req.method?.toUpperCase() === 'DELETE'
           ? await service.reset()
-          : await service.save(await readJsonBody(req, false))
+          : await service.save(await readJsonBody(req))
         sendJson(res, 200, { ok: true, state })
-      }),
-    }),
-    server.register({
-      kind: 'exact',
-      path: SYNC_ROUTE,
-      handler: guarded(gate, ['POST'], async (req, res) => {
-        const body = await readJsonBody(req, true)
-        const url = typeof body === 'object' && body !== null && typeof (body as { url?: unknown }).url === 'string'
-          ? (body as { url: string }).url
-          : undefined
-        service.sync(url)
-        sendJson(res, 200, { ok: true, state: await service.state() })
       }),
     }),
     server.register({
       kind: 'exact',
       path: TOKEN_ROUTE,
       handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
-        const body = await readJsonBody(req, false)
+        const body = await readJsonBody(req)
         const state = req.method?.toUpperCase() === 'DELETE' ? await service.clearToken(body) : await service.setToken(body)
         sendJson(res, 200, { ok: true, state })
       }),
@@ -132,7 +117,7 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       kind: 'exact',
       path: REPORT_UPLOAD_ROUTE,
       handler: guarded(gate, ['POST'], async (req, res) => {
-        sendJson(res, 200, { ok: true, state: await service.retryReport(await readJsonBody(req, false)) })
+        sendJson(res, 200, { ok: true, state: await service.retryReport(await readJsonBody(req)) })
       }),
     }),
   ]

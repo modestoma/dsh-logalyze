@@ -1,15 +1,15 @@
 /**
  * 左侧栏「观象」主区页面：应用仓库、日志下载、分析接口、高级（含 SKILL 改进）四个
  * 分页，后三个共用一份草稿和底部保存条。应用仓库分页只读：仓库在 dsh-repo 的
- * 仓库清单中添加并打开「日志分析」功能，分页显示拉取状态并提供跳转。
- * 仓库拉取中时每 2 秒刷新状态；打开「分析接口」分页时每 5 秒刷新回传记录。
+ * 仓库清单中添加并打开「日志分析」功能，镜像的拉取和拉取状态都在 dsh-repo；
+ * 分页显示各仓库的应用状态并提供跳转。读取应用描述期间每 2 秒刷新状态；打开「分析接口」分页时每 5 秒刷新回传记录。
  *
  * @module dsh-logalyze/client/page
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { AnalyzeWire, EditableKey, EditableSettings, ReportStatus, ReportWire, RepoStatusWire, StateWire, TokenStatusWire, UploadPhase } from '../settings/contract.ts'
-import { clearToken, fetchState, messageOf, resetSettings, retryReport, saveSettings, saveToken, syncRepos } from './api.ts'
+import { clearToken, fetchState, messageOf, resetSettings, retryReport, saveSettings, saveToken } from './api.ts'
 
 /** Sidebar label and page title. */
 export const PANEL_TITLE = '观象'
@@ -133,11 +133,12 @@ function formatTime(iso: string | number | undefined): string {
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleString()
 }
 
-function phasePill(repo: RepoStatusWire): JSX.Element {
-  if (repo.phase === 'syncing') return <span className="lz__pill lz__pill--warn"><span className="lz__dot" />拉取中</span>
-  if (repo.available) return <span className="lz__pill lz__pill--ok"><span className="lz__dot" />就绪</span>
-  if (repo.phase === 'ready' || repo.phase === 'failed') return <span className="lz__pill lz__pill--bad"><span className="lz__dot" />不可用</span>
-  return <span className="lz__pill"><span className="lz__dot" />待拉取</span>
+function appPill(repo: RepoStatusWire): JSX.Element {
+  if (repo.phase === 'syncing') return <span className="lz__pill lz__pill--warn"><span className="lz__dot" />读取中</span>
+  if (repo.available) return <span className="lz__pill lz__pill--ok"><span className="lz__dot" />已配置</span>
+  if (repo.commit !== undefined && repo.app === undefined) return <span className="lz__pill lz__pill--warn" title={repo.writable ? '在对话中让观象起草接入（logalyze_init_repo）' : undefined}><span className="lz__dot" />{repo.writable ? '缺应用描述，可初始化' : '缺应用描述'}</span>
+  if (repo.phase === 'failed' || repo.phase === 'ready') return <span className="lz__pill lz__pill--bad"><span className="lz__dot" />不可用</span>
+  return <span className="lz__pill"><span className="lz__dot" />等待读取</span>
 }
 
 function Overridden({ keys, name }: { keys: readonly EditableKey[]; name: EditableKey }): JSX.Element | null {
@@ -265,7 +266,7 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
         <div className="lz__headRow">
           <h1 className="lz__title">{PANEL_TITLE}</h1>
           <span className={`lz__pill ${available > 0 ? 'lz__pill--ok' : 'lz__pill--warn'}`}><span className="lz__dot" />{available} 个应用可用</span>
-          {syncing ? <span className="lz__pill lz__pill--warn"><span className="lz__dot" />拉取中</span> : null}
+          {syncing ? <span className="lz__pill lz__pill--warn"><span className="lz__dot" />读取中</span> : null}
         </div>
         <div className="lz__meta">观其象，知其因。在对话中输入 /logalyze 描述问题并附上日志，观象会按应用派发分析。</div>
         <div className="lz__tabs" role="tablist">
@@ -276,7 +277,7 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
       </header>
       {state.overlayError === undefined ? null : <div className="lz__notice lz__notice--error">面板设置文件未生效：{state.overlayError}。保存一次会用当前内容覆盖它。</div>}
       <div className="lz__body" role="tabpanel">
-        {tab === 'repos' ? <ReposTab state={state} busy={busy} openRepoSettings={openRepoSettings} onSync={(url) => { void run(() => syncRepos(url), url === undefined ? '已开始重新拉取全部仓库' : '已开始重新拉取', false) }} /> : null}
+        {tab === 'repos' ? <ReposTab state={state} openRepoSettings={openRepoSettings} /> : null}
         {tab === 'download' ? <DownloadTab draft={draft} setDraft={setDraft} overridden={state.overridden} /> : null}
         {tab === 'analyze'
           ? <AnalyzeTab
@@ -308,19 +309,19 @@ interface TabProps {
   setDraft: (next: Draft) => void
 }
 
-function ReposTab({ state, busy, openRepoSettings, onSync }: LogalyzePageProps & { state: StateWire; busy: boolean; onSync: (url?: string) => void }): JSX.Element {
+function ReposTab({ state, openRepoSettings }: LogalyzePageProps & { state: StateWire }): JSX.Element {
   return (
     <section className="lz__sec">
       <h2 className="lz__secTitle">应用仓库</h2>
       <div className="lz__list">
-        {state.repos.length === 0 ? <div className="lz__emptyRow">还没有应用仓库。在 dsh-repo 的「代码仓库 → 仓库」中添加仓库并打开「日志分析」，或在对话中让观象添加。</div> : null}
+        {state.repos.length === 0 ? <div className="lz__emptyRow">还没有应用仓库。请管理员在 dsh-repo 的「代码仓库 → 仓库」中添加仓库并打开「日志分析」。</div> : null}
         {state.repos.map(repo => (
           <div key={repo.url} className="lz__row lz__row--top">
             <div className="lz__rowText">
               <div className="lz__rowLabel">
                 <span className="lz__mono">{repo.url}</span>
-                {repo.branch === undefined ? null : <span className="lz__tag">{repo.branch}</span>}
-                {phasePill(repo)}
+                {repo.branch === undefined ? null : <span className="lz__tag" title="日志分析读取的分支">{repo.branch}</span>}
+                {appPill(repo)}
                 {repo.writable ? null : <span className="lz__pill" title="dsh-repo 中权限为只读：只分析，不起草接入、不改进 SKILL">只读</span>}
               </div>
               {repo.app !== undefined
@@ -328,21 +329,17 @@ function ReposTab({ state, busy, openRepoSettings, onSync }: LogalyzePageProps &
                 : null}
               {repo.app !== undefined ? <div className="lz__rowSummary">{repo.app.description}</div> : null}
               {repo.commit !== undefined
-                ? <div className="lz__rowSummary">提交 <span className="lz__mono">{repo.commit.slice(0, 8)}</span> · 拉取于 {formatTime(repo.syncedAt)}</div>
+                ? <div className="lz__rowSummary">读取的提交 <span className="lz__mono">{repo.commit.slice(0, 8)}</span> · {formatTime(repo.syncedAt)}</div>
                 : null}
               {repo.error !== undefined ? <div className="lz__rowError">{repo.error}</div> : null}
-            </div>
-            <div className="lz__rowCtl">
-              <button type="button" className="lz__btn" disabled={busy || repo.phase === 'syncing'} onClick={() => { onSync(repo.url) }}>重新拉取</button>
             </div>
           </div>
         ))}
       </div>
       {state.dshRepo.availability === 'ready' ? null : <div className="lz__notice lz__notice--error">{state.dshRepo.availability === 'missing' ? '没有加载 dsh-repo 插件，应用仓库来自它的仓库清单。请安装 dsh-repo。' : 'dsh-repo 版本与观象不兼容，无法读取仓库清单。'}</div>}
-      {state.dshRepo.availability === 'ready' && state.dshRepo.mirrorDir === undefined ? <div className="lz__notice lz__notice--error">{state.dshRepo.mirrorProblem ?? 'dsh-repo 的镜像目录未设置，仓库无法拉取。'}请到 dsh-repo 的设置页「高级」里设置镜像目录。</div> : null}
-      <p className="lz__secFoot">应用仓库是 dsh-repo 仓库清单中打开了「日志分析」功能的仓库，地址、分支和权限都在 dsh-repo 中修改，改动后观象自动拉取。由 dsh-repo 拉取到它的镜像目录{state.dshRepo.mirrorDir === undefined ? '' : `（${state.dshRepo.mirrorDir}）`}；主机或令牌变更后自动重新拉取。每个仓库需包含 <span className="lz__mono">.agents/logalyze.yaml</span> 与其中声明的日志分析 SKILL；起草接入和改进 SKILL 要推送分支，仓库权限需为「可改代码」。</p>
+      {state.dshRepo.availability === 'ready' && state.dshRepo.mirrorDir === undefined ? <div className="lz__notice lz__notice--error">{state.dshRepo.mirrorProblem ?? 'dsh-repo 的镜像目录未设置，仓库无法读取。'}请到 dsh-repo 的设置页「高级」里设置镜像目录。</div> : null}
+      <p className="lz__secFoot">应用仓库是 dsh-repo 仓库清单中打开了「日志分析」功能的仓库，只能在 dsh-repo 中添加；地址、分支和权限也都在那里修改，镜像的拉取状态和「重新拉取」也在那里。分析读取「日志分析」开关旁选的分支（留空用基线分支），起草接入和改进 SKILL 从基线分支开始，合并请求合回基线分支，仓库权限需为「可改代码」。每个仓库的日志分析分支上需包含 <span className="lz__mono">.agents/logalyze.yaml</span> 与其中声明的日志分析 SKILL。</p>
       <div className="lz__headRow">
-        {state.repos.length > 0 ? <button type="button" className="lz__btn" disabled={busy} onClick={() => { onSync() }}>重新拉取全部</button> : null}
         {openRepoSettings === undefined || state.dshRepo.availability === 'missing' ? null : <button type="button" className="lz__btn lz__btn--ghost" onClick={openRepoSettings}>{state.dshRepo.availability === 'ready' && state.dshRepo.mirrorDir === undefined ? '去设置镜像目录' : '在 dsh-repo 中管理仓库'}</button>}
       </div>
     </section>
@@ -536,7 +533,7 @@ function AdvancedTab({ draft, setDraft, overridden, busy, onReset }: TabProps & 
       <section className="lz__sec">
         <h2 className="lz__secTitle">仓库</h2>
         <div className="lz__list">
-          <NumberRow label="更新间隔" summary="输入 /logalyze 时，距上次拉取超过该时间的仓库会先更新；0 表示每次都更新。" unit="分钟" value={draft.fetchIntervalMin} overridden={overridden.includes('fetchIntervalMs')} onChange={(value) => { setDraft({ ...draft, fetchIntervalMin: value }) }} />
+          <NumberRow label="更新间隔" summary="输入 /logalyze 时，距上次读取超过该时间的仓库会先重新读取应用描述；0 表示每次都读取。" unit="分钟" value={draft.fetchIntervalMin} overridden={overridden.includes('fetchIntervalMs')} onChange={(value) => { setDraft({ ...draft, fetchIntervalMin: value }) }} />
         </div>
       </section>
       <section className="lz__sec">

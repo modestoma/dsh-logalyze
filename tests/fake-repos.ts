@@ -7,8 +7,6 @@ import type {
   CatalogRepo,
   DshRepos,
   MrSummary,
-  RepoAddParams,
-  RepoAddResult,
   RepoFeature,
   SnapshotAcquireParams,
   SnapshotLease,
@@ -85,21 +83,16 @@ function acceptedAddress(url: string): boolean {
  * of the remote, which must be a local repository or stand in {@link origins}. Switches cover host
  * changes, stalled fetches, snapshot failures, declined or failing pushes,
  * and merge requests (none open unless {@link openMr} is set). The catalog is
- * {@link catalog}; {@link repoAdd} matches addresses exactly and records each
- * call.
+ * {@link catalog}.
  */
 export class FakeRepos implements DshRepos {
-  readonly version = 6 as const
+  readonly version = 7 as const
   /** Catalog repositories; change it with {@link setCatalog} to notify observers. */
   catalog: CatalogRepo[] = []
   /** Registered features by id. */
   readonly features = new Map<string, RepoFeature>()
   /** Local repositories that stand in for remote addresses, by address; an address not listed is cloned as given. */
   readonly origins = new Map<string, string>()
-  /** Every {@link repoAdd} call, oldest first. */
-  readonly addRepoCalls: RepoAddParams[] = []
-  /** When set, {@link repoAdd} rejects with it. */
-  addRepoError: Error | undefined
   /** While true, fetching a mirror never settles. */
   stalled = false
   /** While true, the provider reports no mirror directory and every mirror call rejects, as dsh-repo does before one is chosen. */
@@ -138,7 +131,7 @@ export class FakeRepos implements DshRepos {
   }
 
   async repoList(params: { readonly feature?: string } = {}): Promise<readonly CatalogRepo[]> {
-    return this.catalog.filter(repo => params.feature === undefined || repo.features.includes(params.feature))
+    return this.catalog.filter(repo => params.feature === undefined || repo.features.some(item => item.id === params.feature))
   }
 
   featureRegister(feature: RepoFeature): () => void {
@@ -162,33 +155,18 @@ export class FakeRepos implements DshRepos {
 
   /**
    * Replace the catalog with repositories that have the given features, and notify observers.
-   * @param repos - addresses with an optional branch.
+   * @param repos - addresses with an optional baseline branch and an optional branch of every feature.
    * @param features - feature ids every repository has.
    */
-  setCatalog(repos: readonly { readonly url: string; readonly branch?: string }[], features: readonly string[] = ['log-analysis']): void {
-    this.catalog = repos.map((repo, index) => ({ id: index.toString(16).padStart(12, '0'), url: repo.url, ...repo.branch === undefined ? {} : { branch: repo.branch }, access: 'write', features: [...features] }))
+  setCatalog(repos: readonly { readonly url: string; readonly base?: string; readonly branch?: string }[], features: readonly string[] = ['log-analysis']): void {
+    this.catalog = repos.map((repo, index) => ({
+      id: index.toString(16).padStart(12, '0'),
+      url: repo.url,
+      ...repo.base === undefined ? {} : { base: repo.base },
+      access: 'write',
+      features: features.map(id => ({ id, ...repo.branch === undefined ? {} : { branch: repo.branch } })),
+    }))
     this.emitReposChange()
-  }
-
-  async repoAdd(params: RepoAddParams): Promise<RepoAddResult> {
-    this.addRepoCalls.push(params)
-    if (this.addRepoError !== undefined) throw this.addRepoError
-    const url = params.repo
-    const features = params.features ?? []
-    const existing = this.catalog.find(repo => repo.url === url)
-    if (existing !== undefined) {
-      if (params.branch !== undefined && params.branch !== existing.branch) throw repoError('conflict', `${url} 已在仓库清单中，跟随其他分支`)
-      const missing = features.filter(id => !existing.features.includes(id))
-      if (missing.length === 0) return { status: 'unchanged', repo: existing }
-      const updated = { ...existing, features: [...existing.features, ...missing] }
-      this.catalog = this.catalog.map(repo => repo === existing ? updated : repo)
-      this.emitReposChange()
-      return { status: 'updated', repo: updated }
-    }
-    const added: CatalogRepo = { id: this.catalog.length.toString(16).padStart(12, '0'), url, ...params.branch === undefined ? {} : { branch: params.branch }, access: params.access ?? 'read', features: [...features] }
-    this.catalog = [...this.catalog, added]
-    this.emitReposChange()
-    return { status: 'added', repo: added }
   }
 
   /** Report a host or token change to every observer. */
@@ -214,7 +192,7 @@ export class FakeRepos implements DshRepos {
     if (this.snapshotError !== undefined) throw this.snapshotError
     const { repo } = params
     const mirror = await this.sync(repo)
-    const commit = await this.resolve(mirror, params.ref ?? this.catalog.find(entry => entry.url === repo)?.branch)
+    const commit = await this.resolve(mirror, params.ref ?? this.catalog.find(entry => entry.url === repo)?.base)
     const path = join(this.root, '.snapshots', basename(mirror), commit.slice(0, 12))
     if (!await exists(path)) {
       await mkdir(path, { recursive: true })
@@ -239,14 +217,17 @@ export class FakeRepos implements DshRepos {
 
   async workspaceCreate(params: WorkspaceCreateParams): Promise<WorkspaceInfo> {
     this.creates.push(params)
-    const { repo, path, branch } = params
+    const { repo, path } = params
     if (!acceptedAddress(repo)) throw repoError('invalid', `只支持 HTTPS 地址、file: URL 和本机绝对路径：${repo}`)
     if (await exists(path) && (await readdir(path)).length > 0) throw repoError('invalid', `${path} 不是空目录`)
     const mirror = await this.sync(repo)
-    const base = params.base ?? (await git(mirror, ['symbolic-ref', '--short', 'HEAD'])).trim()
-    if (branch === base) throw repoError('invalid', `不能推送到基准分支 ${branch}`)
-    if ((await git(mirror, ['for-each-ref', `refs/heads/${branch}`])).trim() !== '') throw repoError('invalid', `远端已有分支 ${branch}，不能指定起始提交`)
-    const baseCommit = await this.resolve(mirror, params.commit ?? base)
+    const base = params.base ?? this.catalog.find(entry => entry.url === repo)?.base ?? (await git(mirror, ['symbolic-ref', '--short', 'HEAD'])).trim()
+    // Like dsh-repo's default template `dsh/{session}`.
+    const branch = params.branch ?? `dsh/${params.agent.session?.header.id.replace(/[^A-Za-z0-9]/g, '').slice(0, 8).toLowerCase() || 'nosession'}`
+    if (branch === base) throw repoError('invalid', `不能推送到基线分支 ${branch}`)
+    const existing = (await git(mirror, ['for-each-ref', '--format=%(objectname)', `refs/heads/${branch}`])).trim()
+    if (existing !== '' && params.commit !== undefined) throw repoError('invalid', `远端已有分支 ${branch}，不能指定起始提交`)
+    const baseCommit = existing !== '' ? existing : await this.resolve(mirror, params.commit ?? base)
     await mkdir(dirname(path), { recursive: true })
     await git(dirname(path), ['clone', '-q', '--no-checkout', this.origins.get(repo) ?? repo, path])
     await git(path, ['checkout', '-q', '-b', branch, baseCommit])
