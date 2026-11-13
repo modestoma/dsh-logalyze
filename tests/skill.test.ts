@@ -113,8 +113,8 @@ describe('entry skill', () => {
 })
 
 describe('bundled skills', () => {
-  it('ships valid SKILL.md files for the kit, improvement guide, and mr-reviewer guide', () => {
-    const [kit, improve, mrReviewer] = loadBundledSkills(new URL('../skills/', import.meta.url))
+  it('ships valid SKILL.md files for the kit, improvement guide, mr-reviewer, and log-supervisor guides', () => {
+    const [kit, improve, mrReviewer, logSupervisor] = loadBundledSkills(new URL('../skills/', import.meta.url))
     expect(kit?.name).toBe('logalyze-kit')
     expect(kit?.description).toContain('触发别名')
     expect(kit?.content).toContain('不需要创建 `.agents/logalyze.yaml`')
@@ -125,7 +125,10 @@ describe('bundled skills', () => {
     expect(mrReviewer?.name).toBe('mr-reviewer')
     expect(mrReviewer?.content).toContain('supervisor_mr_prepare')
     expect(mrReviewer?.content).toContain('supervisor_mr_publish_review')
-    for (const skill of [kit, improve, mrReviewer]) expect(skill?.content).not.toMatch(/^---/)
+    expect(logSupervisor?.name).toBe('log-supervisor')
+    expect(logSupervisor?.content).toContain('supervisor_log_prepare')
+    expect(logSupervisor?.content).toContain('supervisor_log_submit')
+    for (const skill of [kit, improve, mrReviewer, logSupervisor]) expect(skill?.content).not.toMatch(/^---/)
   })
 
   it('rejects a file that would not register under its name', () => {

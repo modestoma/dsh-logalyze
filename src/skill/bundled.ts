@@ -23,8 +23,11 @@ export const IMPROVE_SKILL_NAME = 'logalyze-improve'
 /** MR incremental reviewer guide name, addressed as `/mr-reviewer`. */
 export const MR_REVIEWER_SKILL_NAME = 'mr-reviewer'
 
+/** Unified log supervision guide name, addressed as `/log-supervisor`. */
+export const LOG_SUPERVISOR_SKILL_NAME = 'log-supervisor'
+
 /** Every bundled skill, in listing order. */
-export const BUNDLED_SKILL_NAMES = [KIT_SKILL_NAME, IMPROVE_SKILL_NAME, MR_REVIEWER_SKILL_NAME] as const
+export const BUNDLED_SKILL_NAMES = [KIT_SKILL_NAME, IMPROVE_SKILL_NAME, MR_REVIEWER_SKILL_NAME, LOG_SUPERVISOR_SKILL_NAME] as const
 
 /** Name of one bundled skill. */
 export type BundledSkillName = (typeof BUNDLED_SKILL_NAMES)[number]

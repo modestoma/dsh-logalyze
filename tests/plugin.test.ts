@@ -150,8 +150,14 @@ describe('plugin', () => {
       'supervisor_mr_reply_thread',
       'supervisor_mr_resolve_thread',
       'supervisor_mr_checkpoint',
+      'supervisor_log_prepare',
+      'supervisor_issue_search',
+      'supervisor_log_submit',
+      'supervisor_log_push_mr',
     ])
-    const [tool, improve, show, ...mrTools] = h.tools
+    const [tool, improve, show, ...supervisionTools] = h.tools
+    const mrTools = supervisionTools.slice(0, 5)
+    const logTools = supervisionTools.slice(5)
     const signal = new AbortController().signal
     const step = (depth?: number) => ({ agent: { id: 'a', session: { header: { id: 'a', ...depth === undefined ? {} : { delegationDepth: depth } } } }, signal })
     // The condition waits for the first sync, so a step prepared during startup still sees the cloned application.
@@ -160,6 +166,11 @@ describe('plugin', () => {
     // MR supervision tools are hidden outside bound MR supervision sessions.
     for (const mrTool of mrTools) {
       expect(await mrTool.when?.(step())).toBe(false)
+    }
+    // Log supervision tools are offered to top-level agents when apps are usable, never to subagents.
+    for (const logTool of logTools) {
+      expect(await logTool.when?.(step())).toBe(true)
+      expect(await logTool.when?.(step(1))).toBe(false)
     }
     // The SKILL tools are offered to top-level agents while an application is usable.
     expect(await improve!.when?.(step())).toBe(true)
@@ -291,7 +302,7 @@ describe('plugin', () => {
       if (autoInvoke) expect(listed?.description).toContain('订单服务（order-service')
       // Inside the repositories and the run directories' workspaces only the bundled guides are listed.
       for (const cwd of [join(h.repos.root, '.snapshots', 'local', 'x'), join(dir, '.logalyze', 'runs', 'r1', 'init', 'repo')]) {
-        expect((await provider.list({ cwd })).map(skill => skill.name)).toEqual(['logalyze-kit', 'logalyze-improve', 'mr-reviewer'])
+        expect((await provider.list({ cwd })).map(skill => skill.name)).toEqual(['logalyze-kit', 'logalyze-improve', 'mr-reviewer', 'log-supervisor'])
       }
     }
   })

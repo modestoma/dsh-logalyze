@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { PlatformSettings } from '../src/settings/contract.ts'
@@ -5,6 +6,7 @@ import type { PlatformSettings } from '../src/settings/contract.ts'
 /** One log the fake platform knows, in the platform's field names. */
 export interface FakeLog {
   log_id: string
+  product_code?: string | null
   product_sn?: string | null
   hw_version?: string | null
   sw_version?: string | null
@@ -17,6 +19,7 @@ export interface FakeLog {
   status: string
   file_size_bytes?: string | null
   created_at?: string | null
+  archived_at?: string | null
   detail_url?: string | null
 }
 
@@ -47,7 +50,7 @@ export interface FakeRequest {
  */
 export class FakePlatform {
   readonly logs = new Map<string, FakeLog>()
-  readonly contents = new Map<string, string>()
+  readonly contents = new Map<string, string | Buffer | Uint8Array>()
   readonly revisions: FakeRevision[] = []
   readonly requests: FakeRequest[] = []
   /** Secrets accepted by the token endpoint. */
@@ -77,7 +80,7 @@ export class FakePlatform {
   }
 
   /** Add a log with downloadable content. */
-  addLog(log: FakeLog, content = 'log-content'): void {
+  addLog(log: FakeLog, content: string | Buffer | Uint8Array = 'log-content'): void {
     this.logs.set(log.log_id, log)
     this.contents.set(log.log_id, content)
   }
@@ -129,8 +132,11 @@ export class FakePlatform {
     const segments = url.pathname.split('/').slice(4).map(decodeURIComponent)
     switch (route) {
       case 'logs': {
-        const ids = url.searchParams.getAll('log_id')
-        return send(res, 200, { items: ids.flatMap(id => this.logs.has(id) ? [this.logs.get(id)] : []), next_cursor: null })
+        if (url.searchParams.has('log_id')) {
+          const ids = url.searchParams.getAll('log_id')
+          return send(res, 200, { items: ids.flatMap(id => this.logs.has(id) ? [this.logs.get(id)] : []), next_cursor: null })
+        }
+        return this.queryLogs(url.searchParams, res)
       }
       case 'download': {
         const log = this.logs.get(segments[0] ?? '')
@@ -213,6 +219,90 @@ export class FakePlatform {
   /** The uploaded entry of a revision. */
   entryOf(revision: FakeRevision): string {
     return revision.files.get(revision.entry)?.toString('utf8') ?? ''
+  }
+
+  private queryLogs(searchParams: URLSearchParams, res: ServerResponse): void {
+    const allowedParams = new Set([
+      'limit',
+      'cursor',
+      'archived_from',
+      'archived_to',
+      'created_from',
+      'created_to',
+      'product_code',
+      'factory_code',
+      'product_sn',
+      'sw_version',
+      'component_code',
+      'component_version',
+      'error_code',
+      'status',
+    ])
+    for (const key of searchParams.keys()) {
+      if (!allowedParams.has(key)) {
+        return send(res, 400, { message: `unknown query parameter: ${key}` })
+      }
+    }
+    const archivedFrom = searchParams.get('archived_from')
+    const archivedTo = searchParams.get('archived_to')
+    const status = searchParams.get('status')
+    const productCode = searchParams.get('product_code')
+    const componentCode = searchParams.get('component_code')
+    const errorCode = searchParams.get('error_code')
+    const limitRaw = searchParams.get('limit')
+    const limit = limitRaw === null ? 100 : Number(limitRaw)
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      return send(res, 400, { message: 'invalid limit' })
+    }
+    const fromMs = archivedFrom === null ? undefined : Date.parse(archivedFrom)
+    const toMs = archivedTo === null ? undefined : Date.parse(archivedTo)
+    if ((fromMs !== undefined && Number.isNaN(fromMs)) || (toMs !== undefined && Number.isNaN(toMs))) {
+      return send(res, 400, { message: 'invalid timestamp' })
+    }
+    if (fromMs !== undefined && toMs !== undefined && fromMs >= toMs) {
+      return send(res, 400, { message: 'archived_from must be strictly before archived_to' })
+    }
+
+    const sig = createHash('sha256')
+      .update(JSON.stringify({ archivedFrom, archivedTo, status, productCode, componentCode, errorCode }))
+      .digest('hex')
+      .slice(0, 12)
+    let offset = 0
+    const cursor = searchParams.get('cursor')
+    if (cursor !== null && cursor !== '') {
+      const match = /^cursor:([a-f0-9]+):(\d+)$/u.exec(cursor)
+      if (match === null || match[1] !== sig) {
+        return send(res, 400, { message: 'cursor does not match query filters' })
+      }
+      offset = Number(match[2])
+    }
+
+    const matched = [...this.logs.values()]
+      .filter((log) => {
+        if (status !== null && log.status !== status) return false
+        if (productCode !== null && log.product_code !== productCode) return false
+        if (componentCode !== null && log.component_code !== componentCode) return false
+        if (errorCode !== null && log.error_code !== errorCode) return false
+        if (fromMs !== undefined || toMs !== undefined) {
+          const archivedStr = log.archived_at ?? log.created_at
+          const archivedMs = archivedStr === undefined || archivedStr === null ? Number.NaN : Date.parse(archivedStr)
+          if (Number.isNaN(archivedMs)) return false
+          if (fromMs !== undefined && archivedMs < fromMs) return false
+          if (toMs !== undefined && archivedMs >= toMs) return false
+        }
+        return true
+      })
+      .sort((a, b) => {
+        const ca = a.created_at ?? ''
+        const cb = b.created_at ?? ''
+        if (ca !== cb) return ca < cb ? 1 : -1
+        return a.log_id < b.log_id ? 1 : a.log_id > b.log_id ? -1 : 0
+      })
+
+    const pageItems = matched.slice(offset, offset + limit)
+    const nextOffset = offset + pageItems.length
+    const nextCursor = nextOffset < matched.length ? `cursor:${sig}:${nextOffset}` : null
+    send(res, 200, { items: pageItems, next_cursor: nextCursor })
   }
 }
 

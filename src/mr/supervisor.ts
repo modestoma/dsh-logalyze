@@ -319,24 +319,32 @@ export class MrSupervisor implements MrToolsRuntime {
   }
 
   resolveForTool(sessionId: string, repo?: string, mrNumber?: number): SupervisedMrRecord {
-    const mappedKey = this.sessionToKey.get(sessionId)
-    if (mappedKey !== undefined) {
-      const rec = this.deps.table.get(mappedKey)
-      if (rec !== undefined) {
-        if ((repo !== undefined && rec.repo !== repo) || (mrNumber !== undefined && rec.mrNumber !== mrNumber)) {
-          throw new Error(`当前会话已绑定 MR ${rec.repo}#${rec.mrNumber}，不能跨 MR 操作 ${repo ?? rec.repo}#${mrNumber ?? rec.mrNumber}`)
-        }
-        return rec
-      }
-    }
+    const boundRecords: SupervisedMrRecord[] = []
     for (const [key, rec] of this.deps.table.entries()) {
       if (rec.sessionId === sessionId) {
-        this.sessionToKey.set(sessionId, key)
-        if ((repo !== undefined && rec.repo !== repo) || (mrNumber !== undefined && rec.mrNumber !== mrNumber)) {
-          throw new Error(`当前会话已绑定 MR ${rec.repo}#${rec.mrNumber}，不能跨 MR 操作`)
+        if (!this.sessionToKey.has(sessionId)) {
+          this.sessionToKey.set(sessionId, key)
         }
-        return rec
+        boundRecords.push(rec)
       }
+    }
+    if (boundRecords.length > 0) {
+      if (repo !== undefined && mrNumber !== undefined) {
+        const exact = boundRecords.find(rec => rec.repo === repo && rec.mrNumber === mrNumber)
+        if (exact !== undefined) return exact
+        const first = boundRecords[0]!
+        throw new Error(`当前会话已绑定 MR ${first.repo}#${first.mrNumber}，不能跨 MR 操作 ${repo}#${mrNumber}`)
+      }
+      const filtered = boundRecords.filter(rec =>
+        (repo === undefined || rec.repo === repo)
+        && (mrNumber === undefined || rec.mrNumber === mrNumber),
+      )
+      if (filtered.length === 1) return filtered[0]!
+      if (filtered.length > 1) {
+        throw new Error(`当前会话同时关联多个受监管 MR（${filtered.map(r => `${r.repo}#${r.mrNumber}`).join('、')}），请显式指定 repo 与 mrNumber`)
+      }
+      const first = boundRecords[0]!
+      throw new Error(`当前会话已绑定 MR ${first.repo}#${first.mrNumber}，不能跨 MR 操作 ${repo ?? first.repo}#${mrNumber ?? first.mrNumber}`)
     }
     if (repo !== undefined && mrNumber !== undefined) {
       const explicit = this.deps.table.get(supervisedMrKey(repo, mrNumber))
