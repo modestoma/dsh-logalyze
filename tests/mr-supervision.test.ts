@@ -79,6 +79,8 @@ class FakeReposV8 {
   readonly reviewCalls: MrReviewParams[] = []
   readonly replyCalls: { discussionId: string; body: string }[] = []
   readonly resolveCalls: { discussionId: string; resolved: boolean }[] = []
+  mrGetCalls = 0
+  onMrGet?: (params: { readonly repo: string; readonly number: number; readonly callIndex: number }) => Promise<void> | void
   private noteSeq = 100
 
   constructor(dir: string) {
@@ -132,6 +134,10 @@ class FakeReposV8 {
         return { items: list }
       },
       mrGet: async ({ repo, number }) => {
+        this.mrGetCalls += 1
+        if (this.onMrGet !== undefined) {
+          await this.onMrGet({ repo, number, callIndex: this.mrGetCalls })
+        }
         const found = this.mrs.get(repo)?.get(number)
         if (found === undefined) throw new Error(`MR ${repo}#${number} not found`)
         const detail: MrDetail = { ...found.info, comments: found.comments }
@@ -374,6 +380,51 @@ describe('MR signal helpers & bot normalization', () => {
       nowMs: 1000,
     })
     expect(resIgnored.action).toBe('skip')
+  })
+
+  it('excludes in-flight deliveredNoteIds from duplicate feedback signals while accepting genuinely new notes', () => {
+    const repo = { url: 'git@x/a.git', writable: true }
+    const settings = { skipDraft: true, ignoreLabels: [] }
+    const mr = makeMr('git@x/a.git', 3)
+    const detail: MrDetail = { ...mr, comments: [] }
+    const status: MrStatus = { headSha: mr.headSha, checks: [], overall: 'success', mergeable: true }
+    const discussions: MrDiscussion[] = [{
+      id: 'disc-1',
+      inline: true,
+      position: { path: 'src/a.ts', newLine: 3 },
+      resolvable: true,
+      resolved: false,
+      notes: [
+        { id: 'note-1', author: { username: 'alice' }, body: 'Already delivered to running turn', createdAt: '2026-11-01T00:02:00Z' },
+        { id: 'note-2', author: { username: 'bob' }, body: 'Arrived mid-turn', createdAt: '2026-11-01T00:03:00Z' },
+      ],
+    }]
+
+    const res = classifyMrPollUpdate({
+      existing: {
+        repo: 'git@x/a.git',
+        mrNumber: 3,
+        origin: 'external',
+        state: 'open',
+        headSha: mr.headSha,
+        lastReviewedSha: mr.headSha,
+        ownPushedShas: [],
+        autoFixAttempts: 0,
+        pendingSignals: [],
+        seenNoteIds: [],
+        deliveredNoteIds: ['d:disc-1:note-1'],
+      },
+      mr,
+      detail,
+      discussions,
+      status,
+      bot: { username: 'bot' },
+      repo,
+      settings,
+      nowMs: 2000,
+    })
+
+    expect(res.signals.map(s => s.noteId)).toEqual(['note-2'])
   })
 })
 
@@ -738,5 +789,324 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     await h2.service.mrSupervisorInstance()!.flushDebouncedDue()
     await h2.service.mrSupervisorInstance()!.waitForIdle()
     expect(turnCount).toBe(3)
+  })
+
+  it('does not re-queue in-flight delivered notes if a poll runs while a discussion turn is still executing', async () => {
+    const { dir, cleanup } = await tempDir('logalyze-mr-inflight-notes-')
+    cleanups.push(cleanup)
+    const origin = await createAppRepo(join(dir, 'repo'))
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    fakeV8.base.catalog = [{ id: 'r1', url: origin, base: 'main', access: 'write', features: [{ id: 'mr-review' }] }]
+
+    let releaseTurn2!: () => void
+    const turn2Blocked = new Promise<void>((resolve) => { releaseTurn2 = resolve })
+    let turnCount = 0
+    let turn2StartedResolve!: () => void
+    const turn2Started = new Promise<void>((resolve) => { turn2StartedResolve = resolve })
+    let h!: Awaited<ReturnType<typeof createServiceHarness>>
+
+    const driver: MrSessionDriver = {
+      async runTurn(req) {
+        turnCount += 1
+        const sid = req.existingSessionId ?? `s-${turnCount}`
+        await req.onSessionBound?.(sid)
+        if (turnCount === 1) {
+          await h.callTool(MR_PUBLISH_REVIEW_TOOL_NAME, { headSha: 'sha-mr-40-v1', verdict: 'comment', body: 'ok' }, sid)
+        } else if (turnCount === 2) {
+          turn2StartedResolve()
+          await turn2Blocked
+          await h.callTool(MR_REPLY_THREAD_TOOL_NAME, { discussionId: 'disc-40', body: 'Fixed!' }, sid)
+        }
+        return { sessionId: sid }
+      },
+    }
+
+    h = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 0 },
+      driver,
+    })
+    cleanups.push(h.dispose)
+
+    const mr40 = fakeV8.upsertMr(origin, 40)
+    const supervisor = h.service.mrSupervisorInstance()!
+    await supervisor.pollNow()
+    await supervisor.flushDebouncedDue()
+    expect(turnCount).toBe(1)
+
+    mr40.discussions.push({
+      id: 'disc-40',
+      inline: true,
+      position: { path: 'src/a.ts', newLine: 1 },
+      resolvable: true,
+      resolved: false,
+      notes: [{ id: 'n-human-1', author: { username: 'alice' }, body: 'Please rename this', createdAt: '2026-11-01T00:05:10Z' }],
+    })
+    mr40.info = { ...mr40.info, updatedAt: '2026-11-01T00:05:10Z' }
+    await supervisor.pollNow()
+    const flushPromise = supervisor.flushDebouncedDue()
+    await turn2Started
+
+    // Poll while Turn 2 is still running and n-human-1 is in deliveredNoteIds (not yet in seenNoteIds)
+    await supervisor.pollNow()
+    releaseTurn2()
+    await flushPromise
+    await supervisor.waitForIdle()
+    await supervisor.flushDebouncedDue()
+
+    expect(turnCount).toBe(2)
+  })
+
+  it('halts retries when blocked by breaker or disabled settings and resumes dormant work after cooldown', async () => {
+    const { dir, cleanup } = await tempDir('logalyze-mr-breaker-dormant-')
+    cleanups.push(cleanup)
+    const origin = await createAppRepo(join(dir, 'repo'))
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    fakeV8.base.catalog = [{ id: 'r1', url: origin, base: 'main', access: 'write', features: [{ id: 'mr-review' }] }]
+
+    let clockMs = 10_000_000
+    let turnCount = 0
+    const h = await createServiceHarness({
+      fakeV8,
+      dir,
+      clock: () => clockMs,
+      mrConfig: { debounceMs: 0, dailyMrTurnLimit: 1 },
+      driver: {
+        async runTurn(req) {
+          turnCount += 1
+          const sid = req.existingSessionId ?? `s-${turnCount}`
+          await req.onSessionBound?.(sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(h.dispose)
+
+    const mr41 = fakeV8.upsertMr(origin, 41, { headSha: 'sha-1', updatedAt: '2026-11-01T03:00:00Z' })
+    const supervisor = h.service.mrSupervisorInstance()!
+    await supervisor.pollNow()
+    await supervisor.flushDebouncedDue()
+    expect(turnCount).toBe(1)
+
+    // Trigger 2nd update -> blocked by dailyMrTurnLimit: 1
+    mr41.info = { ...mr41.info, headSha: 'sha-2', updatedAt: '2026-11-01T03:01:00Z' }
+    await supervisor.pollNow()
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+    expect(turnCount).toBe(1)
+
+    const getsAfterBlock = fakeV8.mrGetCalls
+    await new Promise(resolve => setTimeout(resolve, 25))
+    expect(fakeV8.mrGetCalls).toBe(getsAfterBlock)
+
+    const dormantRec = (await h.service.supervisorDomain()).supervisedMrs.get(supervisedMrKey(origin, 41))
+    expect(dormantRec?.dueAt).toBeUndefined()
+    expect(dormantRec?.pendingSignals).toHaveLength(1)
+
+    // Disable supervision via HTTP PUT while pending, then advance past 24h cooldown: still dormant while disabled
+    const disableRes = await fetch(`${h.baseUrl}/logalyze/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mrReview: { enabled: false } }),
+    })
+    expect(disableRes.status).toBe(200)
+    clockMs += 24 * 60 * 60 * 1000 + 1000
+    await supervisor.pollNow()
+    expect(turnCount).toBe(1)
+
+    // Re-enable supervision -> dormant pending signal recovers and runs Turn 2 without manual breaker reset
+    const enableRes = await fetch(`${h.baseUrl}/logalyze/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mrReview: { enabled: true } }),
+    })
+    expect(enableRes.status).toBe(200)
+    await new Promise(resolve => setTimeout(resolve, 25))
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+    expect(turnCount).toBe(2)
+  })
+
+  it('transitions MR to merged without deadlocking when mrList returns open but mrGet returns merged', async () => {
+    const { dir, cleanup } = await tempDir('logalyze-mr-terminal-lock-')
+    cleanups.push(cleanup)
+    const origin = await createAppRepo(join(dir, 'repo'))
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    fakeV8.base.catalog = [{ id: 'r1', url: origin, base: 'main', access: 'write', features: [{ id: 'mr-review' }] }]
+
+    const h = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 0 },
+      driver: {
+        async runTurn(req) {
+          const sid = req.existingSessionId ?? 's-term'
+          await req.onSessionBound?.(sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(h.dispose)
+
+    const domain = await h.service.supervisorDomain()
+    await domain.issues.upsertByAi({
+      issueId: 'iss-term',
+      appId: 'orders',
+      title: 'Fix race',
+      matchCriteria: 'FixRace',
+      aiDiagnosis: 'Race',
+      aiStatus: 'located',
+      resolutionAdvice: 'Guard lock',
+    })
+
+    const mr42 = fakeV8.upsertMr(origin, 42, { headSha: 'sha-open', state: 'open' })
+    const supervisor = h.service.mrSupervisorInstance()!
+    await supervisor.registerSelfMr({
+      repo: origin,
+      mrNumber: 42,
+      origin: 'self-fix',
+      headSha: 'sha-open',
+      sessionId: 'sess-term',
+      issueId: 'iss-term',
+    })
+
+    // mrList returns 'open', then right as mrGet runs the remote reports 'merged'.
+    fakeV8.onMrGet = ({ number }) => {
+      if (number === 42) {
+        mr42.info = { ...mr42.info, state: 'merged', updatedAt: '2026-11-01T04:00:00Z' }
+      }
+    }
+
+    await supervisor.pollNow()
+    const rec = domain.supervisedMrs.get(supervisedMrKey(origin, 42))
+    expect(rec?.state).toBe('merged')
+    expect(domain.issues.get('iss-term')?.aiStatus).toBe('fixed')
+  })
+
+  it('anchors discovery cursor on listed updatedAt rather than poll completion clock', async () => {
+    const { dir, cleanup } = await tempDir('logalyze-mr-cursor-')
+    cleanups.push(cleanup)
+    const origin = await createAppRepo(join(dir, 'repo'))
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    fakeV8.base.catalog = [{ id: 'r1', url: origin, base: 'main', access: 'write', features: [{ id: 'mr-review' }] }]
+
+    const startMs = Date.parse('2026-11-01T05:00:00Z')
+    let clockMs = startMs
+    const seenMrs: number[] = []
+    const h = await createServiceHarness({
+      fakeV8,
+      dir,
+      clock: () => clockMs,
+      mrConfig: { debounceMs: 0 },
+      driver: {
+        async runTurn(req) {
+          seenMrs.push(req.mrNumber)
+          const sid = req.existingSessionId ?? `s-${req.mrNumber}`
+          await req.onSessionBound?.(sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(h.dispose)
+
+    fakeV8.upsertMr(origin, 43, {
+      updatedAt: new Date(startMs).toISOString(),
+    })
+    fakeV8.onMrGet = ({ number, callIndex }) => {
+      if (number === 43 && callIndex === 1) {
+        // Poll processing takes 10s; meanwhile external MR #44 is opened at startMs + 2s (before poll ends!).
+        clockMs += 10_000
+        fakeV8.upsertMr(origin, 44, {
+          updatedAt: new Date(startMs + 2_000).toISOString(),
+        })
+      }
+    }
+
+    const supervisor = h.service.mrSupervisorInstance()!
+    await supervisor.pollNow()
+    await supervisor.flushDebouncedDue()
+    expect(seenMrs).toEqual([43])
+
+    // Next poll uses updatedAfter based on startMs (listed maxUpdatedAt), NOT startMs + 10s!
+    await supervisor.pollNow()
+    await supervisor.flushDebouncedDue()
+    expect(seenMrs).toEqual([43, 44])
+  })
+
+  it('preserves signals appended by a concurrent poll while executeMrTurn is fetching remote state', async () => {
+    const { dir, cleanup } = await tempDir('logalyze-mr-concurrent-signal-')
+    cleanups.push(cleanup)
+    const origin = await createAppRepo(join(dir, 'repo'))
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    fakeV8.base.catalog = [{ id: 'r1', url: origin, base: 'main', access: 'write', features: [{ id: 'mr-review' }] }]
+
+    let clockMs = 6_000_000
+    const seenHeadShas: string[] = []
+    let releaseTurn2MrGet!: () => void
+    let pausedInTurn2 = false
+    let turn2PausedNotify!: () => void
+    const turn2Paused = new Promise<void>((resolve) => { turn2PausedNotify = resolve })
+
+    const mr45 = fakeV8.upsertMr(origin, 45, {
+      headSha: 'sha-1',
+      updatedAt: '2026-11-01T06:00:00Z',
+    })
+
+    const h = await createServiceHarness({
+      fakeV8,
+      dir,
+      clock: () => clockMs,
+      mrConfig: { debounceMs: 5000 },
+      driver: {
+        async runTurn(req) {
+          seenHeadShas.push(req.prompt.match(/commit (sha-\d+)/)?.[1] ?? 'unknown')
+          const sid = req.existingSessionId ?? `s-${seenHeadShas.length}`
+          await req.onSessionBound?.(sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(h.dispose)
+
+    const supervisor = h.service.mrSupervisorInstance()!
+    await supervisor.pollNow()
+    clockMs += 6000
+    await supervisor.flushDebouncedDue()
+    expect(seenHeadShas).toEqual(['sha-1'])
+
+    // Poll buffers push (sha-2) in debouncer without running executeMrTurn yet.
+    mr45.info = { ...mr45.info, headSha: 'sha-2', updatedAt: '2026-11-01T06:01:00Z' }
+    await supervisor.pollNow()
+
+    // Pause executeMrTurn inside its mrGet call for sha-2.
+    fakeV8.onMrGet = async ({ number }) => {
+      if (number === 45 && !pausedInTurn2) {
+        pausedInTurn2 = true
+        turn2PausedNotify()
+        await new Promise<void>((resolve) => { releaseTurn2MrGet = resolve })
+      }
+    }
+
+    clockMs += 6000
+    const flushPromise = supervisor.flushDebouncedDue()
+    await turn2Paused
+    fakeV8.onMrGet = undefined
+
+    // While executeMrTurn is suspended on mrGet for sha-2, a concurrent poll observes sha-3!
+    mr45.info = { ...mr45.info, headSha: 'sha-3', updatedAt: '2026-11-01T06:01:30Z' }
+    await supervisor.pollNow()
+
+    // Release executeMrTurn for the sha-2 batch; sha-3 must remain queued and execute cleanly.
+    releaseTurn2MrGet()
+    await flushPromise
+    clockMs += 6000
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+
+    const finalRec = (await h.service.supervisorDomain()).supervisedMrs.get(supervisedMrKey(origin, 45))
+    expect(seenHeadShas).toEqual(['sha-1', 'sha-2', 'sha-3'])
+    expect(finalRec?.pendingSignals).toEqual([])
+    expect(finalRec?.reviewedHeadSha).toBe('sha-3')
   })
 })

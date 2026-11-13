@@ -108,10 +108,10 @@ function isNewNote(
   key: string,
   createdAt: string,
   seenSet: ReadonlySet<string>,
-  pendingNoteKeys: ReadonlySet<string>,
+  inFlightOrPendingKeys: ReadonlySet<string>,
   lastNoteCursor: string | undefined,
 ): boolean {
-  if (seenSet.has(key) || pendingNoteKeys.has(key)) return false
+  if (seenSet.has(key) || inFlightOrPendingKeys.has(key)) return false
   // When `seenSet` reached its bounded cap, rely on `lastNoteCursor` to avoid replaying ancient history.
   if (seenSet.size >= MAX_SEEN_NOTE_IDS && lastNoteCursor !== undefined && createdAt <= lastNoteCursor) {
     return false
@@ -127,12 +127,13 @@ export function collectHumanFeedbackNotes(
   seenNoteIds: readonly string[] | undefined,
   pendingSignals: readonly MrPendingSignal[] | undefined,
   lastNoteCursor: string | undefined,
+  deliveredNoteIds?: readonly string[],
 ): HumanNoteEvent[] {
   const seenSet = new Set(seenNoteIds ?? [])
-  const pendingKeys = new Set<string>()
+  const inFlightOrPendingKeys = new Set<string>(deliveredNoteIds ?? [])
   for (const signal of pendingSignals ?? []) {
     if (signal.kind !== 'discussion' || signal.noteId === undefined) continue
-    pendingKeys.add(
+    inFlightOrPendingKeys.add(
       signal.discussionId !== undefined
         ? canonicalDiscussionNoteKey(signal.discussionId, signal.noteId)
         : canonicalCommentKey(signal.noteId),
@@ -144,7 +145,7 @@ export function collectHumanFeedbackNotes(
     for (const note of discussion.notes) {
       if (isSameBotUser(note.author, bot)) continue
       const key = canonicalDiscussionNoteKey(discussion.id, note.id)
-      if (!isNewNote(key, note.createdAt, seenSet, pendingKeys, lastNoteCursor)) continue
+      if (!isNewNote(key, note.createdAt, seenSet, inFlightOrPendingKeys, lastNoteCursor)) continue
       found.push({
         key,
         kind: 'discussion-note',
@@ -163,7 +164,7 @@ export function collectHumanFeedbackNotes(
   for (const comment of detail.comments) {
     if (isSameBotUser(comment.author, bot)) continue
     const key = canonicalCommentKey(comment.id)
-    if (!isNewNote(key, comment.createdAt, seenSet, pendingKeys, lastNoteCursor)) continue
+    if (!isNewNote(key, comment.createdAt, seenSet, inFlightOrPendingKeys, lastNoteCursor)) continue
     found.push({
       key,
       kind: 'comment',
@@ -268,6 +269,7 @@ export function classifyMrPollUpdate(input: {
       existing.seenNoteIds,
       existingPending,
       existing.lastNoteCursor,
+      existing.deliveredNoteIds,
     )
     for (const note of notes) {
       const location = note.path !== undefined
@@ -319,6 +321,16 @@ export function classifyMrPollUpdate(input: {
   }
 }
 
+/** Compare two pending MR signals by their logical deduplication identity. */
+export function isSamePendingSignal(a: MrPendingSignal, b: MrPendingSignal): boolean {
+  return (
+    a.kind === b.kind
+    && a.headSha === b.headSha
+    && a.discussionId === b.discussionId
+    && a.noteId === b.noteId
+  )
+}
+
 /** Merge newly observed signals into existing pending signals, keeping order and deduplicating identical keys. */
 export function mergePendingSignals(
   existing: readonly MrPendingSignal[],
@@ -326,15 +338,19 @@ export function mergePendingSignals(
 ): MrPendingSignal[] {
   const merged = [...existing]
   for (const sig of incoming) {
-    const duplicate = merged.some(prev =>
-      prev.kind === sig.kind
-      && prev.headSha === sig.headSha
-      && prev.discussionId === sig.discussionId
-      && prev.noteId === sig.noteId,
-    )
+    const duplicate = merged.some(prev => isSamePendingSignal(prev, sig))
     if (!duplicate) merged.push(sig)
   }
   return merged
+}
+
+/** Remove an already-captured batch of signals while keeping any newer signals queued concurrently. */
+export function subtractPendingSignals(
+  current: readonly MrPendingSignal[],
+  consumed: readonly MrPendingSignal[],
+): MrPendingSignal[] {
+  if (consumed.length === 0) return [...current]
+  return current.filter(sig => !consumed.some(done => isSamePendingSignal(sig, done)))
 }
 
 /** Canonical note keys represented in a batch of pending signals (for exact seen-note accounting). */
