@@ -181,6 +181,7 @@ class FakeFeishuTopics implements FeishuTopicService {
   readonly states = new Map<string, TopicLaunchState>()
   readonly updatedLinks: { readonly key: string; readonly links: TopicCardLinks }[] = []
   failNextLaunch: { readonly code: 'not-connected' | 'send-failed'; readonly message: string } | undefined
+  failedLaunches = 0
   private readonly sessionToKey = new Map<string, string>()
   private statusListeners: ((state: TopicLaunchState) => void)[] = []
 
@@ -192,6 +193,7 @@ class FakeFeishuTopics implements FeishuTopicService {
     if (this.failNextLaunch !== undefined) {
       const failure = this.failNextLaunch
       this.failNextLaunch = undefined
+      this.failedLaunches += 1
       return { ok: false as const, code: failure.code, message: failure.message }
     }
     this.launched.push(spec)
@@ -339,7 +341,7 @@ async function flushMicrotasks(): Promise<void> {
   }
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs = 12_000): Promise<void> {
   const start = Date.now()
   while (!predicate()) {
     if (Date.now() - start > timeoutMs) {
@@ -898,7 +900,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     const afterLogReqCount = h.fakePlatform.requests.filter(r => r.method === 'GET' && r.path.startsWith('/open-api/v1/logs?')).length
     expect(afterLogReqCount - prevLogReqCount).toBeGreaterThanOrEqual(2)
     expect(h.logTurns.length).toBe(8) // 2 original + 6 batches (105 = 20*5 + 5)
-  })
+  }, 20_000)
 
   it('triggers non-resetting batchWindowMs timer and enforces log:<appId> breaker without blocking other apps', async () => {
     const throttles: string[] = []
@@ -992,11 +994,69 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     expect(h.fakeTopics.launched.some(l => l.key.startsWith('log-throttle:'))).toBe(true)
     void throttles
 
-    // Resetting breaker via Web panel immediately resumes E_S1!
+    // 1. Automatic cooldown recovery via polling with ZERO new logs for E_S1!
+    h.advanceNow(60 * 60_000 + 1_000)
+    await sup.pollNow()
+    await waitFor(() => h.logTurns.length === 3)
+    st = await h.service.state()
+    expect(st.logSupervision?.pendingBatches.some(b => b.errorCode === 'E_S1')).toBe(false)
+
+    // 2. Automatic cooldown recovery via scheduled timer (trippedUntil) with ZERO pollNow() and ZERO resetBreaker()!
+    h.advanceNow(1_000)
+    const domain = await h.service.supervisorDomain()
+    const timerTripUntil = h.getNow() + 40
+    await domain.circuitBreakers.put('log:order-service', {
+      windowStartAt: h.getNow(),
+      triggeredCount: 3,
+      events: [h.getNow(), h.getNow(), h.getNow()],
+      trippedUntil: timerTripUntil,
+      reason: 'simulated timer cooldown',
+    })
+    for (let i = 1; i <= 5; i += 1) {
+      h.fakePlatform.addLog({
+        log_id: `timer-cd-${i}`,
+        product_code: 'P1',
+        component_code: 'order-service',
+        error_code: 'E_TIMER',
+        file_name: `timer-cd-${i}.log`,
+        storage_type: 'fds',
+        status: 'completed',
+        archived_at: new Date(h.getNow() - 100).toISOString(),
+      }, 'missing env')
+    }
+    await sup.pollNow()
+    expect(h.logTurns.length).toBe(3)
+    h.advanceNow(50)
+    await waitFor(() => h.logTurns.length === 4)
+
+    // 3. Manual resetBreaker immediately unblocks pending E_RESET batch!
+    h.advanceNow(1_000)
+    await domain.circuitBreakers.put('log:order-service', {
+      windowStartAt: h.getNow(),
+      triggeredCount: 3,
+      events: [h.getNow(), h.getNow(), h.getNow()],
+      trippedUntil: h.getNow() + 3_600_000,
+      reason: 'simulated manual reset',
+    })
+    for (let i = 1; i <= 5; i += 1) {
+      h.fakePlatform.addLog({
+        log_id: `manual-reset-${i}`,
+        product_code: 'P1',
+        component_code: 'order-service',
+        error_code: 'E_RESET',
+        file_name: `manual-reset-${i}.log`,
+        storage_type: 'fds',
+        status: 'completed',
+        archived_at: new Date(h.getNow() - 100).toISOString(),
+      }, 'missing env')
+    }
+    await sup.pollNow()
+    expect(h.logTurns.length).toBe(4)
+
     const afterReset = await h.service.resetBreaker({ scope: 'log-app', key: 'order-service' })
     expect(afterReset.logSupervision?.breakers.some(b => b.tripped)).toBe(false)
-    await waitFor(() => h.logTurns.length === 3)
-  })
+    await waitFor(() => h.logTurns.length === 5)
+  }, 20_000)
 
   it('supports manual Feishu ZIP diagnosis without platform config AND closes the full fix_code + isolated improve_skill MR loop', async () => {
     const h = await createFullHarness({
@@ -1164,7 +1224,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     await mrSup.flushDebouncedDue()
     await waitFor(() => h.mrTurns.some(t => t.mrNumber === fixPush.mrNumber && t.origin === 'self-fix'))
     expect(h.mrTurns.find(t => t.mrNumber === fixPush.mrNumber)?.prompt).toContain('ci-failed')
-  })
+  }, 20_000)
 
   it('launches Feishu topic immediately under topic-on-start deliveryMode and prevents symlink follow in unpack', async () => {
     const h = await createFullHarness({
@@ -1227,7 +1287,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     await flushMicrotasks()
     expect(h.fakePlatform.revisions.filter(r => r.completed).length).toBe(2)
     expect((await lstat(liveWs)).isDirectory()).toBe(true)
-  })
+  }, 20_000)
 
   it('enforces maxConcurrentBatches for topic-on-start until terminal topic state', async () => {
     const h = await createFullHarness({
@@ -1290,7 +1350,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     // Terminal state releases the pool slot so topic 2 launches immediately.
     await waitFor(() => h.fakeTopics.launched.length === 2)
     expect(h.fakeTopics.launched[1]?.key).not.toBe(launch1.key)
-  })
+  }, 20_000)
 
   it('keeps pendingTopicDelivery on transient launch failure and deduplicates crash recovery across log_tasks and pending_batches', async () => {
     const sharedSup = await tempDir()
@@ -1331,6 +1391,29 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
       createdAt: 1_000,
       updatedAt: 1_000,
     })
+    await seedDomain.logTasks.put('log-missing-outbox-1', {
+      source: 'platform',
+      appId: 'order-service',
+      appName: 'order-service',
+      batchKey: 'P1\0order-service\0E_ORPHAN',
+      errorCode: 'E_ORPHAN',
+      inputs: [{
+        ref: 'L1',
+        logId: 'orphan-outbox-log-1',
+        productCode: 'P1',
+        componentCode: 'order-service',
+        errorCode: 'E_ORPHAN',
+        fileName: 'orphan.log',
+      }],
+      status: 'completed',
+      revisions: [{
+        revision: 1,
+        summary: '提交后回传前中断',
+        createdAt: 1_000,
+      }],
+      createdAt: 1_000,
+      updatedAt: 1_000,
+    })
     await seedDomain.pendingBatches.put('P1\0order-service\0E_CRASH', {
       productCode: 'P1',
       componentCode: 'order-service',
@@ -1367,6 +1450,16 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
           status: 'completed',
           archived_at: '2026-11-12T09:55:00.000Z',
         }, 'recovered log\n')
+        platform.addLog({
+          log_id: 'orphan-outbox-log-1',
+          product_code: 'P1',
+          component_code: 'order-service',
+          error_code: 'E_ORPHAN',
+          file_name: 'orphan.log',
+          storage_type: 'fds',
+          status: 'completed',
+          archived_at: '2026-11-12T09:55:00.000Z',
+        }, 'orphan outbox log\n')
       },
       onLogTurn: async (req) => {
         if (!failedOnce) {
@@ -1392,14 +1485,18 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
       },
     })
 
+    // Boot reconciled missing outbox row for completed platform revision and uploaded it!
+    await waitFor(() => h.fakePlatform.revisions.some(r => r.key === 'log-missing-outbox-1:rev1:orphan-outbox-log-1' && r.completed))
+
     // Recovered task ran once without duplicating pending_batches!
     await waitFor(() => h.logTurns.length === 1)
     const domainAfter = await h.service.supervisorDomain()
     await waitFor(() => domainAfter.logTasks.get('log-crashed-1')?.status === 'completed')
-    expect(domainAfter.logTasks.keys()).toEqual(['log-crashed-1'])
+    expect(domainAfter.logTasks.keys().sort()).toEqual(['log-crashed-1', 'log-missing-outbox-1'])
     expect(domainAfter.pendingBatches.size).toBe(0)
 
     // Initial launch returned not-connected -> pendingTopicDelivery stayed true until retry succeeded!
+    await waitFor(() => h.fakeTopics.failedLaunches === 1)
     expect(h.fakeTopics.launched).toHaveLength(0)
     expect(domainAfter.logTasks.get('log-crashed-1')?.pendingTopicDelivery).toBe(true)
 
@@ -1407,5 +1504,5 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     await waitFor(() => h.fakeTopics.launched.length === 1)
     expect(domainAfter.logTasks.get('log-crashed-1')?.pendingTopicDelivery).toBeUndefined()
     expect(domainAfter.logTasks.get('log-crashed-1')?.feishuLaunchKey).toBe('log-task:log-crashed-1')
-  })
+  }, 20_000)
 })

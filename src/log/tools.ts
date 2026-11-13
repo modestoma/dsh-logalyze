@@ -921,16 +921,17 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
         createdAt: now,
       }
 
-      const updatedTask = await runtime.updateTask(taskId, cur => ({
+      // Persist the revision before marking completed; onRevisionSubmitted() enqueues durable
+      // outbox rows first and atomically commits status='completed' (plus pendingTopicDelivery).
+      const taskWithRevision = await runtime.updateTask(taskId, cur => ({
         ...cur,
-        status: 'completed',
         revisions: [...cur.revisions, revision],
         updatedAt: now,
       }))
 
       const postSubmit = await runtime.onRevisionSubmitted({
         taskId,
-        task: updatedTask,
+        task: taskWithRevision,
         revision,
         app,
       })
