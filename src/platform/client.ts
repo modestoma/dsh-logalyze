@@ -56,6 +56,7 @@ const logItemSchema = z.object({
   status: z.string(),
   file_size_bytes: z.union([z.string(), z.number()]).nullable().optional().transform(value => (value === undefined || value === null ? null : String(value))),
   created_at: nullableText,
+  archived_at: nullableText,
   detail_url: nullableText,
 })
 
@@ -101,6 +102,21 @@ export interface RevisionFile {
   /** Path relative to the revision root. */
   readonly path: string
   readonly sizeBytes: number
+}
+
+/** One incremental `GET /open-api/v1/logs` query page. */
+export interface ListLogsPageParams {
+  readonly archivedFrom: string
+  readonly archivedTo: string
+  readonly status?: string
+  readonly limit?: number
+  readonly cursor?: string
+}
+
+/** Result of one incremental `GET /open-api/v1/logs` page. */
+export interface PlatformLogPage {
+  readonly items: readonly PlatformLog[]
+  readonly nextCursor?: string
 }
 
 /** Collaborators of the client. */
@@ -178,6 +194,27 @@ export class PlatformClient {
       if (cursor === undefined || found.size >= logIds.length) break
     }
     return [...found.values()]
+  }
+
+  /**
+   * Poll one page of archived logs in `[archivedFrom, archivedTo)`.
+   * Sends only `LogQuery`-accepted query fields (`archived_from`, `archived_to`,
+   * `status`, `limit`, `cursor`) so strict OpenAPI servers never reject unknown fields.
+   */
+  async listLogsPage(params: ListLogsPageParams): Promise<PlatformLogPage> {
+    const query = new URLSearchParams()
+    query.set('archived_from', params.archivedFrom)
+    query.set('archived_to', params.archivedTo)
+    query.set('status', params.status ?? 'completed')
+    const limit = Math.min(MAX_LOG_IDS_PER_QUERY, Math.max(1, Math.trunc(params.limit ?? MAX_LOG_IDS_PER_QUERY)))
+    query.set('limit', String(limit))
+    if (params.cursor !== undefined) query.set('cursor', params.cursor)
+    const body = await this.call('GET', `/open-api/v1/logs?${query.toString()}`, logPageSchema, '增量拉取归档日志')
+    const nextCursor = body.next_cursor ?? undefined
+    return {
+      items: body.items,
+      ...(nextCursor === undefined || nextCursor === '' ? {} : { nextCursor }),
+    }
   }
 
   /**

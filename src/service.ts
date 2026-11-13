@@ -34,6 +34,9 @@ import { Dispatcher } from './dispatch/tool.ts'
 import type { HostContext, HostCredentials, ToolActivationContext, ToolDefinition, WorkingDirectoryService } from './host.ts'
 import { SkillViewer } from './improve/show.ts'
 import { SkillImprover } from './improve/tool.ts'
+import { IssueMemory } from './issues/memory.ts'
+import { LogSupervisor, createHostLogSessionDriver, createLogTools } from './log/index.ts'
+import type { LogSessionDriver, LogToolsRuntime } from './log/index.ts'
 import { MrSupervisor, createHostMrSessionDriver, createMrTools } from './mr/index.ts'
 import type { MrSessionDriver } from './mr/index.ts'
 import { PlatformClient, PlatformError, platformProblem } from './platform/client.ts'
@@ -77,12 +80,18 @@ export interface ServiceOptions {
   readonly supervisorDir?: string
   /** Local directory where per-MR review workspaces are created. */
   readonly mrWorkspacesDir?: string
+  /** Local directory where per-log supervision workspaces are created. */
+  readonly logWorkspacesDir?: string
   /** Custom MR session turn driver (used by tests and embedding hosts). */
   readonly mrSessionDriver?: MrSessionDriver
+  /** Custom log supervision session turn driver (used by tests and embedding hosts). */
+  readonly logSessionDriver?: LogSessionDriver
   /** Deterministic clock seam for tests. */
   readonly now?: () => number
   /** Disable background MR poll interval timer in tests (`pollNow()` drives manually). */
   readonly autoMrPollTimer?: boolean
+  /** Disable background log poll interval timer in tests (`pollNow()` drives manually). */
+  readonly autoLogPollTimer?: boolean
 }
 
 /** Package files the service serves. */
@@ -111,12 +120,19 @@ export class LogalyzeService {
   private readonly reports: ReportTracker
   private readonly supervisorDir: string
   private readonly mrWorkspacesDir: string
+  private readonly logWorkspacesDir: string
   private readonly clock: () => number
   private readonly autoMrPollTimer: boolean
+  private readonly autoLogPollTimer: boolean
   private readonly hostMrDriver: ReturnType<typeof createHostMrSessionDriver> | undefined
   private readonly mrSessionDriver: MrSessionDriver
+  private readonly hostLogDriver: ReturnType<typeof createHostLogSessionDriver> | undefined
+  private readonly logSessionDriver: LogSessionDriver
+  private readonly fetchImpl: typeof fetch | undefined
   private breakers: CircuitBreakerRegistry | undefined
+  private issueMemory: IssueMemory | undefined
   private mrSupervisor: MrSupervisor | undefined
+  private logSupervisor: LogSupervisor | undefined
   private supervisorPromise: Promise<SupervisorDomain> | undefined
   private active = true
   private readonly refreshWaitMs: number
@@ -142,10 +158,15 @@ export class LogalyzeService {
     const fetchSeam = options.fetch === undefined ? {} : { fetch: options.fetch }
     this.supervisorDir = options.supervisorDir ?? join(dirname(store.path), 'supervisor')
     this.mrWorkspacesDir = options.mrWorkspacesDir ?? join(dirname(store.path), 'mr-workspaces')
+    this.logWorkspacesDir = options.logWorkspacesDir ?? join(dirname(store.path), 'log-workspaces')
     this.clock = options.now ?? Date.now
     this.autoMrPollTimer = options.autoMrPollTimer ?? true
+    this.autoLogPollTimer = options.autoLogPollTimer ?? true
     this.hostMrDriver = options.mrSessionDriver === undefined ? createHostMrSessionDriver(ctx) : undefined
     this.mrSessionDriver = options.mrSessionDriver ?? this.hostMrDriver!
+    this.hostLogDriver = options.logSessionDriver === undefined ? createHostLogSessionDriver(ctx) : undefined
+    this.logSessionDriver = options.logSessionDriver ?? this.hostLogDriver!
+    this.fetchImpl = options.fetch
     this.pools = createSupervisionPools()
     this.settings = new SettingsController(config, store, warn)
     this.refreshWaitMs = config.refreshWaitMs
@@ -153,7 +174,7 @@ export class LogalyzeService {
     const credentials = (): HostCredentials | undefined => ctx.get?.('credentials') as HostCredentials | undefined
     this.token = new StoredCredential(config.analyzeTokenRef, '分析接口令牌', credentials, warn)
     this.secret = new StoredCredential(config.platformSecretRef, '日志平台 client_secret', credentials, warn)
-    this.platform = new PlatformClient({ settings: () => this.settings.get().analyze.platform, secret: () => this.secret.value(), ...fetchSeam })
+    this.platform = new PlatformClient({ settings: () => this.settings.get().analyze.platform, secret: () => this.secret.value(), now: this.clock, ...fetchSeam })
     this.legacy = new LegacyReports(options.legacyReportsDir ?? legacyReportsDir(), warn)
     this.registry = new RepoRegistry({
       repos: this.repos,
@@ -200,6 +221,7 @@ export class LogalyzeService {
       this.supervisorPromise = openSupervisorDomain({
         ctx: this.ctx,
         fallbackDir: this.supervisorDir,
+        now: this.clock,
       })
     }
     return this.supervisorPromise
@@ -227,9 +249,14 @@ export class LogalyzeService {
     this.ctx.on('session/event', (session, event) => {
       if (event.type === 'turn/end') this.improver.turnEnded(session.header.id)
       this.hostMrDriver?.onSessionEvent(session.header.id, event.type, event.data)
+      this.hostLogDriver?.onSessionEvent(session.header.id, event.type, event.data)
+      this.logSupervisor?.onSessionEvent(session.header.id, event.type, event.data)
       this.reports.sessionEvent(session, event)
     })
-    this.ctx.on(FEISHU_TOPICS_STATUS_EVENT, (state) => { this.reports.statusChanged(state) })
+    this.ctx.on(FEISHU_TOPICS_STATUS_EVENT, (state) => {
+      this.reports.statusChanged(state)
+      this.logSupervisor?.onTopicStatusChanged(state)
+    })
     const hasApps = (): boolean => this.registry.readyApps().length > 0
     const register = <V>(definition: ToolDefinition<V>, condition: (context: ToolActivationContext) => boolean, label: string): void => {
       this.ctx.effect(() => this.ctx.tools.register(definition, { when: context => this.offers(context, condition) }), `logalyze: ${label} tool`)
@@ -252,6 +279,15 @@ export class LogalyzeService {
     })
     for (const tool of mrTools) {
       register(tool, context => this.mrSupervisor?.isMrSession(context.agent.session.header.id) === true, tool.name)
+    }
+
+    const logTools = createLogTools(this.logToolsRuntimeAdapter())
+    for (const tool of logTools) {
+      register(
+        tool,
+        context => this.logSupervisor?.isLogSession(context.agent.session.header.id) === true || hasApps(),
+        tool.name,
+      )
     }
   }
 
@@ -289,14 +325,17 @@ export class LogalyzeService {
           table: domain.circuitBreakers,
           resolvePolicy: (key) => {
             const mr = this.settings.get().mrReview
+            const log = this.settings.get().logSupervision
             if (key.startsWith('mr-repo:')) return { windowMs: 60 * 60_000, limit: mr.repoHourlyTurnLimit, cooldownMs: 60 * 60_000 }
             if (key.startsWith('mr:')) return { windowMs: 24 * 60 * 60_000, limit: mr.dailyMrTurnLimit, cooldownMs: 24 * 60 * 60_000 }
             if (key.startsWith('mr-fix:')) return { windowMs: 365 * 24 * 60 * 60_000, limit: Math.max(1, mr.maxAutoFixAttempts), cooldownMs: 24 * 60 * 60_000 }
+            if (key.startsWith('log:')) return { windowMs: 60 * 60_000, limit: log.appHourlyBatchLimit, cooldownMs: 60 * 60_000 }
             return undefined
           },
           now: this.clock,
           onError: (error) => { this.ctx.logger?.warn?.('logalyze: 熔断通知失败：%s', messageOf(error)) },
         })
+        this.issueMemory = new IssueMemory(domain.issues)
         this.mrSupervisor = new MrSupervisor({
           table: domain.supervisedMrs,
           breakers: this.breakers,
@@ -311,6 +350,38 @@ export class LogalyzeService {
           logger: this.ctx.logger,
           autoPollTimer: this.autoMrPollTimer,
         })
+        this.logSupervisor = new LogSupervisor({
+          watermarks: domain.watermarks,
+          pendingBatches: domain.pendingBatches,
+          logTasks: domain.logTasks,
+          outbox: domain.outboxPlatform,
+          issues: domain.issues,
+          issueMemory: this.issueMemory,
+          breakers: this.breakers,
+          logPool: this.pools.logPool,
+          platform: this.platform,
+          registry: this.registry,
+          repos: this.repos,
+          workspacesRoot: this.logWorkspacesDir,
+          sessionDriver: this.logSessionDriver,
+          getSettings: () => this.settings.get().logSupervision,
+          getPlatformSettings: () => this.settings.get().analyze.platform,
+          getDownloadSettings: () => this.settings.get().download,
+          getUploadSettings: () => this.settings.get().analyze.upload,
+          getTopics: () => this.topicsService(),
+          getActions: () => {
+            const lookup = lookupActions(this.ctx.get?.(FEISHU_ACTIONS_SERVICE))
+            return lookup.availability === 'ready' ? lookup.service : undefined
+          },
+          registerSelfMr: async (input) => {
+            if (this.mrSupervisor === undefined) throw new Error('审微 MR 监管运行时尚未就绪')
+            await this.mrSupervisor.registerSelfMr(input)
+          },
+          ...(this.fetchImpl === undefined ? {} : { fetch: this.fetchImpl }),
+          now: this.clock,
+          logger: this.ctx.logger,
+          autoPollTimer: this.autoLogPollTimer,
+        })
       }
       await this.reports.boot().catch((error: unknown) => {
         this.ctx.logger?.error?.('logalyze: 读取分析记录失败：%s', messageOf(error))
@@ -320,6 +391,7 @@ export class LogalyzeService {
       })
       await this.catalog.load()
       await this.mrSupervisor?.boot()
+      await this.logSupervisor?.boot()
     } finally {
       this.booted.resolve()
     }
@@ -331,6 +403,7 @@ export class LogalyzeService {
     if (!this.active) return
     await this.catalog.serviceAppeared()
     this.mrSupervisor?.notifyConfigOrReposChanged()
+    this.logSupervisor?.notifyConfigOrReposChanged()
   }
 
   /** Register both features with dsh-repo and follow its catalog and host changes. */
@@ -344,6 +417,7 @@ export class LogalyzeService {
     this.reports.shutdown()
     this.booted.resolve()
     await Promise.allSettled([
+      this.logSupervisor?.drainAndClose(),
       this.mrSupervisor?.drainAndClose(),
       this.pools.drainAndClose({ cancelQueued: true, abortActive: true }),
       this.registry.close(),
@@ -358,6 +432,7 @@ export class LogalyzeService {
     await this.booted.promise
     if (!this.active) return
     await this.reports.reconcile()
+    await this.logSupervisor?.onTopicsAvailable()
   }
 
   /** Accept one validated analyze request with idempotency protection. */
@@ -475,6 +550,7 @@ export class LogalyzeService {
         legacyReports: this.legacy.list(),
       },
       ...(this.mrSupervisor === undefined ? {} : { mrSupervision: this.mrSupervisor.panelState() }),
+      ...(this.logSupervisor === undefined ? {} : { logSupervision: this.logSupervisor.panelState() }),
     }
   }
 
@@ -516,6 +592,7 @@ export class LogalyzeService {
   async save(raw: unknown): Promise<StateWire> {
     await this.settings.save(raw)
     this.mrSupervisor?.notifyConfigOrReposChanged()
+    this.logSupervisor?.notifyConfigOrReposChanged()
     return await this.state()
   }
 
@@ -523,6 +600,7 @@ export class LogalyzeService {
   async reset(): Promise<StateWire> {
     await this.settings.reset()
     this.mrSupervisor?.notifyConfigOrReposChanged()
+    this.logSupervisor?.notifyConfigOrReposChanged()
     return await this.state()
   }
 
@@ -531,13 +609,48 @@ export class LogalyzeService {
     await this.prepared()
     const parsed = breakerResetSchema.safeParse(raw)
     if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
-    await this.mrSupervisor?.resetBreaker(parsed.data.scope, parsed.data.key)
+    if (parsed.data.scope === 'log-app') {
+      await this.logSupervisor?.resetBreaker(parsed.data.key)
+    } else {
+      await this.mrSupervisor?.resetBreaker(parsed.data.scope, parsed.data.key)
+    }
+    return await this.state()
+  }
+
+  /** Pause, resume, or rewind the automatic log-platform polling watermark. */
+  async controlLogWatermark(raw: unknown): Promise<StateWire> {
+    await this.prepared()
+    if (this.logSupervisor === undefined) throw new SettingsError('观象日志监管运行时尚未就绪')
+    try {
+      await this.logSupervisor.controlWatermark(raw)
+    } catch (error) {
+      throw new SettingsError(messageOf(error))
+    }
+    return await this.state()
+  }
+
+  /** Retry one dead-letter outbox entry or all dead-letter entries immediately. */
+  async retryOutboxDead(raw: unknown): Promise<StateWire> {
+    await this.prepared()
+    if (this.logSupervisor === undefined) throw new SettingsError('观象日志监管运行时尚未就绪')
+    const parsed = z.object({ key: z.string().trim().min(1).optional() }).strict().safeParse(raw)
+    if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
+    try {
+      await this.logSupervisor.retryOutboxDead(parsed.data.key)
+    } catch (error) {
+      throw new SettingsError(messageOf(error))
+    }
     return await this.state()
   }
 
   /** Access the active MR supervision coordinator (for tests and internal integrations). */
   mrSupervisorInstance(): MrSupervisor | undefined {
     return this.mrSupervisor
+  }
+
+  /** Access the active log supervision coordinator (for tests and internal integrations). */
+  logSupervisorInstance(): LogSupervisor | undefined {
+    return this.logSupervisor
   }
 
   /** Save only application metadata; catalog membership is checked on each write. */
@@ -555,5 +668,35 @@ export class LogalyzeService {
   private onRegistryChange(): void {
     if (!this.active) return
     this.skill.invalidate()
+    this.logSupervisor?.notifyConfigOrReposChanged()
+  }
+
+  private logToolsRuntimeAdapter(): LogToolsRuntime {
+    const requireSup = (): LogToolsRuntime => {
+      if (this.logSupervisor === undefined) {
+        throw new Error('观象日志监管运行时尚未就绪')
+      }
+      return this.logSupervisor.toolsRuntime()
+    }
+    return {
+      resolveApp: appOrAlias => this.registry.resolve(appOrAlias),
+      readyApp: appId => this.registry.readyApp(appId),
+      requireRepos: () => this.repos.require(),
+      downloadSettings: () => this.settings.get().download,
+      uploadSettings: () => this.settings.get().analyze.upload,
+      maxUnpackBytes: () => this.settings.get().logSupervision.maxUnpackBytes,
+      issueMemory: () => requireSup().issueMemory(),
+      ...(this.fetchImpl === undefined ? {} : { fetch: this.fetchImpl }),
+      platformDownload: (log, dir, fileName, download, signal) =>
+        requireSup().platformDownload(log, dir, fileName, download, signal),
+      resolveTaskForSession: (sessionId, taskId) =>
+        requireSup().resolveTaskForSession(sessionId, taskId),
+      createFeishuTask: input => requireSup().createFeishuTask(input),
+      updateTask: (taskId, updater) => requireSup().updateTask(taskId, updater),
+      onRevisionSubmitted: params => requireSup().onRevisionSubmitted(params),
+      registerSelfMr: async (input) => { await requireSup().registerSelfMr?.(input) },
+      logWorkspacesRoot: () => this.logWorkspacesDir,
+      now: () => this.clock(),
+    }
   }
 }

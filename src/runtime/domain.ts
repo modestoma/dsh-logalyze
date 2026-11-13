@@ -30,6 +30,9 @@ export const SUPERVISOR_STORAGE_VERSION = 1
 export const watermarkSchema = z.object({
   cursorTime: z.string().min(1).optional(),
   cursorId: z.string().min(1).optional(),
+  backfillFrom: z.string().min(1).optional(),
+  backfillTo: z.string().min(1).optional(),
+  backfillCursor: z.string().min(1).optional(),
   paused: z.boolean(),
   lastPollAt: z.number().int().nonnegative().optional(),
   lastError: z.string().optional(),
@@ -42,12 +45,32 @@ export type WatermarkRecord = z.infer<typeof watermarkSchema>
 // 2. pending_batches
 // ---------------------------------------------------------------------------
 
+export const logTaskInputSchema = z.object({
+  ref: z.string().min(1),
+  logId: z.string().min(1).optional(),
+  fileName: z.string().min(1).optional(),
+  path: z.string().min(1).optional(),
+  url: z.string().min(1).optional(),
+  detailUrl: z.string().min(1).optional(),
+  productCode: z.string().min(1).optional(),
+  productSn: z.string().min(1).optional(),
+  swVersion: z.string().min(1).optional(),
+  componentCode: z.string().min(1).optional(),
+  componentVersion: z.string().min(1).optional(),
+  errorCode: z.string().min(1).optional(),
+  unpackStatus: z.enum(['ok', 'corrupted']).optional(),
+  unpackError: z.string().optional(),
+}).strict()
+
+export type LogTaskInput = z.infer<typeof logTaskInputSchema>
+
 export const pendingBatchSchema = z.object({
   productCode: z.string().min(1).optional(),
   componentCode: z.string().min(1),
   errorCode: z.string().min(1).optional(),
   appId: z.string().min(1),
   logIds: z.array(z.string().min(1)).min(1),
+  logs: z.array(logTaskInputSchema).optional(),
   windowOpenedAt: z.number().int().nonnegative(),
 }).strict()
 
@@ -57,16 +80,42 @@ export type PendingBatchRecord = z.infer<typeof pendingBatchSchema>
 // 3. log_tasks
 // ---------------------------------------------------------------------------
 
-export const logTaskInputSchema = z.object({
-  ref: z.string().min(1),
-  logId: z.string().min(1).optional(),
-  fileName: z.string().min(1).optional(),
-  path: z.string().min(1).optional(),
-  url: z.string().min(1).optional(),
-  detailUrl: z.string().min(1).optional(),
+export const logEvidenceSchema = z.object({
+  source: z.string().min(1),
+  locator: z.string().min(1),
+  excerpt: z.string().min(1),
 }).strict()
 
-export type LogTaskInput = z.infer<typeof logTaskInputSchema>
+export type LogEvidence = z.infer<typeof logEvidenceSchema>
+
+export const logRootCauseCategorySchema = z.enum([
+  'code_defect',
+  'config_or_env',
+  'hardware_or_external',
+  'usage_error',
+  'unknown',
+])
+
+export type LogRootCauseCategory = z.infer<typeof logRootCauseCategorySchema>
+
+export const logItemStatusSchema = z.enum([
+  'diagnosed',
+  'insufficient_evidence',
+  'corrupted_log',
+])
+
+export type LogItemStatus = z.infer<typeof logItemStatusSchema>
+
+export const logRevisionItemSchema = z.object({
+  ref: z.string().min(1),
+  status: logItemStatusSchema,
+  rootCauseCategory: logRootCauseCategorySchema,
+  conclusion: z.string().min(1),
+  evidences: z.array(logEvidenceSchema),
+  issueId: z.string().min(1).optional(),
+}).strict()
+
+export type LogRevisionItem = z.infer<typeof logRevisionItemSchema>
 
 export const logTaskRevisionSchema = z.object({
   revision: z.number().int().positive(),
@@ -75,6 +124,9 @@ export const logTaskRevisionSchema = z.object({
   confidence: z.enum(['high', 'medium', 'low']).optional(),
   issueId: z.string().min(1).optional(),
   evidence: z.array(z.string()).optional(),
+  items: z.array(logRevisionItemSchema).optional(),
+  attachments: z.array(z.string().min(1)).optional(),
+  actionCardKey: z.string().min(1).optional(),
   reportDir: z.string().min(1).optional(),
   createdAt: z.number().int().nonnegative(),
 }).strict()
@@ -87,9 +139,15 @@ export type LogTaskStatus = z.infer<typeof logTaskStatusSchema>
 export const logTaskSchema = z.object({
   source: z.enum(['platform', 'feishu']),
   appId: z.string().min(1),
-  sessionId: z.string().min(1),
-  workDir: z.string().min(1),
+  appName: z.string().min(1).optional(),
+  errorCode: z.string().min(1).optional(),
+  sessionId: z.string().min(1).optional(),
+  workDir: z.string().min(1).optional(),
   feishuLaunchKey: z.string().min(1).optional(),
+  deliveryMode: z.enum(['quiet-until-done', 'topic-on-start']).optional(),
+  feishuChatId: z.string().min(1).optional(),
+  pendingTopicDelivery: z.boolean().optional(),
+  lastError: z.string().optional(),
   inputs: z.array(logTaskInputSchema),
   status: logTaskStatusSchema,
   revisions: z.array(logTaskRevisionSchema),
@@ -392,6 +450,51 @@ export class IssuesTable {
     return this.syncHumanFields(issueId, {
       ...(bitableRecordId === undefined ? {} : { bitableRecordId }),
       syncDirty: false,
+    })
+  }
+
+  /**
+   * Attach platform report URLs (`sampleReportUrl` when unset, `latestReportUrl` always)
+   * or a linked fix MR URL (`fixMrUrl`) to an existing issue without touching AI diagnosis
+   * text or any human-owned columns (`humanConclusion`, `humanStatus`, `assignee`).
+   */
+  attachUrlsByAi(
+    issueId: string,
+    urls: {
+      readonly sampleReportUrl?: string
+      readonly latestReportUrl?: string
+      readonly fixMrUrl?: string
+    },
+  ): Promise<IssueRecord | undefined> {
+    if (this.closed) {
+      return this.rejectClosed()
+    }
+    const key = issueId.trim()
+    if (key === '') {
+      return Promise.reject(new TypeError('issues.attachUrlsByAi: issueId 不能为空'))
+    }
+    return this.withKeyLock(key, async () => {
+      const existing = this.table.get(key)
+      if (existing === undefined) return undefined
+      const sampleReportUrl = existing.sampleReportUrl ?? urls.sampleReportUrl
+      const latestReportUrl = urls.latestReportUrl ?? existing.latestReportUrl
+      const fixMrUrl = urls.fixMrUrl ?? existing.fixMrUrl
+      if (
+        sampleReportUrl === existing.sampleReportUrl
+        && latestReportUrl === existing.latestReportUrl
+        && fixMrUrl === existing.fixMrUrl
+      ) {
+        return existing
+      }
+      const next: IssueRecord = {
+        ...existing,
+        ...(sampleReportUrl === undefined ? {} : { sampleReportUrl }),
+        ...(latestReportUrl === undefined ? {} : { latestReportUrl }),
+        ...(fixMrUrl === undefined ? {} : { fixMrUrl }),
+        syncDirty: true,
+      }
+      await this.table.put(key, next)
+      return this.table.get(key)!
     })
   }
 
