@@ -852,4 +852,71 @@ describe('OutboxRunner', () => {
     await expect(runner.enqueue({ taskId: 'task-A', revision: 4, logId: 'log-1' })).rejects.toThrow('已关闭')
     await domain.close()
   })
+
+  it('coalesces overlapping passes without unbounded pool growth and drains admitted enqueues before drainAndClose resolves', async () => {
+    const now = 20_000
+    const domain = await openSupervisorDomain({ now: () => now })
+    const firstGate = Promise.withResolvers<void>()
+    const firstStarted = Promise.withResolvers<void>()
+    const delivered: string[] = []
+
+    const runner = new OutboxRunner({
+      table: domain.outboxPlatform,
+      concurrency: 1,
+      now: () => now,
+      deliver: async (record) => {
+        if (record.logId === 'log-1') {
+          firstStarted.resolve()
+          await firstGate.promise
+        }
+        delivered.push(`${record.logId}:rev${record.revision}`)
+      },
+    })
+
+    await runner.enqueue({ taskId: 'task-c', revision: 1, logId: 'log-1' })
+    await runner.enqueue({ taskId: 'task-c', revision: 1, logId: 'log-2' })
+
+    // Fire 21 overlapping passes while `log-1` is blocked in `deliver` and `concurrency === 1`.
+    const passes = Array.from({ length: 21 }, () => runner.processDue())
+    await firstStarted.promise
+    // Inspect internal pool queue size: `log-2` must be queued at most ONCE (not 21 times).
+    const internalPool = (runner as unknown as { pool: { queuedCount: number } }).pool
+    expect(internalPool.queuedCount).toBe(1)
+
+    firstGate.resolve()
+    const summaries = await Promise.all(passes)
+    const totalDelivered = summaries.reduce((acc, item) => acc + item.delivered, 0)
+    expect(totalDelivered).toBe(2)
+    expect(delivered).toEqual(['log-1:rev1', 'log-2:rev1'])
+
+    // Now test shutdown barrier with two concurrent `enqueue()` calls on the same target while `table.put` is async.
+    const origPut = domain.outboxPlatform.put.bind(domain.outboxPlatform)
+    const putGate = Promise.withResolvers<void>()
+    let slowPutCalls = 0
+    domain.outboxPlatform.put = async (key, value) => {
+      slowPutCalls += 1
+      await putGate.promise
+      await origPut(key, value)
+    }
+
+    const e1 = runner.enqueue({ taskId: 'task-shutdown', revision: 1, logId: 'log-9' })
+    const e2 = runner.enqueue({ taskId: 'task-shutdown', revision: 2, logId: 'log-9' })
+    let drained = false
+    const closing = runner.drainAndClose().then(() => { drained = true })
+
+    await new Promise(resolve => setTimeout(resolve, 15))
+    expect(drained).toBe(false)
+
+    putGate.resolve()
+    await closing
+    expect(drained).toBe(true)
+    expect(slowPutCalls).toBe(2)
+    await expect(e1).resolves.toMatchObject({ status: 'enqueued' })
+    await expect(e2).resolves.toMatchObject({ status: 'enqueued' })
+
+    // Closing storage right after `runner.drainAndClose()` succeeds cleanly with both rows persisted!
+    await domain.close()
+    expect(domain.outboxPlatform.has(outboxPlatformKey('task-shutdown', 1, 'log-9'))).toBe(true)
+    expect(domain.outboxPlatform.has(outboxPlatformKey('task-shutdown', 2, 'log-9'))).toBe(true)
+  })
 })

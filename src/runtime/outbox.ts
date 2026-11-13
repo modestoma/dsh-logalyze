@@ -95,6 +95,9 @@ export class OutboxRunner {
   private readonly pool: TaskPool
   private readonly pairLocks = new Map<string, Promise<unknown>>()
   private readonly inflightPasses = new Set<Promise<OutboxProcessSummary>>()
+  private readonly inflightOps = new Set<Promise<unknown>>()
+  private readonly activePairPasses = new Map<string, { maxDueAt: number; promise: Promise<void> }>()
+  private bgPollInFlight = false
   private pollTimer: ReturnType<typeof setInterval> | undefined
   private closing = false
 
@@ -157,32 +160,45 @@ export class OutboxRunner {
     return Math.min(this.maxDelayMs, Math.round(raw))
   }
 
+  private trackOperation<T>(op: () => Promise<T>): Promise<T> {
+    const promise = op().finally(() => {
+      this.inflightOps.delete(promise)
+    })
+    this.inflightOps.add(promise)
+    return promise
+  }
+
   /**
    * Recover rows left in `'uploading'` from an unclean shutdown back to `'pending'`
    * (or discard them if a higher revision already completed).
    * @returns number of rows recovered or cleaned up.
    */
-  async recoverInterrupted(): Promise<number> {
-    let touched = 0
-    for (const [key, record] of this.table.entries()) {
-      if (record.status !== 'uploading') continue
-      await this.withPairLock(record.taskId, record.logId, async () => {
-        const latest = this.table.get(key)
-        if (latest?.status !== 'uploading') return
-        if (this.highestDoneRevision(latest.taskId, latest.logId) > latest.revision) {
-          await this.table.delete(key)
-          touched += 1
-          return
-        }
-        await this.table.put(key, {
-          ...latest,
-          status: 'pending',
-          nextRetryAt: this.now(),
-        })
-        touched += 1
-      })
+  recoverInterrupted(): Promise<number> {
+    if (this.closing) {
+      return Promise.reject(new Error('OutboxRunner 已关闭，不能执行中断恢复'))
     }
-    return touched
+    return this.trackOperation(async () => {
+      let touched = 0
+      for (const [key, record] of this.table.entries()) {
+        if (record.status !== 'uploading') continue
+        await this.withPairLock(record.taskId, record.logId, async () => {
+          const latest = this.table.get(key)
+          if (latest?.status !== 'uploading') return
+          if (this.highestDoneRevision(latest.taskId, latest.logId) > latest.revision) {
+            await this.table.delete(key)
+            touched += 1
+            return
+          }
+          await this.table.put(key, {
+            ...latest,
+            status: 'pending',
+            nextRetryAt: this.now(),
+          })
+          touched += 1
+        })
+      }
+      return touched
+    })
   }
 
   /**
@@ -197,7 +213,7 @@ export class OutboxRunner {
       return Promise.reject(new RangeError(`OutboxRunner.enqueue: revision 必须是正整数，收到 ${String(input.revision)}`))
     }
     const key = outboxPlatformKey(input.taskId, input.revision, input.logId)
-    return this.withPairLock(input.taskId, input.logId, async () => {
+    return this.trackOperation(() => this.withPairLock(input.taskId, input.logId, async () => {
       const doneRevision = this.highestDoneRevision(input.taskId, input.logId)
       if (doneRevision > input.revision) {
         return { status: 'superseded', key, doneRevision }
@@ -219,14 +235,21 @@ export class OutboxRunner {
       }
       await this.table.put(key, record)
       return { status: 'enqueued', key, record }
-    })
+    }))
   }
 
   /**
    * Manually reset one `'dead'` record to `'pending'` for immediate retry,
    * unless a higher revision for `(taskId, logId)` has already completed.
    */
-  async retryDead(key: string): Promise<OutboxRetryOutcome> {
+  retryDead(key: string): Promise<OutboxRetryOutcome> {
+    if (this.closing) {
+      return Promise.reject(new Error('OutboxRunner 已关闭，不能重试死信任务'))
+    }
+    return this.trackOperation(() => this.retryDeadInternal(key))
+  }
+
+  private async retryDeadInternal(key: string): Promise<OutboxRetryOutcome> {
     const initial = this.table.get(key)
     if (initial === undefined || initial.status !== 'dead') {
       return 'not-dead'
@@ -260,17 +283,22 @@ export class OutboxRunner {
   /**
    * Reset all `'dead'` entries (optionally scoped to `taskId`) for immediate retry.
    */
-  async retryAllDead(filter?: { readonly taskId?: string }): Promise<{ readonly requeued: number; readonly superseded: number }> {
-    let requeued = 0
-    let superseded = 0
-    for (const [key, record] of this.table.entries()) {
-      if (record.status !== 'dead') continue
-      if (filter?.taskId !== undefined && record.taskId !== filter.taskId) continue
-      const outcome = await this.retryDead(key)
-      if (outcome === 'requeued') requeued += 1
-      else if (outcome === 'superseded') superseded += 1
+  retryAllDead(filter?: { readonly taskId?: string }): Promise<{ readonly requeued: number; readonly superseded: number }> {
+    if (this.closing) {
+      return Promise.reject(new Error('OutboxRunner 已关闭，不能批量重试死信任务'))
     }
-    return { requeued, superseded }
+    return this.trackOperation(async () => {
+      let requeued = 0
+      let superseded = 0
+      for (const [key, record] of this.table.entries()) {
+        if (record.status !== 'dead') continue
+        if (filter?.taskId !== undefined && record.taskId !== filter.taskId) continue
+        const outcome = await this.retryDeadInternal(key)
+        if (outcome === 'requeued') requeued += 1
+        else if (outcome === 'superseded') superseded += 1
+      }
+      return { requeued, superseded }
+    })
   }
 
   /** List all entries currently in `'dead'` status. */
@@ -295,16 +323,13 @@ export class OutboxRunner {
   }
 
   private async runDuePass(at: number): Promise<OutboxProcessSummary> {
-    const groups = new Map<string, { key: string; record: OutboxPlatformRecord }[]>()
-    for (const [key, record] of this.table.entries()) {
+    const duePairs = new Map<string, { readonly taskId: string; readonly logId: string }>()
+    for (const [, record] of this.table.entries()) {
       if (record.status !== 'pending' || record.nextRetryAt > at) continue
       const pairKey = targetLockKey(record.taskId, record.logId)
-      const list = groups.get(pairKey) ?? []
-      list.push({ key, record })
-      groups.set(pairKey, list)
-    }
-    for (const list of groups.values()) {
-      list.sort((a, b) => b.record.revision - a.record.revision)
+      if (!duePairs.has(pairKey)) {
+        duePairs.set(pairKey, { taskId: record.taskId, logId: record.logId })
+      }
     }
 
     let delivered = 0
@@ -312,23 +337,55 @@ export class OutboxRunner {
     let dead = 0
     let skipped = 0
 
-    await Promise.all([...groups.values()].map(async (candidates) => {
-      const sample = candidates[0]
-      if (sample === undefined || this.closing) return
-      await this.pool.run(async (signal) => {
-        await this.withPairLock(sample.record.taskId, sample.record.logId, async () => {
-          for (const candidate of candidates) {
-            if (this.closing || signal.aborted) return
-            const outcome = await this.deliverOne(candidate.key, at, signal)
-            if (outcome === 'delivered') delivered += 1
-            else if (outcome === 'retried') retried += 1
-            else if (outcome === 'dead') dead += 1
-            else if (outcome === 'skipped') skipped += 1
+    await Promise.all([...duePairs.entries()].map(async ([pairKey, sample]) => {
+      if (this.closing) return
+      const existing = this.activePairPasses.get(pairKey)
+      if (existing !== undefined) {
+        existing.maxDueAt = Math.max(existing.maxDueAt, at)
+        await existing.promise
+        return
+      }
+      const state = { maxDueAt: at, promise: Promise.resolve() }
+      const promise = this.pool.run(async (signal) => {
+        await this.withPairLock(sample.taskId, sample.logId, async () => {
+          const attemptedKeys = new Set<string>()
+          while (!this.closing && !signal.aborted) {
+            const threshold = state.maxDueAt
+            const candidates = this.table.entries()
+              .filter(([key, rec]) =>
+                rec.taskId === sample.taskId
+                && rec.logId === sample.logId
+                && rec.status === 'pending'
+                && rec.nextRetryAt <= threshold
+                && !attemptedKeys.has(key))
+              .sort((a, b) => b[1].revision - a[1].revision)
+            if (candidates.length === 0) {
+              if (this.activePairPasses.get(pairKey) === state) {
+                this.activePairPasses.delete(pairKey)
+              }
+              break
+            }
+            for (const [key] of candidates) {
+              if (this.closing || signal.aborted) return
+              attemptedKeys.add(key)
+              const outcome = await this.deliverOne(key, threshold, signal)
+              if (outcome === 'delivered') delivered += 1
+              else if (outcome === 'retried') retried += 1
+              else if (outcome === 'dead') dead += 1
+              else if (outcome === 'skipped') skipped += 1
+            }
           }
         })
       }).catch((error: unknown) => {
         if (!this.closing) throw error
+      }).finally(() => {
+        if (this.activePairPasses.get(pairKey) === state) {
+          this.activePairPasses.delete(pairKey)
+        }
       })
+      state.promise = promise
+      this.activePairPasses.set(pairKey, state)
+      await promise
     }))
 
     return { delivered, retried, dead, skipped }
@@ -433,17 +490,22 @@ export class OutboxRunner {
   start(pollIntervalMs = 1_000): void {
     if (this.closing || this.pollTimer !== undefined) return
     const timer = setInterval(() => {
-      if (this.closing) return
-      void this.processDue().catch((error: unknown) => {
-        this.onError?.(error)
-      })
+      if (this.closing || this.bgPollInFlight) return
+      this.bgPollInFlight = true
+      void this.processDue()
+        .catch((error: unknown) => {
+          this.onError?.(error)
+        })
+        .finally(() => {
+          this.bgPollInFlight = false
+        })
     }, pollIntervalMs)
     timer.unref?.()
     this.pollTimer = timer
   }
 
   /**
-   * Stop background polling and wait for all in-flight upload passes to settle.
+   * Stop background polling and wait for all in-flight upload passes and admitted mutations to settle.
    */
   async drainAndClose(options: { readonly abortActive?: boolean } = {}): Promise<void> {
     this.closing = true
@@ -455,6 +517,12 @@ export class OutboxRunner {
       cancelQueued: true,
       abortActive: options.abortActive ?? false,
     })
-    await Promise.allSettled([...this.inflightPasses])
+    while (this.inflightPasses.size > 0 || this.inflightOps.size > 0 || this.pairLocks.size > 0) {
+      await Promise.allSettled([
+        ...this.inflightPasses,
+        ...this.inflightOps,
+        ...this.pairLocks.values(),
+      ])
+    }
   }
 }
