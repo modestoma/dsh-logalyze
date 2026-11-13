@@ -180,6 +180,7 @@ class FakeFeishuTopics implements FeishuTopicService {
   readonly launched: TopicLaunchSpec[] = []
   readonly states = new Map<string, TopicLaunchState>()
   readonly updatedLinks: { readonly key: string; readonly links: TopicCardLinks }[] = []
+  failNextLaunch: { readonly code: 'not-connected' | 'send-failed'; readonly message: string } | undefined
   private readonly sessionToKey = new Map<string, string>()
   private statusListeners: ((state: TopicLaunchState) => void)[] = []
 
@@ -188,6 +189,11 @@ class FakeFeishuTopics implements FeishuTopicService {
   }
 
   async launch(spec: TopicLaunchSpec) {
+    if (this.failNextLaunch !== undefined) {
+      const failure = this.failNextLaunch
+      this.failNextLaunch = undefined
+      return { ok: false as const, code: failure.code, message: failure.message }
+    }
     this.launched.push(spec)
     const msgId = `om_${this.launched.length}`
     const state: TopicLaunchState = {
@@ -475,6 +481,62 @@ describe('IssueMemory search, humanConclusion preservation, and batch dedup', ()
     expect(hits).toHaveLength(1)
     expect(hits[0]?.humanConclusion).toBe('人工确认为 Redis 连接池配置过小且未判空')
     expect(hits[0]?.humanStatus).toBe('已排期修复')
+
+    // Collision-resistant slug namespaces & serialized allocation for >32-char prefixes and non-ASCII appIds
+    const [alphaRes, betaRes, cnOrderRes, cnPayRes] = await Promise.all([
+      memory.upsertNewOrReuseByTitle({
+        appId: 'enterprise-microservice-platform-order-alpha',
+        title: 'Alpha 超时',
+        matchCriteria: 'TimeoutException alpha',
+        aiDiagnosis: 'alpha diag',
+        aiStatus: 'located',
+        resolutionAdvice: 'fix alpha',
+        seenAt: 3_000,
+      }),
+      memory.upsertNewOrReuseByTitle({
+        appId: 'enterprise-microservice-platform-order-beta',
+        title: 'Beta 超时',
+        matchCriteria: 'TimeoutException beta',
+        aiDiagnosis: 'beta diag',
+        aiStatus: 'located',
+        resolutionAdvice: 'fix beta',
+        seenAt: 3_000,
+      }),
+      memory.upsertNewOrReuseByTitle({
+        appId: '订单核心服务',
+        title: '订单库连接泄露',
+        matchCriteria: 'PoolExhausted order',
+        aiDiagnosis: 'cn order diag',
+        aiStatus: 'located',
+        resolutionAdvice: 'close conn',
+        seenAt: 3_000,
+      }),
+      memory.upsertNewOrReuseByTitle({
+        appId: '支付核心服务',
+        title: '支付渠道超时',
+        matchCriteria: 'ChannelTimeout pay',
+        aiDiagnosis: 'cn pay diag',
+        aiStatus: 'located',
+        resolutionAdvice: 'retry pay',
+        seenAt: 3_000,
+      }),
+    ])
+    expect(new Set([alphaRes.issueId, betaRes.issueId, cnOrderRes.issueId, cnPayRes.issueId]).size).toBe(4)
+    expect(alphaRes.record.appId).toBe('enterprise-microservice-platform-order-alpha')
+    expect(betaRes.record.appId).toBe('enterprise-microservice-platform-order-beta')
+    expect(cnOrderRes.record.appId).toBe('订单核心服务')
+    expect(cnPayRes.record.appId).toBe('支付核心服务')
+
+    await expect(domain.issues.upsertByAi({
+      issueId: alphaRes.issueId,
+      appId: 'enterprise-microservice-platform-order-beta',
+      title: 'Cross app overwrite',
+      matchCriteria: 'none',
+      aiDiagnosis: 'none',
+      aiStatus: 'located',
+      resolutionAdvice: 'none',
+      seenAt: 4_000,
+    })).rejects.toThrow(/已归属应用/)
   })
 })
 
@@ -489,15 +551,21 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     readonly batchSizeThreshold?: number
     readonly maxBatchSize?: number
     readonly batchWindowMs?: number
+    readonly maxConcurrentBatches?: number
     readonly appHourlyBatchLimit?: number
+    readonly origin?: string
+    readonly settingsPath?: string
+    readonly skipSaveApplication?: boolean
+    readonly supervisorDir?: string
     readonly withPlatform?: boolean
+    readonly setupPlatform?: (platform: FakePlatform) => void
     readonly onLogTurn?: (req: LogSessionTurnRequest, tools: readonly ToolDefinition<unknown>[]) => Promise<void>
     readonly onMrTurn?: (req: { repo: string; mrNumber: number; origin: string; prompt: string }) => Promise<void>
   } = {}) {
     const { dir, cleanup } = await tempDir()
     cleanups.push(cleanup)
 
-    const origin = await createAppRepo(join(dir, 'order-service'), {
+    const origin = options.origin ?? await createAppRepo(join(dir, 'order-service'), {
       'src/handler.ts': 'export function handleOrder() { return null }\n',
     })
 
@@ -508,6 +576,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     if (options.withPlatform !== false) {
       await fakePlatform.start()
       cleanups.push(() => fakePlatform.stop())
+      options.setupPlatform?.(fakePlatform)
     }
 
     const fakeTopics = new FakeFeishuTopics()
@@ -560,7 +629,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
       },
     }
 
-    const store = new OverlayStore(join(dir, 'settings.json'))
+    const store = new OverlayStore(options.settingsPath ?? join(dir, 'settings.json'))
     const config = resolveConfig({
       mrReview: {
         enabled: true,
@@ -578,7 +647,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
         batchSizeThreshold: options.batchSizeThreshold ?? 5,
         maxBatchSize: options.maxBatchSize ?? 20,
         batchWindowMs: options.batchWindowMs ?? 300_000,
-        maxConcurrentBatches: 4,
+        maxConcurrentBatches: options.maxConcurrentBatches ?? 4,
         appHourlyBatchLimit: options.appHourlyBatchLimit ?? 15,
         feishuChatId: 'oc_ops_group',
         deliveryMode: options.deliveryMode ?? 'quiet-until-done',
@@ -615,7 +684,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     const service = new LogalyzeService(ctx, config, store, { bundled }, {
       analysesDir: join(dir, 'analyses'),
       legacyReportsDir: join(dir, 'legacy'),
-      supervisorDir: join(dir, 'supervisor'),
+      supervisorDir: options.supervisorDir ?? join(dir, 'supervisor'),
       mrWorkspacesDir: join(dir, 'mr-ws'),
       logWorkspacesDir: join(dir, 'log-ws'),
       mrSessionDriver,
@@ -627,7 +696,9 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
 
     service.registerTools()
     await service.boot()
-    await service.saveApplication({ url: origin, description: '订单服务', aliases: ['order-comp'] })
+    if (!options.skipSaveApplication) {
+      await service.saveApplication({ url: origin, description: '订单服务', aliases: ['order-comp'] })
+    }
     cleanups.push(() => service.shutdown())
 
     const toolExecCtx = (sessionId: string, cwd = dir, callId = 'call-1') => ({
@@ -1156,5 +1227,185 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     await flushMicrotasks()
     expect(h.fakePlatform.revisions.filter(r => r.completed).length).toBe(2)
     expect((await lstat(liveWs)).isDirectory()).toBe(true)
+  })
+
+  it('enforces maxConcurrentBatches for topic-on-start until terminal topic state', async () => {
+    const h = await createFullHarness({
+      deliveryMode: 'topic-on-start',
+      batchSizeThreshold: 1,
+      maxConcurrentBatches: 1,
+    })
+
+    await h.service.controlLogWatermark({ action: 'rewind', cursorTime: '2026-11-12T09:50:00.000Z' })
+    h.fakePlatform.addLog({
+      log_id: 'conc-1',
+      product_code: 'P1',
+      component_code: 'order-service',
+      error_code: 'E_CONC_1',
+      file_name: 'conc-1.log',
+      storage_type: 'fds',
+      status: 'completed',
+      archived_at: '2026-11-12T09:55:00.000Z',
+    }, 'err 1\n')
+    h.fakePlatform.addLog({
+      log_id: 'conc-2',
+      product_code: 'P1',
+      component_code: 'order-service',
+      error_code: 'E_CONC_2',
+      file_name: 'conc-2.log',
+      storage_type: 'fds',
+      status: 'completed',
+      archived_at: '2026-11-12T09:55:00.000Z',
+    }, 'err 2\n')
+
+    await h.service.logSupervisorInstance()!.pollNow()
+    await waitFor(() => h.fakeTopics.launched.length === 1)
+    await flushMicrotasks()
+
+    // While topic 1 is still running, topic 2 must remain queued under maxConcurrentBatches=1!
+    expect(h.fakeTopics.launched).toHaveLength(1)
+    expect((await h.service.state()).logSupervision?.running).toBe(1)
+
+    const liveSess1 = 'live-conc-1'
+    const liveWs1 = join(h.dir, 'live-conc-ws-1')
+    await mkdir(liveWs1, { recursive: true })
+    const launch1 = h.fakeTopics.launched[0]!
+    h.fakeTopics.emitState({ key: launch1.key, status: 'running', sessionId: liveSess1, workDir: liveWs1 })
+    await flushMicrotasks()
+    const prep1 = await h.toolNamed('supervisor_log_prepare').execute({}, h.toolExecCtx(liveSess1, liveWs1)) as {
+      readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+    }
+    await h.toolNamed('supervisor_log_submit').execute({
+      summary: '批次 1 已完成',
+      items: prep1.slots.map(s => ({
+        ref: s.ref,
+        status: 'diagnosed',
+        rootCauseCategory: 'config_or_env',
+        conclusion: 'ok',
+        evidences: [{ source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'err' }],
+      })),
+    }, h.toolExecCtx(liveSess1, liveWs1))
+    h.fakeTopics.emitState({ key: launch1.key, status: 'done', sessionId: liveSess1, workDir: liveWs1 })
+
+    // Terminal state releases the pool slot so topic 2 launches immediately.
+    await waitFor(() => h.fakeTopics.launched.length === 2)
+    expect(h.fakeTopics.launched[1]?.key).not.toBe(launch1.key)
+  })
+
+  it('keeps pendingTopicDelivery on transient launch failure and deduplicates crash recovery across log_tasks and pending_batches', async () => {
+    const sharedSup = await tempDir()
+    cleanups.push(sharedSup.cleanup)
+    const settingsPath = join(sharedSup.dir, 'settings.json')
+
+    // 1. First boot saves application configuration to persistent OverlayStore, then shuts down.
+    const h1 = await createFullHarness({
+      supervisorDir: sharedSup.dir,
+      settingsPath,
+    })
+    const origin = h1.origin
+    await h1.service.shutdown()
+
+    // 2. Pre-seed crash state: one persisted platform running task plus an overlapping pending_batches entry
+    const seedDomain = await openSupervisorDomain({ fallbackDir: sharedSup.dir })
+    const persistedWorkDir = join(sharedSup.dir, 'ws-persisted')
+    await mkdir(persistedWorkDir, { recursive: true })
+    await seedDomain.logTasks.put('log-crashed-1', {
+      source: 'platform',
+      appId: 'order-service',
+      appName: 'order-service',
+      batchKey: 'P1\0order-service\0E_CRASH',
+      errorCode: 'E_CRASH',
+      workDir: persistedWorkDir,
+      deliveryMode: 'quiet-until-done',
+      feishuChatId: 'oc_ops_group',
+      inputs: [{
+        ref: 'L1',
+        logId: 'crash-log-1',
+        productCode: 'P1',
+        componentCode: 'order-service',
+        errorCode: 'E_CRASH',
+        fileName: 'crash-1.log',
+      }],
+      status: 'running',
+      revisions: [],
+      createdAt: 1_000,
+      updatedAt: 1_000,
+    })
+    await seedDomain.pendingBatches.put('P1\0order-service\0E_CRASH', {
+      productCode: 'P1',
+      componentCode: 'order-service',
+      errorCode: 'E_CRASH',
+      appId: 'order-service',
+      logIds: ['crash-log-1'],
+      logs: [{
+        ref: 'L1',
+        logId: 'crash-log-1',
+        productCode: 'P1',
+        componentCode: 'order-service',
+        errorCode: 'E_CRASH',
+        fileName: 'crash-1.log',
+      }],
+      windowOpenedAt: 1_000,
+    })
+    await seedDomain.close()
+
+    let failedOnce = false
+    const h = await createFullHarness({
+      origin,
+      settingsPath,
+      skipSaveApplication: true,
+      supervisorDir: sharedSup.dir,
+      batchSizeThreshold: 1,
+      setupPlatform: (platform) => {
+        platform.addLog({
+          log_id: 'crash-log-1',
+          product_code: 'P1',
+          component_code: 'order-service',
+          error_code: 'E_CRASH',
+          file_name: 'crash-1.log',
+          storage_type: 'fds',
+          status: 'completed',
+          archived_at: '2026-11-12T09:55:00.000Z',
+        }, 'recovered log\n')
+      },
+      onLogTurn: async (req) => {
+        if (!failedOnce) {
+          failedOnce = true
+          h.fakeTopics.failNextLaunch = { code: 'not-connected', message: 'bot offline' }
+        }
+        const prepare = h.toolNamed('supervisor_log_prepare')
+        const submit = h.toolNamed('supervisor_log_submit')
+        const prepared = await prepare.execute({ taskId: req.taskId }, h.toolExecCtx(req.existingSessionId!, req.workDir)) as {
+          readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+        }
+        await submit.execute({
+          taskId: req.taskId,
+          summary: '崩溃恢复后完成诊断',
+          items: prepared.slots.map(s => ({
+            ref: s.ref,
+            status: 'diagnosed',
+            rootCauseCategory: 'config_or_env',
+            conclusion: 'recovered diagnosis',
+            evidences: [{ source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'recovered log' }],
+          })),
+        }, h.toolExecCtx(req.existingSessionId!, req.workDir))
+      },
+    })
+
+    // Recovered task ran once without duplicating pending_batches!
+    await waitFor(() => h.logTurns.length === 1)
+    const domainAfter = await h.service.supervisorDomain()
+    await waitFor(() => domainAfter.logTasks.get('log-crashed-1')?.status === 'completed')
+    expect(domainAfter.logTasks.keys()).toEqual(['log-crashed-1'])
+    expect(domainAfter.pendingBatches.size).toBe(0)
+
+    // Initial launch returned not-connected -> pendingTopicDelivery stayed true until retry succeeded!
+    expect(h.fakeTopics.launched).toHaveLength(0)
+    expect(domainAfter.logTasks.get('log-crashed-1')?.pendingTopicDelivery).toBe(true)
+
+    await h.service.topicsAvailable()
+    await waitFor(() => h.fakeTopics.launched.length === 1)
+    expect(domainAfter.logTasks.get('log-crashed-1')?.pendingTopicDelivery).toBeUndefined()
+    expect(domainAfter.logTasks.get('log-crashed-1')?.feishuLaunchKey).toBe('log-task:log-crashed-1')
   })
 })

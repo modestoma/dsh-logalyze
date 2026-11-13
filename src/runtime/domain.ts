@@ -140,6 +140,7 @@ export const logTaskSchema = z.object({
   source: z.enum(['platform', 'feishu']),
   appId: z.string().min(1),
   appName: z.string().min(1).optional(),
+  batchKey: z.string().min(1).optional(),
   errorCode: z.string().min(1).optional(),
   sessionId: z.string().min(1).optional(),
   workDir: z.string().min(1).optional(),
@@ -359,6 +360,9 @@ export class IssuesTable {
     }
     return this.withKeyLock(issueId, async () => {
       const existing = this.table.get(issueId)
+      if (existing !== undefined && existing.appId !== input.appId) {
+        throw new Error(`已知问题 "${issueId}" 已归属应用 "${existing.appId}"，不能被应用 "${input.appId}" 覆盖`)
+      }
       const now = this.now()
       const candidateFirstSeen = input.firstSeenAt ?? input.seenAt ?? now
       const candidateLastSeen = input.lastSeenAt ?? input.seenAt ?? now

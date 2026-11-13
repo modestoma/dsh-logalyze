@@ -185,9 +185,12 @@ export class LogSupervisor {
   private readonly activeTaskIds = new Set<string>()
   private readonly sessionToTaskIds = new Map<string, string[]>()
   private readonly launchKeyToTaskId = new Map<string, string>()
+  private readonly liveTopicWaiters = new Map<string, Set<() => void>>()
+  private readonly topicDeliveryInFlight = new Set<string>()
 
   private lastConcurrency: number
   private booted = false
+  private bootPromise: Promise<void> | undefined
   private closed = false
 
   constructor(private readonly deps: LogSupervisorDeps) {
@@ -222,40 +225,80 @@ export class LogSupervisor {
   /** Restore outbox/task/batch state after process restart and start background pollers. */
   async boot(): Promise<void> {
     if (this.closed || this.booted) return
-    this.booted = true
+    if (this.bootPromise !== undefined) return await this.bootPromise
+    this.bootPromise = this.runBoot()
+    try {
+      await this.bootPromise
+    } finally {
+      this.bootPromise = undefined
+    }
+  }
+
+  private async runBoot(): Promise<void> {
+    if (this.closed || this.booted) return
 
     this.deps.logPool.setConcurrency(Math.max(1, this.deps.getSettings().maxConcurrentBatches))
     this.lastConcurrency = this.deps.getSettings().maxConcurrentBatches
 
     await this.outboxRunner.recoverInterrupted()
 
+    // Deduplicate pending_batches against tasks persisted right before a crash in evaluateBatchKey.
+    const batchKeys = this.deps.pendingBatches.keys()
+    for (const bKey of batchKeys) {
+      await this.deduplicatePendingBatch(bKey)
+    }
+
     for (const [taskId, task] of this.deps.logTasks.entries()) {
       if (task.sessionId !== undefined) this.indexSessionTask(task.sessionId, taskId)
       if (task.feishuLaunchKey !== undefined) this.launchKeyToTaskId.set(task.feishuLaunchKey, taskId)
 
-      if (task.status === 'running') {
-        const reconciled = await this.reconcileRunningTaskOnBoot(taskId, task)
-        if (!reconciled && !this.closed) {
+      if (task.status !== 'running') continue
+
+      if (task.source === 'platform') {
+        if (task.feishuLaunchKey === undefined && task.revisions.length > 0) {
+          const deliveryMode = task.deliveryMode ?? this.deps.getSettings().deliveryMode
+          const needsQuietSummary = deliveryMode === 'quiet-until-done'
+            && (task.feishuChatId ?? this.deps.getSettings().feishuChatId) !== undefined
           await this.updateTask(taskId, cur => (
             cur.status === 'running'
               ? {
                 ...cur,
-                status: 'interrupted',
-                lastError: cur.lastError ?? 'DSH 重启前本轮日志诊断尚未提交结果',
+                status: 'completed',
+                lastError: undefined,
+                ...(needsQuietSummary ? { pendingTopicDelivery: true } : {}),
                 updatedAt: this.now(),
               }
               : cur
           ))
+        } else if (!this.closed) {
+          this.enqueuePlatformTask(taskId)
         }
+        continue
+      }
+
+      const reconciled = await this.reconcileRunningTaskOnBoot(taskId, task)
+      if (!reconciled && !this.closed) {
+        await this.updateTask(taskId, cur => (
+          cur.status === 'running'
+            ? {
+              ...cur,
+              status: 'interrupted',
+              lastError: cur.lastError ?? 'DSH 重启前本轮日志诊断尚未提交结果',
+              updatedAt: this.now(),
+            }
+            : cur
+        ))
       }
     }
 
     await this.reconcilePendingTopics()
 
-    const batchKeys = this.deps.pendingBatches.keys()
-    for (const key of batchKeys) {
+    for (const key of this.deps.pendingBatches.keys()) {
       await this.evaluateBatchKey(key)
     }
+
+    if (this.closed) return
+    this.booted = true
 
     this.outboxRunner.start(OUTBOX_POLL_INTERVAL_MS)
     if (this.autoPollTimer) {
@@ -285,7 +328,7 @@ export class LogSupervisor {
 
   /** React to updated plugin settings or catalog repositories. */
   notifyConfigOrReposChanged(): void {
-    if (this.closed) return
+    if (this.closed || !this.booted) return
     const nextConcurrency = Math.max(1, this.deps.getSettings().maxConcurrentBatches)
     if (nextConcurrency !== this.lastConcurrency) {
       this.lastConcurrency = nextConcurrency
@@ -296,6 +339,9 @@ export class LogSupervisor {
         this.deps.logger?.warn?.('logalyze: 评估待发批次 %s 失败：%s', key, messageOf(error))
       })
     }
+    void this.reconcilePendingTopics().catch((error: unknown) => {
+      this.deps.logger?.warn?.('logalyze: 补发静默摘要卡片失败：%s', messageOf(error))
+    })
     if (this.autoPollTimer) {
       this.scheduleNextPoll(this.nextPollDelayMs())
     }
@@ -305,9 +351,23 @@ export class LogSupervisor {
   async onTopicsAvailable(): Promise<void> {
     if (this.closed) return
     await this.reconcilePendingTopics()
+    const topics = this.deps.getTopics()
     for (const [taskId, task] of this.deps.logTasks.entries()) {
       if (task.feishuLaunchKey !== undefined && task.status === 'running') {
-        await this.reconcileTopicLaunchState(taskId, task.feishuLaunchKey)
+        const reconciled = await this.reconcileTopicLaunchState(taskId, task.feishuLaunchKey)
+        if (!reconciled && topics !== undefined && topics.state(task.feishuLaunchKey) === undefined) {
+          await this.updateTask(taskId, cur => (
+            cur.status === 'running'
+              ? {
+                ...cur,
+                status: 'interrupted',
+                lastError: cur.lastError ?? '飞书话题状态已失效（重启或未注册）',
+                updatedAt: this.now(),
+              }
+              : cur
+          ))
+          this.notifyTopicWaiters(taskId)
+        }
       }
     }
   }
@@ -547,6 +607,9 @@ export class LogSupervisor {
       clearTimeout(entry.timer)
     }
     this.batchTimers.clear()
+    for (const taskId of [...this.liveTopicWaiters.keys()]) {
+      this.notifyTopicWaiters(taskId)
+    }
 
     await Promise.allSettled([
       this.pollInFlight ?? Promise.resolve(),
@@ -610,8 +673,12 @@ export class LogSupervisor {
   private async runPollCycle(): Promise<void> {
     if (this.closed) return
     const settings = this.deps.getSettings()
+    if (!settings.enabled) return
+    await this.reconcilePendingTopics().catch((error: unknown) => {
+      this.deps.logger?.warn?.('logalyze: 轮询前补发静默摘要卡片失败：%s', messageOf(error))
+    })
     const wm = this.readWatermark()
-    if (!settings.enabled || wm.paused) return
+    if (wm.paused) return
     if (platformProblem(this.deps.getPlatformSettings()) !== undefined) return
 
     const currentNow = this.now()
@@ -861,6 +928,22 @@ export class LogSupervisor {
           return
         }
 
+        const preCheck = await this.deps.breakers.canProceed(`log:${batch.appId}`)
+        if (!preCheck.allowed) {
+          this.clearBatchTimer(bKey)
+          return
+        }
+
+        const sliceCount = Math.min(count, maxSlice)
+        const slice = currentInputs.slice(0, sliceCount)
+        const remainder = currentInputs.slice(sliceCount)
+
+        // Prepare workspace and allocate taskId before recording breaker or mutating pending_batches.
+        const now = this.now()
+        const taskId = `log-${now}-${randomBytes(4).toString('hex')}`
+        const workDir = join(this.deps.workspacesRoot, taskId)
+        await mkdir(workDir, { recursive: true })
+
         const decision = await this.deps.breakers.record(`log:${batch.appId}`, {
           reason: `应用 ${batch.appId} 1 小时内发车超过上限`,
         })
@@ -873,9 +956,9 @@ export class LogSupervisor {
           return
         }
 
-        const sliceCount = Math.min(count, maxSlice)
-        const slice = currentInputs.slice(0, sliceCount)
-        const remainder = currentInputs.slice(sliceCount)
+        // Persist the recoverable task record BEFORE trimming/deleting pending_batches so a crash
+        // between writes never strands logs outside both tables.
+        await this.persistDispatchedSlice(taskId, workDir, now, bKey, batch, slice)
 
         if (remainder.length === 0) {
           await this.deps.pendingBatches.delete(bKey)
@@ -889,8 +972,47 @@ export class LogSupervisor {
           })
         }
 
-        await this.launchDispatchedSlice(batch, slice)
+        this.enqueuePlatformTask(taskId)
       }
+    })
+  }
+
+  private async deduplicatePendingBatch(bKey: string): Promise<void> {
+    await this.withBatchLock(bKey, async () => {
+      const batch = this.deps.pendingBatches.get(bKey)
+      if (batch === undefined) return
+
+      const persistedLogIds = new Set<string>()
+      for (const [, task] of this.deps.logTasks.entries()) {
+        if (task.source !== 'platform') continue
+        if (task.batchKey !== undefined && task.batchKey !== bKey) continue
+        if ((task.createdAt ?? 0) < batch.windowOpenedAt) continue
+        for (const input of task.inputs) {
+          if (input.logId !== undefined) {
+            persistedLogIds.add(input.logId)
+          }
+        }
+      }
+      if (persistedLogIds.size === 0) return
+
+      const currentInputs = this.materializeBatchInputs(batch)
+      const remainingInputs = currentInputs.filter((item, idx) => {
+        const lid = item.logId ?? batch.logIds[idx]
+        return lid === undefined || !persistedLogIds.has(lid)
+      })
+      if (remainingInputs.length === currentInputs.length) return
+
+      if (remainingInputs.length === 0) {
+        await this.deps.pendingBatches.delete(bKey)
+        this.clearBatchTimer(bKey)
+        return
+      }
+
+      await this.deps.pendingBatches.put(bKey, {
+        ...batch,
+        logIds: remainingInputs.map((item, idx) => item.logId ?? `log-${idx}`),
+        logs: remainingInputs.map((item, idx) => ({ ...item, ref: `L${idx + 1}` })),
+      })
     })
   }
 
@@ -909,13 +1031,15 @@ export class LogSupervisor {
     }))
   }
 
-  private async launchDispatchedSlice(batch: PendingBatchRecord, rawSlice: readonly LogTaskInput[]): Promise<void> {
+  private async persistDispatchedSlice(
+    taskId: string,
+    workDir: string,
+    now: number,
+    batchKey: string,
+    batch: PendingBatchRecord,
+    rawSlice: readonly LogTaskInput[],
+  ): Promise<void> {
     const app = this.findReadyOrName(batch.appId)
-    const now = this.now()
-    const taskId = `log-${now}-${randomBytes(4).toString('hex')}`
-    const workDir = join(this.deps.workspacesRoot, taskId)
-    await mkdir(workDir, { recursive: true })
-
     const settings = this.deps.getSettings()
     const deliveryMode = settings.deliveryMode
     const feishuChatId = settings.feishuChatId
@@ -928,6 +1052,7 @@ export class LogSupervisor {
       source: 'platform',
       appId: batch.appId,
       appName: app?.app.name ?? batch.appId,
+      batchKey,
       ...(batch.errorCode === undefined ? {} : { errorCode: batch.errorCode }),
       workDir,
       deliveryMode,
@@ -939,13 +1064,24 @@ export class LogSupervisor {
       updatedAt: now,
     }
     await this.deps.logTasks.put(taskId, record)
+  }
 
-    this.activeTaskIds.add(taskId)
-    const runPromise = this.executePlatformTask(taskId)
-    const cleanup = (): void => {
-      this.activeTaskIds.delete(taskId)
-    }
-    this.trackBackground(runPromise.then(cleanup, cleanup))
+  private enqueuePlatformTask(taskId: string): void {
+    if (this.closed) return
+    const runPromise = this.deps.logPool.run(async (signal) => {
+      if (this.closed || signal.aborted) return
+      this.activeTaskIds.add(taskId)
+      try {
+        await this.executePlatformTask(taskId, signal)
+      } finally {
+        this.activeTaskIds.delete(taskId)
+      }
+    }).catch((error: unknown) => {
+      if (!this.closed) {
+        this.deps.logger?.warn?.('logalyze: 平台日志批次任务执行异常（%s）：%s', taskId, messageOf(error))
+      }
+    })
+    this.trackBackground(runPromise)
   }
 
   private findReadyOrName(appId: string): ReadyApp | undefined {
@@ -956,30 +1092,57 @@ export class LogSupervisor {
     }
   }
 
-  private async executePlatformTask(taskId: string): Promise<void> {
+  private async executePlatformTask(taskId: string, signal: AbortSignal): Promise<void> {
     const task = this.deps.logTasks.get(taskId)
-    if (task === undefined || this.closed) return
+    if (task === undefined || task.status !== 'running' || this.closed || signal.aborted) return
 
     const mode = task.deliveryMode ?? this.deps.getSettings().deliveryMode
     const topics = this.deps.getTopics()
     const chatId = task.feishuChatId ?? this.deps.getSettings().feishuChatId
 
+    if (task.feishuLaunchKey !== undefined) {
+      if (topics === undefined) {
+        await this.waitForTopicTerminal(taskId, signal)
+        return
+      }
+      if (chatId !== undefined) {
+        await this.runLiveTopicBatch(taskId, task, chatId, topics, signal)
+        return
+      }
+    }
+
     if (mode === 'topic-on-start' && topics !== undefined && chatId !== undefined) {
-      await this.startLiveTopicTask(taskId, task, chatId, topics)
+      await this.runLiveTopicBatch(taskId, task, chatId, topics, signal)
       return
     }
 
-    await this.deps.logPool.run(signal => this.runHeadlessBatch(taskId, signal))
+    await this.runHeadlessBatch(taskId, signal)
   }
 
-  private async startLiveTopicTask(
+  private async runLiveTopicBatch(
     taskId: string,
     task: LogTaskRecord,
     chatId: string,
     topics: FeishuTopicService,
+    signal: AbortSignal,
   ): Promise<void> {
-    const launchKey = logTopicKey(taskId)
+    const launchKey = task.feishuLaunchKey ?? logTopicKey(taskId)
     this.launchKeyToTaskId.set(launchKey, taskId)
+
+    if (task.feishuLaunchKey !== undefined) {
+      const existingState = topics.state(launchKey)
+      if (existingState !== undefined) {
+        await this.applyTopicState(taskId, existingState)
+        if (this.deps.logTasks.get(taskId)?.status !== 'running') {
+          return
+        }
+        if (existingState.status === 'running') {
+          await this.waitForTopicTerminal(taskId, signal)
+          return
+        }
+      }
+    }
+
     await this.updateTask(taskId, cur => ({
       ...cur,
       feishuLaunchKey: launchKey,
@@ -1007,7 +1170,20 @@ export class LogSupervisor {
       phase: 'starting',
     })
 
-    const res = await topics.launch(spec)
+    let res: Awaited<ReturnType<FeishuTopicService['launch']>>
+    try {
+      res = await topics.launch(spec)
+    } catch (error) {
+      await this.updateTask(taskId, cur => ({
+        ...cur,
+        status: 'failed',
+        lastError: `发起飞书话题异常：${messageOf(error)}`,
+        updatedAt: this.now(),
+      }))
+      this.notifyTopicWaiters(taskId)
+      return
+    }
+
     if (!res.ok) {
       await this.updateTask(taskId, cur => ({
         ...cur,
@@ -1015,6 +1191,7 @@ export class LogSupervisor {
         lastError: `发起飞书话题失败（${res.code}）：${res.message}`,
         updatedAt: this.now(),
       }))
+      this.notifyTopicWaiters(taskId)
       return
     }
 
@@ -1022,6 +1199,46 @@ export class LogSupervisor {
     if (currentState !== undefined) {
       await this.applyTopicState(taskId, currentState)
     }
+
+    while (!this.closed && !signal.aborted && this.deps.logTasks.get(taskId)?.status === 'running') {
+      await this.waitForTopicTerminal(taskId, signal)
+    }
+  }
+
+  private notifyTopicWaiters(taskId: string): void {
+    const waiters = this.liveTopicWaiters.get(taskId)
+    if (waiters === undefined) return
+    this.liveTopicWaiters.delete(taskId)
+    for (const wake of waiters) {
+      wake()
+    }
+  }
+
+  private waitForTopicTerminal(taskId: string, signal: AbortSignal): Promise<void> {
+    if (this.closed || signal.aborted || this.deps.logTasks.get(taskId)?.status !== 'running') {
+      return Promise.resolve()
+    }
+    return new Promise((resolve) => {
+      let settled = false
+      const finish = (): void => {
+        if (settled) return
+        settled = true
+        signal.removeEventListener('abort', finish)
+        const set = this.liveTopicWaiters.get(taskId)
+        set?.delete(finish)
+        if (set !== undefined && set.size === 0) {
+          this.liveTopicWaiters.delete(taskId)
+        }
+        resolve()
+      }
+      let set = this.liveTopicWaiters.get(taskId)
+      if (set === undefined) {
+        set = new Set()
+        this.liveTopicWaiters.set(taskId, set)
+      }
+      set.add(finish)
+      signal.addEventListener('abort', finish, { once: true })
+    })
   }
 
   private async runHeadlessBatch(taskId: string, signal: AbortSignal): Promise<void> {
@@ -1063,10 +1280,32 @@ export class LogSupervisor {
 
     const latest = await this.updateTask(taskId, (cur) => {
       if (turnResult.error !== undefined) {
+        if (signal.aborted || this.closed) {
+          if (cur.revisions.length > 0) {
+            const quietNeedsCard = (cur.deliveryMode ?? mode) === 'quiet-until-done'
+              && cur.feishuLaunchKey === undefined
+              && (cur.feishuChatId ?? this.deps.getSettings().feishuChatId) !== undefined
+            return {
+              ...cur,
+              sessionId: cur.sessionId ?? turnResult.sessionId,
+              status: 'completed',
+              lastError: undefined,
+              ...(quietNeedsCard ? { pendingTopicDelivery: true } : {}),
+              updatedAt: this.now(),
+            }
+          }
+          return {
+            ...cur,
+            sessionId: cur.sessionId ?? turnResult.sessionId,
+            status: 'running',
+            lastError: turnResult.error,
+            updatedAt: this.now(),
+          }
+        }
         return {
           ...cur,
           sessionId: cur.sessionId ?? turnResult.sessionId,
-          status: signal.aborted || this.closed ? 'interrupted' : 'failed',
+          status: 'failed',
           lastError: turnResult.error,
           updatedAt: this.now(),
         }
@@ -1110,8 +1349,10 @@ export class LogSupervisor {
     revision: LogTaskRevision,
     reportUrls: Readonly<Record<string, string>>,
   ): Promise<void> {
+    if (this.closed || this.topicDeliveryInFlight.has(taskId)) return
     const task = this.deps.logTasks.get(taskId)
-    if (task === undefined || this.closed) return
+    if (task === undefined) return
+    if (task.feishuLaunchKey !== undefined && !task.pendingTopicDelivery) return
     const chatId = task.feishuChatId ?? this.deps.getSettings().feishuChatId
     if (chatId === undefined) return
 
@@ -1119,48 +1360,78 @@ export class LogSupervisor {
     if (topics === undefined) {
       await this.updateTask(taskId, cur => ({
         ...cur,
+        feishuChatId: cur.feishuChatId ?? chatId,
         pendingTopicDelivery: true,
         updatedAt: this.now(),
       }))
       return
     }
 
-    const launchKey = logTopicKey(taskId)
-    this.launchKeyToTaskId.set(launchKey, taskId)
-    await this.updateTask(taskId, cur => ({
-      ...cur,
-      feishuLaunchKey: launchKey,
-      feishuChatId: chatId,
-      pendingTopicDelivery: undefined,
-      updatedAt: this.now(),
-    }))
+    this.topicDeliveryInFlight.add(taskId)
+    const launchKey = task.feishuLaunchKey ?? logTopicKey(taskId)
+    try {
+      await this.updateTask(taskId, cur => ({
+        ...cur,
+        feishuChatId: cur.feishuChatId ?? chatId,
+        pendingTopicDelivery: true,
+        updatedAt: this.now(),
+      }))
 
-    const prompt = buildQuietDoneTopicPrompt({
-      task,
-      taskId,
-      revision,
-      reportUrls,
-    })
-    const spec = buildLogTopicLaunchSpec({
-      launchKey,
-      fingerprint: `${launchKey}:rev${revision.revision}`,
-      chatId,
-      task,
-      taskId,
-      prompt,
-      reportUrls,
-      phase: 'completed',
-    })
+      this.launchKeyToTaskId.set(launchKey, taskId)
 
-    const launched = await topics.launch(spec)
-    if (!launched.ok) {
-      this.deps.logger?.warn?.('logalyze: 投递静默完成飞书卡片失败（%s）：%s', taskId, launched.message)
-      return
-    }
+      const prompt = buildQuietDoneTopicPrompt({
+        task,
+        taskId,
+        revision,
+        reportUrls,
+      })
+      const spec = buildLogTopicLaunchSpec({
+        launchKey,
+        fingerprint: `${launchKey}:rev${revision.revision}`,
+        chatId,
+        task,
+        taskId,
+        prompt,
+        reportUrls,
+        phase: 'completed',
+      })
 
-    const state = topics.state(launchKey)
-    if (state !== undefined) {
-      await this.applyTopicState(taskId, state)
+      let launched: Awaited<ReturnType<FeishuTopicService['launch']>>
+      try {
+        launched = await topics.launch(spec)
+      } catch (error) {
+        if (task.feishuLaunchKey === undefined) {
+          this.launchKeyToTaskId.delete(launchKey)
+        }
+        this.deps.logger?.warn?.('logalyze: 投递静默完成飞书卡片异常（%s）：%s', taskId, messageOf(error))
+        return
+      }
+
+      if (!launched.ok) {
+        if (task.feishuLaunchKey === undefined) {
+          this.launchKeyToTaskId.delete(launchKey)
+        }
+        this.deps.logger?.warn?.('logalyze: 投递静默完成飞书卡片失败（%s）：%s', taskId, launched.message)
+        return
+      }
+
+      await this.updateTask(taskId, cur => ({
+        ...cur,
+        feishuLaunchKey: launchKey,
+        feishuChatId: chatId,
+        pendingTopicDelivery: undefined,
+        updatedAt: this.now(),
+      }))
+
+      const state = topics.state(launchKey)
+      if (state !== undefined) {
+        await this.applyTopicState(taskId, state)
+      }
+      if (Object.keys(reportUrls).length > 0) {
+        await this.updateTopicLinksForTask(taskId, reportUrls)
+      }
+    } finally {
+      this.topicDeliveryInFlight.delete(taskId)
     }
   }
 
@@ -1209,6 +1480,17 @@ export class LogSupervisor {
       if (latestRev !== undefined && latestRev.actionCardKey === undefined) {
         await this.maybeProposeActionsForRevision(taskId, latestRev.revision, state.sessionId)
       }
+    }
+
+    if (
+      updated.status !== 'running'
+      || state.status === 'done'
+      || state.status === 'failed'
+      || state.status === 'error'
+      || state.status === 'stopped'
+      || state.status === 'interrupted'
+    ) {
+      this.notifyTopicWaiters(taskId)
     }
   }
 

@@ -7,6 +7,7 @@
  * @module dsh-logalyze/issues/memory
  */
 
+import { createHash } from 'node:crypto'
 import type { AiIssueUpsertInput, IssueAiStatus, IssueRecord, IssuesTable } from '../runtime/domain.ts'
 
 /** One matched known issue returned by {@link searchIssues}. */
@@ -48,15 +49,20 @@ export function normalizeSearchText(value: string): string {
   return value.normalize('NFKC').trim().toLowerCase()
 }
 
-/** Sanitize an application id into a lowercase ASCII slug for `ISS-<slug>-NNNN`. */
+/** Sanitize an application id into a collision-resistant lowercase ASCII slug for `ISS-<slug>-NNNN`. */
 export function issueAppSlug(appId: string): string {
-  const slug = appId
+  if (/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(appId) && appId.length <= 32) {
+    return appId
+  }
+  const hash = createHash('sha256').update(appId).digest('hex').slice(0, 6)
+  const base = appId
     .normalize('NFKC')
     .toLowerCase()
     .replace(/[^a-z0-9]+/gu, '-')
     .replace(/^-+|-+$/gu, '')
-    .slice(0, 32)
-  return slug === '' ? 'app' : slug
+    .slice(0, 25)
+    .replace(/-+$/gu, '')
+  return `${base === '' ? 'app' : base}-${hash}`
 }
 
 function tokenizeQuery(normalizedQuery: string): string[] {
@@ -198,20 +204,20 @@ export function allocateIssueId(issues: IssuesTable, appId: string): string {
 
 /** Concurrency-safe coordinator around {@link IssuesTable} for issue search, id allocation, and AI upserts. */
 export class IssueMemory {
-  private readonly appLocks = new Map<string, Promise<unknown>>()
+  private readonly slugLocks = new Map<string, Promise<unknown>>()
 
   constructor(readonly table: IssuesTable) {}
 
-  private withAppLock<T>(appId: string, fn: () => Promise<T>): Promise<T> {
-    const previous = this.appLocks.get(appId) ?? Promise.resolve()
+  private withSlugLock<T>(slug: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.slugLocks.get(slug) ?? Promise.resolve()
     const next = previous.then(fn, fn)
     const cleanup = (): void => {
-      if (this.appLocks.get(appId) === tracked) {
-        this.appLocks.delete(appId)
+      if (this.slugLocks.get(slug) === tracked) {
+        this.slugLocks.delete(slug)
       }
     }
     const tracked = next.then(() => undefined, () => undefined).then(cleanup, cleanup)
-    this.appLocks.set(appId, tracked)
+    this.slugLocks.set(slug, tracked)
     return next
   }
 
@@ -230,7 +236,8 @@ export class IssueMemory {
    * one batch or concurrent submits).
    */
   upsertNewOrReuseByTitle(draft: NewIssueDraft): Promise<{ readonly issueId: string; readonly record: IssueRecord; readonly created: boolean }> {
-    return this.withAppLock(draft.appId, async () => {
+    const slug = issueAppSlug(draft.appId)
+    return this.withSlugLock(slug, async () => {
       const normalizedTitle = normalizeSearchText(draft.title)
       for (const [existingId, existingRec] of this.table.listByApp(draft.appId)) {
         if (normalizeSearchText(existingRec.title) === normalizedTitle) {
