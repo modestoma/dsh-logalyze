@@ -42,7 +42,7 @@ interface PendingTurnWaiter {
   messageId: string | undefined
   claimed: boolean
   claimedTurn: number | undefined
-  readonly resolve: (outcome: { readonly error?: string }) => void
+  readonly resolve: (outcome: { readonly error?: string; readonly aborted?: boolean }) => void
   readonly cleanup: () => void
 }
 
@@ -287,11 +287,11 @@ export function createHostMrSessionDriver(ctx: HostContext): MrSessionDriver & {
 
       const requestId = randomUUID()
       let registeredWaiter!: PendingTurnWaiter
-      const turnPromise = new Promise<{ readonly error?: string }>((resolve, reject) => {
+      const turnPromise = new Promise<{ readonly error?: string; readonly aborted?: boolean }>((resolve) => {
         const onAbort = (): void => {
           cleanup()
           pruneSessionState(sessionId!)
-          reject(new Error('MR 会话执行已取消'))
+          resolve({ aborted: true })
         }
         const waiter: PendingTurnWaiter = {
           sessionId: sessionId!,
@@ -306,6 +306,10 @@ export function createHostMrSessionDriver(ctx: HostContext): MrSessionDriver & {
         function cleanup(): void {
           waiters.delete(waiter)
           request.signal.removeEventListener('abort', onAbort)
+        }
+        if (request.signal.aborted) {
+          onAbort()
+          return
         }
         waiters.add(waiter)
         request.signal.addEventListener('abort', onAbort, { once: true })
@@ -335,6 +339,9 @@ export function createHostMrSessionDriver(ctx: HostContext): MrSessionDriver & {
       }
 
       const outcome = await turnPromise
+      if (outcome.aborted) {
+        throw new Error('MR 会话执行已取消')
+      }
       return {
         sessionId,
         ...(outcome.error === undefined ? {} : { error: outcome.error }),

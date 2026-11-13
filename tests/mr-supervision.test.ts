@@ -2358,4 +2358,80 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     expect(dom.supervisedMrs.get(key20)?.autoFixAttempts).toBe(1)
     expect(dom.supervisedMrs.get(key20)?.pendingSignals).toEqual([])
   })
+
+  it('does not leak an unhandled rejection when abort fires while controller.prompt is pending', async () => {
+    let resolvePromptEntered!: () => void
+    const promptEntered = new Promise<void>(resolve => { resolvePromptEntered = resolve })
+    let rejectOnAbort = true
+
+    const ctx: HostContext = {
+      tools: { register: () => () => {} },
+      skills: { registerProvider: () => () => {} },
+      subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('unused')) },
+      on: () => () => {},
+      effect: () => () => {},
+      get: (name: string) => {
+        if (name !== 'sessionController') return undefined
+        return {
+          resolveAgent: async (sessionId: string) => ({
+            agent: { id: 'agent-1', session: { header: { id: sessionId } } },
+          }),
+          prompt: async (_req: unknown, signal?: AbortSignal) => {
+            if (!rejectOnAbort) return { accepted: true }
+            resolvePromptEntered()
+            return await new Promise<{ readonly accepted: boolean }>((_resolve, reject) => {
+              if (signal?.aborted) {
+                reject(new Error('prompt aborted'))
+                return
+              }
+              signal?.addEventListener('abort', () => reject(new Error('prompt aborted')), { once: true })
+            })
+          },
+        }
+      },
+    }
+
+    const driver = createHostMrSessionDriver(ctx)
+    cleanups.push(async () => { driver.dispose?.() })
+
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const ac1 = new AbortController()
+      const p1 = driver.runTurn({
+        repo: 'https://git.example/org/app.git',
+        mrNumber: 1,
+        origin: 'external',
+        existingSessionId: 'sess-abort-prompt',
+        workDir: '/tmp/mr-abort-prompt',
+        prompt: 'Review MR',
+        signal: ac1.signal,
+      })
+      await promptEntered
+      ac1.abort()
+      await expect(p1).rejects.toThrow('prompt aborted')
+
+      // Aborting after controller.prompt() accepts also rejects cleanly without unhandled rejections.
+      rejectOnAbort = false
+      const ac2 = new AbortController()
+      const p2 = driver.runTurn({
+        repo: 'https://git.example/org/app.git',
+        mrNumber: 2,
+        origin: 'external',
+        existingSessionId: 'sess-abort-after',
+        workDir: '/tmp/mr-abort-after',
+        prompt: 'Review MR',
+        signal: ac2.signal,
+      })
+      await new Promise(resolve => setTimeout(resolve, 10))
+      ac2.abort()
+      await expect(p2).rejects.toThrow('MR 会话执行已取消')
+
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
 })
