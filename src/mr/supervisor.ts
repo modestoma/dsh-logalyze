@@ -37,6 +37,8 @@ import {
   MAX_OWN_PUSHED_SHAS,
   MAX_SEEN_NOTE_IDS,
   appendBoundedUnique,
+  canonicalCommentKey,
+  canonicalDiscussionNoteKey,
   classifyMrPollUpdate,
   evaluateMrFilter,
   mergePendingSignals,
@@ -175,8 +177,7 @@ export class MrSupervisor implements MrToolsRuntime {
       merge: (existing, incoming) => mergePendingSignals(existing, [incoming]),
       onFlush: (key) => {
         const promise = this.handleDebouncedFlush(key)
-        this.activeFlushPromises.add(promise)
-        void promise.finally(() => { this.activeFlushPromises.delete(promise) })
+        this.trackFlushPromise(promise)
         return promise
       },
       onError: (error, key) => {
@@ -224,6 +225,9 @@ export class MrSupervisor implements MrToolsRuntime {
     this.deps.mrPool.setConcurrency(settings.maxConcurrentSessions)
     if (!settings.enabled) {
       this.debouncer.cancelAll()
+      void this.suspendPendingDeadlines().catch((error: unknown) => {
+        this.deps.logger?.warn?.('logalyze: 清理暂停 MR 截止时间失败：%s', messageOf(error))
+      })
       return
     }
     void this.resumeDormantPending().catch((error: unknown) => {
@@ -563,6 +567,21 @@ export class MrSupervisor implements MrToolsRuntime {
     )
   }
 
+  private async suspendPendingDeadlines(): Promise<void> {
+    if (this.closed || this.deps.getSettings().enabled) return
+    const currentNow = this.now()
+    for (const [mrKey, rec] of this.deps.table.entries()) {
+      if (this.closed || this.deps.getSettings().enabled) break
+      if (rec.state !== 'open' || rec.dueAt === undefined || this.runningKeys.has(mrKey)) continue
+      await this.updateRecord(rec.repo, rec.mrNumber, (cur) => {
+        if (this.deps.getSettings().enabled || this.runningKeys.has(mrKey) || cur.state !== 'open' || cur.dueAt === undefined) {
+          return cur
+        }
+        return { ...cur, dueAt: undefined, updatedAt: currentNow }
+      }).catch(() => undefined)
+    }
+  }
+
   private async resumeDormantPending(): Promise<void> {
     if (this.closed) return
     const settings = this.deps.getSettings()
@@ -572,7 +591,7 @@ export class MrSupervisor implements MrToolsRuntime {
 
     for (const [mrKey, rec] of this.deps.table.entries()) {
       if (this.closed) break
-      if (rec.state !== 'open' || rec.pendingSignals.length === 0 || rec.dueAt !== undefined) continue
+      if (rec.state !== 'open' || rec.pendingSignals.length === 0) continue
       if (this.runningKeys.has(mrKey) || this.debouncer.peek(mrKey) !== undefined) continue
       if (this.isTurnBreakerTripped(mrKey, rec.repo)) continue
       if (rec.pendingSignals.every(s => s.kind === 'ci-failed') && this.deps.breakers.inspect(`mr-fix:${mrKey}`).tripped) {
@@ -581,13 +600,15 @@ export class MrSupervisor implements MrToolsRuntime {
 
       let resumedRecord: SupervisedMrRecord | undefined
       await this.updateRecord(rec.repo, rec.mrNumber, (cur) => {
-        if (cur.state !== 'open' || cur.pendingSignals.length === 0 || cur.dueAt !== undefined) return cur
-        resumedRecord = { ...cur, dueAt: currentNow, updatedAt: currentNow }
+        if (!this.deps.getSettings().enabled || cur.state !== 'open' || cur.pendingSignals.length === 0) return cur
+        const effectiveDue = cur.dueAt !== undefined && cur.dueAt > currentNow ? cur.dueAt : currentNow
+        resumedRecord = { ...cur, dueAt: effectiveDue, updatedAt: currentNow }
         return resumedRecord
       })
       if (resumedRecord !== undefined && !this.closed && !this.runningKeys.has(mrKey) && this.debouncer.peek(mrKey) === undefined) {
+        const windowMs = Math.max(0, (resumedRecord.dueAt ?? currentNow) - currentNow)
         for (const sig of resumedRecord.pendingSignals) {
-          this.debouncer.push(mrKey, sig, { windowMs: 0 })
+          this.debouncer.push(mrKey, sig, { windowMs })
         }
       }
     }
@@ -897,11 +918,21 @@ export class MrSupervisor implements MrToolsRuntime {
         && latest.dueAt !== undefined
         && (latest.dueAt <= currentNow || (rerunRequested && this.debouncer.peek(key) === undefined))
       if (shouldFollowUp) {
-        const follow = this.handleDebouncedFlush(key)
-        this.activeFlushPromises.add(follow)
-        void follow.finally(() => { this.activeFlushPromises.delete(follow) })
+        const follow = this.handleDebouncedFlush(key).catch((error: unknown) => {
+          this.lastError = `MR 会话唤醒失败 (${key})：${messageOf(error)}`
+          this.deps.logger?.error?.('logalyze: %s', this.lastError)
+        })
+        this.trackFlushPromise(follow)
       }
     }
+  }
+
+  private trackFlushPromise(promise: Promise<void>): void {
+    this.activeFlushPromises.add(promise)
+    void promise.then(
+      () => { this.activeFlushPromises.delete(promise) },
+      () => { this.activeFlushPromises.delete(promise) },
+    )
   }
 
   private async executeMrTurn(key: string, signal: AbortSignal): Promise<TurnOutcome> {
@@ -1005,6 +1036,7 @@ export class MrSupervisor implements MrToolsRuntime {
     }
 
     const preTurnReviewedSha = initial.lastReviewedSha
+    const preTurnOwnPushedCount = initial.ownPushedShas.length
     const deliveredNotes = signalNoteKeys(signalsToRun)
     const willAttemptCiFix = isSelf && signalsToRun.some(s => s.kind === 'ci-failed')
     const workDir = initial.workDir ?? defaultMrWorkDir(this.deps.workspacesRoot, initial.repo, initial.mrNumber)
@@ -1064,16 +1096,15 @@ export class MrSupervisor implements MrToolsRuntime {
       if (result.error !== undefined) {
         this.lastError = `MR ${key} 会话执行异常：${result.error}`
         this.deps.logger?.warn?.('logalyze: %s', this.lastError)
-        await this.updateRecord(initial.repo, initial.mrNumber, (cur) => {
-          if (cur.lastReviewedSha !== preTurnReviewedSha || cur.deliveredNoteIds === undefined) return cur
-          return {
-            ...cur,
-            pendingSignals: mergePendingSignals(signalsToRun, cur.pendingSignals),
-            deliveredNoteIds: undefined,
-            dueAt: undefined,
-            updatedAt: this.now(),
-          }
-        }).catch(() => undefined)
+        await this.rollbackFailedTurnBatch({
+          repo: initial.repo,
+          mrNumber: initial.mrNumber,
+          signalsToRun,
+          deliveredNotes,
+          preTurnReviewedSha,
+          preTurnOwnPushedCount,
+          willAttemptCiFix,
+        })
         return 'blocked'
       }
       if (deliveredNotes.length > 0) {
@@ -1093,19 +1124,68 @@ export class MrSupervisor implements MrToolsRuntime {
       if (!signal.aborted && !this.closed) {
         this.lastError = `MR ${key} 会话唤醒失败：${messageOf(error)}`
         this.deps.logger?.error?.('logalyze: %s', this.lastError)
-        await this.updateRecord(initial.repo, initial.mrNumber, (cur) => {
-          if (cur.lastReviewedSha !== preTurnReviewedSha || cur.deliveredNoteIds === undefined) return cur
-          return {
-            ...cur,
-            pendingSignals: mergePendingSignals(signalsToRun, cur.pendingSignals),
-            deliveredNoteIds: undefined,
-            dueAt: undefined,
-            updatedAt: this.now(),
-          }
-        }).catch(() => undefined)
+        await this.rollbackFailedTurnBatch({
+          repo: initial.repo,
+          mrNumber: initial.mrNumber,
+          signalsToRun,
+          deliveredNotes,
+          preTurnReviewedSha,
+          preTurnOwnPushedCount,
+          willAttemptCiFix,
+        })
       }
       throw error
     }
+  }
+
+  private async rollbackFailedTurnBatch(input: {
+    readonly repo: string
+    readonly mrNumber: number
+    readonly signalsToRun: readonly MrPendingSignal[]
+    readonly deliveredNotes: readonly string[]
+    readonly preTurnReviewedSha: string | undefined
+    readonly preTurnOwnPushedCount: number
+    readonly willAttemptCiFix: boolean
+  }): Promise<void> {
+    await this.updateRecord(input.repo, input.mrNumber, (cur) => {
+      if (cur.state !== 'open') return cur
+      const shaReviewed = cur.lastReviewedSha !== input.preTurnReviewedSha
+      const pushedFix = cur.ownPushedShas.length > input.preTurnOwnPushedCount
+      const seenSet = new Set(cur.seenNoteIds ?? [])
+      const signalsToRestore = input.signalsToRun.filter((sig) => {
+        switch (sig.kind) {
+          case 'opened':
+          case 'ready-for-review':
+          case 'push':
+            return !shaReviewed
+          case 'ci-failed':
+            return !pushedFix && !shaReviewed
+          case 'discussion': {
+            if (sig.noteId === undefined) return true
+            const noteKey = sig.discussionId !== undefined
+              ? canonicalDiscussionNoteKey(sig.discussionId, sig.noteId)
+              : canonicalCommentKey(sig.noteId)
+            return !seenSet.has(noteKey)
+          }
+          case 'conflict':
+            return !shaReviewed && !pushedFix
+        }
+      })
+      const deliveredSet = new Set(input.deliveredNotes)
+      const remainingDelivered = (cur.deliveredNoteIds ?? []).filter(k => !deliveredSet.has(k))
+      const mergedPending = mergePendingSignals(signalsToRestore, cur.pendingSignals)
+      const preservedDueAt = cur.pendingSignals.length > 0 && cur.dueAt !== undefined ? cur.dueAt : undefined
+      return {
+        ...cur,
+        pendingSignals: mergedPending,
+        deliveredNoteIds: remainingDelivered.length > 0 ? remainingDelivered : undefined,
+        dueAt: preservedDueAt,
+        autoFixAttempts: input.willAttemptCiFix && !pushedFix && !shaReviewed
+          ? Math.max(0, cur.autoFixAttempts - 1)
+          : cur.autoFixAttempts,
+        updatedAt: this.now(),
+      }
+    }).catch(() => undefined)
   }
 
   private async notifyBreakerOrHuman(input: {

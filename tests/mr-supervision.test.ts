@@ -1109,4 +1109,151 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     expect(finalRec?.pendingSignals).toEqual([])
     expect(finalRec?.reviewedHeadSha).toBe('sha-3')
   })
+
+  it('resumes pending review after disabling and re-enabling supervision mid-debounce without new remote updates', async () => {
+    const { dir, cleanup } = await tempDir('logalyze-mr-disable-debounce-')
+    cleanups.push(cleanup)
+    const origin = await createAppRepo(join(dir, 'repo'))
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    fakeV8.base.catalog = [{ id: 'r1', url: origin, base: 'main', access: 'write', features: [{ id: 'mr-review' }] }]
+
+    let clockMs = 7_000_000
+    let turnCount = 0
+    const h = await createServiceHarness({
+      fakeV8,
+      dir,
+      clock: () => clockMs,
+      mrConfig: { debounceMs: 5000 },
+      driver: {
+        async runTurn(req) {
+          turnCount += 1
+          const sid = req.existingSessionId ?? `s-${turnCount}`
+          await req.onSessionBound?.(sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(h.dispose)
+
+    fakeV8.upsertMr(origin, 46, { headSha: 'sha-1', updatedAt: '2026-11-01T07:00:00Z' })
+    const supervisor = h.service.mrSupervisorInstance()!
+    const key46 = supervisedMrKey(origin, 46)
+    const domain = await h.service.supervisorDomain()
+
+    // Enters 5s debounce window without running yet.
+    await supervisor.pollNow()
+    expect(turnCount).toBe(0)
+    expect(domain.supervisedMrs.get(key46)?.dueAt).toBe(clockMs + 5000)
+
+    // Disable supervision mid-debounce -> timer cancelled and durable deadline cleared.
+    const disableRes = await fetch(`${h.baseUrl}/logalyze/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mrReview: { enabled: false } }),
+    })
+    expect(disableRes.status).toBe(200)
+    await new Promise(resolve => setTimeout(resolve, 25))
+    expect(domain.supervisedMrs.get(key46)?.dueAt).toBeUndefined()
+
+    clockMs += 6000
+    await supervisor.flushDebouncedDue()
+    expect(turnCount).toBe(0)
+
+    // Re-enable supervision without any new remote update -> queued review runs automatically.
+    const enableRes = await fetch(`${h.baseUrl}/logalyze/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mrReview: { enabled: true } }),
+    })
+    expect(enableRes.status).toBe(200)
+    await new Promise(resolve => setTimeout(resolve, 25))
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+    expect(turnCount).toBe(1)
+  })
+
+  it('restores opened and push-only signal batches when sessionDriver returns an error or throws', async () => {
+    const { dir, cleanup } = await tempDir('logalyze-mr-note-free-rollback-')
+    cleanups.push(cleanup)
+    const origin = await createAppRepo(join(dir, 'repo'))
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    fakeV8.base.catalog = [{ id: 'r1', url: origin, base: 'main', access: 'write', features: [{ id: 'mr-review' }] }]
+
+    let attempt = 0
+    let h!: Awaited<ReturnType<typeof createServiceHarness>>
+    const mr47 = fakeV8.upsertMr(origin, 47, {
+      headSha: 'sha-init',
+      updatedAt: '2026-11-01T08:00:00Z',
+    })
+
+    h = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 0 },
+      driver: {
+        async runTurn(req) {
+          attempt += 1
+          const sid = req.existingSessionId ?? 'sess-rollback'
+          await req.onSessionBound?.(sid)
+          if (attempt === 1 || attempt === 4) {
+            return { sessionId: sid, error: 'model overloaded' }
+          }
+          if (attempt === 2) {
+            throw new Error('network reset')
+          }
+          const targetSha = attempt === 3 ? 'sha-init' : 'sha-push-2'
+          await h.callTool(MR_PUBLISH_REVIEW_TOOL_NAME, {
+            headSha: targetSha,
+            verdict: 'comment',
+            body: `Reviewed ${targetSha}`,
+          }, sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(h.dispose)
+
+    const supervisor = h.service.mrSupervisorInstance()!
+    const domain = await h.service.supervisorDomain()
+    const key47 = supervisedMrKey(origin, 47)
+
+    // Attempt 1 (opened, note-free) returns { error } -> opened signal restored, dueAt cleared.
+    await supervisor.pollNow()
+    await supervisor.waitForIdle()
+    expect(attempt).toBe(1)
+    let rec = domain.supervisedMrs.get(key47)
+    expect(rec?.pendingSignals.map(s => s.kind)).toEqual(['opened'])
+    expect(rec?.dueAt).toBeUndefined()
+
+    // Attempt 2 (opened, note-free) throws -> opened signal restored again.
+    await supervisor.pollNow()
+    await supervisor.waitForIdle()
+    expect(attempt).toBe(2)
+    rec = domain.supervisedMrs.get(key47)
+    expect(rec?.pendingSignals.map(s => s.kind)).toEqual(['opened'])
+    expect(rec?.dueAt).toBeUndefined()
+
+    // Attempt 3 succeeds and publishes review.
+    await supervisor.pollNow()
+    await supervisor.waitForIdle()
+    expect(attempt).toBe(3)
+    rec = domain.supervisedMrs.get(key47)
+    expect(rec?.pendingSignals).toEqual([])
+    expect(rec?.lastReviewedSha).toBe('sha-init')
+
+    // Push sha-push-2 (note-free push-only batch): Attempt 4 fails -> restored, Attempt 5 succeeds!
+    mr47.info = { ...mr47.info, headSha: 'sha-push-2', updatedAt: '2026-11-01T08:05:00Z' }
+    await supervisor.pollNow()
+    await supervisor.waitForIdle()
+    expect(attempt).toBe(4)
+    rec = domain.supervisedMrs.get(key47)
+    expect(rec?.pendingSignals.map(s => s.kind)).toEqual(['push'])
+
+    await supervisor.pollNow()
+    await supervisor.waitForIdle()
+    expect(attempt).toBe(5)
+    rec = domain.supervisedMrs.get(key47)
+    expect(rec?.pendingSignals).toEqual([])
+    expect(rec?.lastReviewedSha).toBe('sha-push-2')
+  })
 })
