@@ -67,23 +67,21 @@ function extractTurnEndError(data: unknown): string | undefined {
   const rec = asRecord(data)
   const reason = asRecord(rec?.reason)
   if (typeof reason?.kind === 'string') {
-    if (reason.kind === 'completed' || reason.kind === 'max-tokens') return undefined
+    if (reason.kind === 'completed') return undefined
     if (reason.kind === 'error') {
       const errObj = asRecord(reason.error)
       return typeof errObj?.message === 'string' && errObj.message.length > 0 ? errObj.message : 'error'
     }
-    if (
-      reason.kind === 'aborted'
-      || reason.kind === 'blocked'
-      || reason.kind === 'interrupted'
-      || reason.kind === 'forked'
-    ) {
-      return reason.kind
-    }
-    return undefined
+    return reason.kind
   }
   const stopReason = typeof rec?.stopReason === 'string' ? rec.stopReason : undefined
-  if (stopReason === 'error' || stopReason === 'aborted') {
+  if (
+    stopReason === 'error'
+    || stopReason === 'aborted'
+    || stopReason === 'max-tokens'
+    || stopReason === 'max_tokens'
+    || stopReason === 'length'
+  ) {
     return typeof rec?.error === 'string' && rec.error.length > 0 ? rec.error : stopReason
   }
   return undefined

@@ -25,6 +25,7 @@ import {
   MAX_SEEN_NOTE_IDS,
   advanceHumanNoteWatermark,
   appendBoundedUnique,
+  canonicalCommentKey,
   canonicalDiscussionNoteKey,
   collectBotNoteKeys,
 } from './signals.ts'
@@ -240,10 +241,7 @@ export function createMrTools(runtime: MrToolsRuntime): ToolDefinition[] {
         title: mr.title || current.title,
         url: mr.webUrl || current.url,
         sourceBranch: mr.sourceBranch || current.sourceBranch,
-        targetBranch: mr.targetBranch || current.targetBranch,
         author: mr.author.username || current.author,
-        headSha: mr.headSha,
-        isDraft: mr.draft,
         updatedAt: Date.now(),
       }))
       return {
@@ -367,6 +365,19 @@ export function createMrTools(runtime: MrToolsRuntime): ToolDefinition[] {
           [...botNotes.keys, ...(current.deliveredNoteIds ?? [])],
           MAX_SEEN_NOTE_IDS,
         )
+        const nextSeenSet = new Set(nextSeen)
+        const nextPending = current.pendingSignals.filter((sig) => {
+          if (sig.kind === 'opened' || sig.kind === 'ready-for-review' || sig.kind === 'push' || sig.kind === 'conflict') {
+            return sig.headSha !== undefined && sig.headSha !== args.headSha && sig.headSha !== current.reviewedHeadSha
+          }
+          if (sig.kind === 'discussion' && sig.noteId !== undefined) {
+            const noteKey = sig.discussionId !== undefined
+              ? canonicalDiscussionNoteKey(sig.discussionId, sig.noteId)
+              : canonicalCommentKey(sig.noteId)
+            return !nextSeenSet.has(noteKey)
+          }
+          return true
+        })
         const nextCursor = botRes.status === 'fulfilled' && discRes.status === 'fulfilled' && detailRes.status === 'fulfilled'
           ? advanceHumanNoteWatermark({
               detail: detailRes.value,
@@ -374,7 +385,7 @@ export function createMrTools(runtime: MrToolsRuntime): ToolDefinition[] {
               bot: botRes.value,
               previousSeenNoteIds: current.seenNoteIds,
               nextSeenNoteIds: nextSeen,
-              pendingSignals: current.pendingSignals,
+              pendingSignals: nextPending,
               deliveredNoteIds: undefined,
               previousCursor: current.lastNoteCursor,
             })
@@ -386,6 +397,8 @@ export function createMrTools(runtime: MrToolsRuntime): ToolDefinition[] {
           ...(nextSeen.length === 0 ? {} : { seenNoteIds: nextSeen }),
           ...(nextCursor === undefined ? {} : { lastNoteCursor: nextCursor }),
           deliveredNoteIds: undefined,
+          pendingSignals: nextPending,
+          dueAt: nextPending.length > 0 ? current.dueAt : undefined,
           updatedAt: Date.now(),
         }
       })
@@ -538,13 +551,32 @@ export function createMrTools(runtime: MrToolsRuntime): ToolDefinition[] {
         const nextSeen = args.markDeliveredNotesSeen
           ? appendBoundedUnique(current.seenNoteIds, current.deliveredNoteIds ?? [], MAX_SEEN_NOTE_IDS)
           : (current.seenNoteIds ?? [])
+        const nextSeenSet = new Set(nextSeen)
         const nextSha = args.reviewedSha ?? current.lastReviewedSha
+        const nextPending = current.pendingSignals.filter((sig) => {
+          if (args.markDeliveredNotesSeen && sig.kind === 'discussion' && sig.noteId !== undefined) {
+            const noteKey = sig.discussionId !== undefined
+              ? canonicalDiscussionNoteKey(sig.discussionId, sig.noteId)
+              : canonicalCommentKey(sig.noteId)
+            if (nextSeenSet.has(noteKey)) return false
+          }
+          if (
+            args.reviewedSha !== undefined
+            && (sig.kind === 'opened' || sig.kind === 'ready-for-review' || sig.kind === 'push' || sig.kind === 'conflict')
+            && (sig.headSha === undefined || sig.headSha === args.reviewedSha)
+          ) {
+            return false
+          }
+          return true
+        })
         return {
           ...current,
           ...(nextSha === undefined ? {} : { lastReviewedSha: nextSha, reviewedHeadSha: nextSha }),
           ownPushedShas: nextOwn,
           ...(nextSeen.length === 0 ? {} : { seenNoteIds: nextSeen }),
           ...(args.markDeliveredNotesSeen ? { deliveredNoteIds: undefined } : {}),
+          pendingSignals: nextPending,
+          dueAt: nextPending.length > 0 ? current.dueAt : undefined,
           updatedAt: Date.now(),
         }
       })

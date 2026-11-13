@@ -220,6 +220,23 @@ export class MrSupervisor implements MrToolsRuntime {
     const settings = this.deps.getSettings()
     const enabled = settings.enabled
     this.lastFilterSignature = this.computeFilterSignature(settings)
+
+    // Clear orphaned in-flight `deliveredNoteIds` if the previous process crashed mid-turn.
+    for (const [key, record] of this.deps.table.entries()) {
+      if (record.deliveredNoteIds !== undefined) {
+        await this.withKeyLock(key, async () => {
+          const cur = this.deps.table.get(key)
+          if (cur !== undefined && cur.deliveredNoteIds !== undefined) {
+            await this.deps.table.put(key, {
+              ...cur,
+              deliveredNoteIds: undefined,
+              updatedAt: currentNow,
+            })
+          }
+        })
+      }
+    }
+
     for (const [key, record] of this.deps.table.entries()) {
       if (record.sessionId !== undefined) {
         this.sessionToKey.set(record.sessionId, key)
@@ -434,7 +451,7 @@ export class MrSupervisor implements MrToolsRuntime {
     if (scope === 'mr' || scope === 'mr-repo' || scope === 'mr-fix') {
       const currentNow = this.now()
       for (const [mrKey, rec] of this.deps.table.entries()) {
-        if (rec.state !== 'open' || rec.pendingSignals.length === 0) continue
+        if (rec.state !== 'open' || rec.pendingSignals.length === 0 || this.runningKeys.has(mrKey)) continue
         const matches = (scope === 'mr' && mrKey === key)
           || (scope === 'mr-fix' && mrKey === key)
           || (scope === 'mr-repo' && rec.repo === key)
@@ -1219,8 +1236,51 @@ export class MrSupervisor implements MrToolsRuntime {
     }
 
     const capturedBatch = [...initial.pendingSignals]
-    let signalsToRun = [...capturedBatch]
     const isSelf = initial.origin === 'self-fix' || initial.origin === 'self-skill'
+    const seenNotesNow = new Set(initial.seenNoteIds ?? [])
+    const validBatch = capturedBatch.filter((sig) => {
+      if (sig.kind === 'ci-failed') {
+        return (
+          isSelf
+          && (sig.headSha === undefined || sig.headSha === mr.headSha)
+          && status.overall === 'failure'
+          && status.headSha === mr.headSha
+        )
+      }
+      if (sig.kind === 'opened' || sig.kind === 'push') {
+        if (
+          initial.lastReviewedSha !== undefined
+          && initial.lastReviewedSha === mr.headSha
+          && (sig.headSha === undefined || sig.headSha === mr.headSha)
+        ) {
+          return false
+        }
+        return true
+      }
+      if (sig.kind === 'discussion' && sig.noteId !== undefined) {
+        const noteKey = sig.discussionId !== undefined
+          ? canonicalDiscussionNoteKey(sig.discussionId, sig.noteId)
+          : canonicalCommentKey(sig.noteId)
+        return !seenNotesNow.has(noteKey)
+      }
+      return true
+    })
+    const staleSignals = subtractPendingSignals(capturedBatch, validBatch)
+    if (validBatch.length === 0) {
+      const afterPrune = await this.updateRecord(initial.repo, initial.mrNumber, (cur) => {
+        const remaining = subtractPendingSignals(cur.pendingSignals, staleSignals)
+        return {
+          ...cur,
+          headSha: remaining.length > 0 && cur.headSha !== undefined ? cur.headSha : mr.headSha,
+          pendingSignals: remaining,
+          dueAt: remaining.length > 0 ? cur.dueAt : undefined,
+          updatedAt: this.now(),
+        }
+      })
+      return afterPrune.pendingSignals.length > 0 && afterPrune.dueAt !== undefined ? 'ran' : 'blocked'
+    }
+
+    let signalsToRun = [...validBatch]
     const hasCiFailed = signalsToRun.some(s => s.kind === 'ci-failed')
 
     if (isSelf && hasCiFailed && initial.autoFixAttempts >= latestSettings.maxAutoFixAttempts) {
@@ -1238,8 +1298,9 @@ export class MrSupervisor implements MrToolsRuntime {
       })
       signalsToRun = signalsToRun.filter(s => s.kind !== 'ci-failed')
       if (signalsToRun.length === 0) {
+        const toDrop = [...staleSignals, ...strippedCiSignals]
         const afterStrip = await this.updateRecord(initial.repo, initial.mrNumber, (cur) => {
-          const remaining = subtractPendingSignals(cur.pendingSignals, strippedCiSignals)
+          const remaining = subtractPendingSignals(cur.pendingSignals, toDrop)
           return {
             ...cur,
             pendingSignals: remaining,
@@ -1296,15 +1357,17 @@ export class MrSupervisor implements MrToolsRuntime {
     const deliveredNotes = signalNoteKeys(signalsToRun)
     const willAttemptCiFix = isSelf && signalsToRun.some(s => s.kind === 'ci-failed')
     const workDir = initial.workDir ?? defaultMrWorkDir(this.deps.workspacesRoot, initial.repo, initial.mrNumber)
+    const discardedBeforeTurn = subtractPendingSignals(capturedBatch, signalsToRun)
 
     const preparedRecord = await this.withKeyLock(key, async () => {
       const current = this.deps.table.get(key) ?? initial
-      const remainingPending = subtractPendingSignals(current.pendingSignals, capturedBatch)
+      const retainedPending = subtractPendingSignals(current.pendingSignals, discardedBeforeTurn)
+      const concurrentQueued = subtractPendingSignals(retainedPending, signalsToRun)
       const nextDelivered = deliveredNotes.length > 0
         ? appendBoundedUnique(current.deliveredNoteIds, deliveredNotes, MAX_SEEN_NOTE_IDS)
         : current.deliveredNoteIds
-      const nextDueAt = remainingPending.length > 0 ? (current.dueAt ?? this.now()) : undefined
-      const nextHeadSha = remainingPending.length > 0 && current.headSha !== undefined
+      const nextDueAt = concurrentQueued.length > 0 ? (current.dueAt ?? this.now()) : undefined
+      const nextHeadSha = concurrentQueued.length > 0 && current.headSha !== undefined
         ? current.headSha
         : mr.headSha
       const next: SupervisedMrRecord = {
@@ -1313,9 +1376,8 @@ export class MrSupervisor implements MrToolsRuntime {
         headSha: nextHeadSha,
         reviewedHeadSha: mr.headSha,
         ...(nextDelivered === undefined || nextDelivered.length === 0 ? {} : { deliveredNoteIds: nextDelivered }),
-        pendingSignals: remainingPending,
+        pendingSignals: retainedPending,
         dueAt: nextDueAt,
-        autoFixAttempts: willAttemptCiFix ? current.autoFixAttempts + 1 : current.autoFixAttempts,
         updatedAt: this.now(),
       }
       await this.deps.table.put(key, next)
@@ -1363,18 +1425,24 @@ export class MrSupervisor implements MrToolsRuntime {
         })
         return 'blocked'
       }
-      if (deliveredNotes.length > 0) {
-        await this.updateRecord(initial.repo, initial.mrNumber, (cur) => {
-          if (cur.deliveredNoteIds === undefined || cur.deliveredNoteIds.length === 0) return cur
-          const nextSeen = appendBoundedUnique(cur.seenNoteIds, cur.deliveredNoteIds, MAX_SEEN_NOTE_IDS)
-          return {
-            ...cur,
-            ...(nextSeen.length === 0 ? {} : { seenNoteIds: nextSeen }),
-            deliveredNoteIds: undefined,
-            updatedAt: this.now(),
-          }
-        })
-      }
+      await this.updateRecord(initial.repo, initial.mrNumber, (cur) => {
+        const deliveredSet = new Set(deliveredNotes)
+        const toMarkSeen = (cur.deliveredNoteIds ?? []).filter(k => deliveredSet.has(k))
+        const nextSeen = toMarkSeen.length > 0
+          ? appendBoundedUnique(cur.seenNoteIds, toMarkSeen, MAX_SEEN_NOTE_IDS)
+          : cur.seenNoteIds
+        const remainingDelivered = (cur.deliveredNoteIds ?? []).filter(k => !deliveredSet.has(k))
+        const remainingPending = subtractPendingSignals(cur.pendingSignals, signalsToRun)
+        return {
+          ...cur,
+          ...(nextSeen === undefined || nextSeen.length === 0 ? {} : { seenNoteIds: nextSeen }),
+          deliveredNoteIds: remainingDelivered.length > 0 ? remainingDelivered : undefined,
+          pendingSignals: remainingPending,
+          dueAt: remainingPending.length > 0 ? (cur.dueAt ?? this.now()) : undefined,
+          autoFixAttempts: willAttemptCiFix ? cur.autoFixAttempts + 1 : cur.autoFixAttempts,
+          updatedAt: this.now(),
+        }
+      })
       return 'ran'
     } catch (error) {
       const abortedOrClosing = signal.aborted || this.closed
@@ -1430,10 +1498,13 @@ export class MrSupervisor implements MrToolsRuntime {
             return !shaReviewed && !pushedFix
         }
       })
+      const completedSignals = subtractPendingSignals(input.signalsToRun, signalsToRestore)
+      const withoutCompleted = subtractPendingSignals(cur.pendingSignals, completedSignals)
+      const concurrentSignals = subtractPendingSignals(withoutCompleted, signalsToRestore)
       const deliveredSet = new Set(input.deliveredNotes)
       const remainingDelivered = (cur.deliveredNoteIds ?? []).filter(k => !deliveredSet.has(k))
-      const mergedPending = mergePendingSignals(signalsToRestore, cur.pendingSignals)
-      const preservedDueAt = !input.clearDueAt && !this.closed && cur.pendingSignals.length > 0 && cur.dueAt !== undefined
+      const mergedPending = mergePendingSignals(signalsToRestore, withoutCompleted)
+      const preservedDueAt = !input.clearDueAt && !this.closed && concurrentSignals.length > 0 && cur.dueAt !== undefined
         ? cur.dueAt
         : undefined
       return {
@@ -1441,8 +1512,8 @@ export class MrSupervisor implements MrToolsRuntime {
         pendingSignals: mergedPending,
         deliveredNoteIds: remainingDelivered.length > 0 ? remainingDelivered : undefined,
         dueAt: preservedDueAt,
-        autoFixAttempts: input.willAttemptCiFix && !pushedFix && !shaReviewed
-          ? Math.max(0, cur.autoFixAttempts - 1)
+        autoFixAttempts: input.willAttemptCiFix && (pushedFix || shaReviewed)
+          ? cur.autoFixAttempts + 1
           : cur.autoFixAttempts,
         updatedAt: this.now(),
       }

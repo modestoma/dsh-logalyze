@@ -1989,4 +1989,373 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     expect(turnCount).toBe(3)
     expect(domain.supervisedMrs.get(key1)?.seenNoteIds).toContain('c:human-mid-1')
   })
+
+  it('persists in-flight signal batches until checkpointed and recovers orphaned deliveredNoteIds after an unclean crash', async () => {
+    const { dir, cleanup } = await tempDir('mr-crash-recovery-')
+    cleanups.push(cleanup)
+
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    const origin = 'https://git.example/org/app.git'
+    fakeV8.base.setCatalog([{ url: origin, base: 'main' }], ['mr-review'])
+    fakeV8.upsertMr(origin, 1, { headSha: 'sha-crash-1', updatedAt: '2026-11-01T12:00:00Z' })
+
+    const dirLive = join(dir, 'live')
+    const dirCrash = join(dir, 'crashed')
+
+    let snapshotBeforePublish: ReturnType<Awaited<ReturnType<typeof openSupervisorDomain>>['supervisedMrs']['get']>
+    let h1!: Awaited<ReturnType<typeof createServiceHarness>>
+    h1 = await createServiceHarness({
+      fakeV8,
+      dir: dirLive,
+      mrConfig: { debounceMs: 0 },
+      driver: {
+        async runTurn(req) {
+          const sid = req.existingSessionId ?? 'sess-crash-1'
+          await req.onSessionBound?.(sid)
+          const d1 = await h1.service.supervisorDomain()
+          snapshotBeforePublish = d1.supervisedMrs.get(supervisedMrKey(req.repo, req.mrNumber))
+          await h1.callTool(MR_PUBLISH_REVIEW_TOOL_NAME, {
+            headSha: 'sha-crash-1',
+            verdict: 'comment',
+            body: 'Completed in h1',
+          }, sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(() => h1.dispose())
+
+    const sup1 = h1.service.mrSupervisorInstance()!
+    const dom1 = await h1.service.supervisorDomain()
+    const key1 = supervisedMrKey(origin, 1)
+
+    // Seed an open record that already has a tracked MR + an unseen human note waiting to be delivered.
+    fakeV8.upsertMr(
+      origin,
+      1,
+      { headSha: 'sha-crash-1', updatedAt: '2026-11-01T12:00:10Z' },
+      {
+        comments: [{ id: 'human-crash-note', author: { username: 'alice' }, body: 'Please check', createdAt: '2026-11-01T12:00:10Z' }],
+      },
+    )
+    await dom1.supervisedMrs.put(key1, {
+      repo: origin,
+      mrNumber: 1,
+      origin: 'external',
+      state: 'open',
+      headSha: 'sha-crash-1',
+      ownPushedShas: [],
+      autoFixAttempts: 0,
+      pendingSignals: [
+        { kind: 'push', observedAt: 1000, headSha: 'sha-crash-1' },
+        { kind: 'discussion', observedAt: 1001, headSha: 'sha-crash-1', noteId: 'human-crash-note', summary: 'Please check' },
+      ],
+      dueAt: 0,
+    })
+    await sup1.pollNow()
+    await sup1.flushDebouncedDue()
+    await sup1.waitForIdle()
+
+    // While runTurn was executing (before publish/checkpoint), durable record retained pendingSignals + deliveredNoteIds!
+    expect(snapshotBeforePublish?.pendingSignals.map(s => s.kind)).toEqual(['push', 'discussion'])
+    expect(snapshotBeforePublish?.deliveredNoteIds).toEqual(['c:human-crash-note'])
+    expect(snapshotBeforePublish?.dueAt).toBeUndefined()
+
+    // Simulate an unclean SIGKILL crash mid-turn: write that exact mid-turn record into `dirCrash` without running rollback.
+    const crashSupervisorDir = join(dirCrash, 'supervisor')
+    await mkdir(crashSupervisorDir, { recursive: true })
+    const crashDomain = await openSupervisorDomain({ fallbackDir: crashSupervisorDir })
+    await crashDomain.supervisedMrs.put(key1, snapshotBeforePublish!)
+    await crashDomain.close()
+
+    // Boot fresh service on `dirCrash`: boot() must clear orphaned deliveredNoteIds and recover uncheckpointed signals!
+    const recoveredHeads: string[] = []
+    let h2!: Awaited<ReturnType<typeof createServiceHarness>>
+    h2 = await createServiceHarness({
+      fakeV8,
+      dir: dirCrash,
+      mrConfig: { debounceMs: 0 },
+      driver: {
+        async runTurn(req) {
+          const sid = req.existingSessionId ?? 'sess-crash-1'
+          await req.onSessionBound?.(sid)
+          recoveredHeads.push('sha-crash-1')
+          await h2.callTool(MR_PUBLISH_REVIEW_TOOL_NAME, {
+            headSha: 'sha-crash-1',
+            verdict: 'approve',
+            body: 'Recovered cleanly after crash',
+          }, sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(() => h2.dispose())
+
+    const sup2 = h2.service.mrSupervisorInstance()!
+    const dom2 = await h2.service.supervisorDomain()
+    await vi.waitFor(() => {
+      expect(recoveredHeads).toEqual(['sha-crash-1'])
+    })
+    await sup2.waitForIdle()
+    expect(dom2.supervisedMrs.get(key1)?.lastReviewedSha).toBe('sha-crash-1')
+    expect(dom2.supervisedMrs.get(key1)?.pendingSignals).toEqual([])
+    expect(dom2.supervisedMrs.get(key1)?.deliveredNoteIds).toBeUndefined()
+    expect(dom2.supervisedMrs.get(key1)?.seenNoteIds).toContain('c:human-crash-note')
+  })
+
+  it('keeps supervisor_mr_prepare_workspace from consuming concurrent pushes before publish', async () => {
+    const { dir, cleanup } = await tempDir('mr-prepare-head-race-')
+    cleanups.push(cleanup)
+
+    const origin = await createAppRepo(join(dir, 'repo'))
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    fakeV8.base.setCatalog([{ url: origin, base: 'main' }], ['mr-review'])
+    fakeV8.upsertMr(origin, 1, { headSha: 'sha-A', updatedAt: '2026-11-01T13:00:00Z' })
+
+    const publishedHeads: string[] = []
+    let turnNumber = 0
+    let h!: Awaited<ReturnType<typeof createServiceHarness>>
+    h = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 0 },
+      driver: {
+        async runTurn(req) {
+          turnNumber += 1
+          const sid = req.existingSessionId ?? 'sess-race-1'
+          await req.onSessionBound?.(sid)
+          if (turnNumber === 1) {
+            // Race: author pushes sha-B right before prepare_workspace runs, while turn prompt targets sha-A!
+            fakeV8.upsertMr(origin, 1, { headSha: 'sha-B', updatedAt: '2026-11-01T13:00:05Z' })
+            const prep = await h.callTool(MR_PREPARE_TOOL_NAME, {}, sid) as { readonly headSha: string }
+            expect(prep.headSha).toBe('sha-B')
+            publishedHeads.push('sha-A')
+            await h.callTool(MR_PUBLISH_REVIEW_TOOL_NAME, {
+              headSha: 'sha-A',
+              verdict: 'comment',
+              body: 'Review for sha-A',
+            }, sid)
+          } else {
+            const prep = await h.callTool(MR_PREPARE_TOOL_NAME, {}, sid) as { readonly headSha: string }
+            publishedHeads.push(prep.headSha)
+            await h.callTool(MR_PUBLISH_REVIEW_TOOL_NAME, {
+              headSha: prep.headSha,
+              verdict: 'approve',
+              body: 'Incremental review for sha-B',
+            }, sid)
+          }
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(() => h.dispose())
+
+    const supervisor = h.service.mrSupervisorInstance()!
+    const domain = await h.service.supervisorDomain()
+    const key1 = supervisedMrKey(origin, 1)
+
+    await supervisor.pollNow()
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+    expect(publishedHeads).toEqual(['sha-A'])
+    expect(domain.supervisedMrs.get(key1)?.lastReviewedSha).toBe('sha-A')
+
+    // Next poll MUST detect sha-B as a push signal (not swallowed by prepare_workspace)!
+    await supervisor.pollNow()
+    expect(domain.supervisedMrs.get(key1)?.pendingSignals.map(s => ({ kind: s.kind, headSha: s.headSha }))).toEqual([
+      { kind: 'push', headSha: 'sha-B' },
+    ])
+
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+    expect(publishedHeads).toEqual(['sha-A', 'sha-B'])
+    expect(domain.supervisedMrs.get(key1)?.lastReviewedSha).toBe('sha-B')
+  })
+
+  it('treats max-tokens turn termination as incomplete so uncheckpointed signals are retained for retry', async () => {
+    const submittedRequests: Array<{ readonly sessionId: string; readonly requestId: string }> = []
+    const ctx: HostContext = {
+      tools: { register: () => () => {} },
+      skills: { registerProvider: () => () => {} },
+      subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('unused')) },
+      on: () => () => {},
+      effect: () => () => {},
+      get: (name: string) => {
+        if (name !== 'sessionController') return undefined
+        return {
+          resolveAgent: async (sessionId: string) => ({
+            agent: { id: 'agent-1', session: { header: { id: sessionId } } },
+          }),
+          prompt: async (req: { readonly sessionId: string; readonly requestId: string }) => {
+            submittedRequests.push(req)
+            return { accepted: true }
+          },
+        }
+      },
+    }
+
+    const driver = createHostMrSessionDriver(ctx)
+    cleanups.push(async () => { driver.dispose?.() })
+
+    const turnPromise = driver.runTurn({
+      repo: 'https://git.example/org/app.git',
+      mrNumber: 1,
+      origin: 'external',
+      existingSessionId: 'sess-max-tok',
+      workDir: '/tmp/mr-max-tokens',
+      prompt: 'Review MR',
+      signal: new AbortController().signal,
+    })
+
+    await vi.waitFor(() => { expect(submittedRequests).toHaveLength(1) })
+    const req = submittedRequests[0]!
+    driver.onSessionEvent('sess-max-tok', 'turn/start', { turn: 1 })
+    driver.onSessionEvent('sess-max-tok', 'user/message', { id: 'm1', source: { kind: 'user', rpcId: req.requestId } })
+    driver.onSessionEvent('sess-max-tok', 'turn/end', { turn: 1, reason: { kind: 'max-tokens' } })
+    expect(await turnPromise).toEqual({ sessionId: 'sess-max-tok', error: 'max-tokens' })
+
+    // Verify MrSupervisor rolls back uncheckpointed signals on `{ error: 'max-tokens' }`.
+    const { dir, cleanup } = await tempDir('mr-max-tokens-e2e-')
+    cleanups.push(cleanup)
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    const origin = 'https://git.example/org/app.git'
+    fakeV8.base.setCatalog([{ url: origin, base: 'main' }], ['mr-review'])
+    fakeV8.upsertMr(origin, 1, { headSha: 'sha-tok-1', updatedAt: '2026-11-01T14:00:00Z' })
+
+    let run = 0
+    let h!: Awaited<ReturnType<typeof createServiceHarness>>
+    h = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 0 },
+      driver: {
+        async runTurn(r) {
+          run += 1
+          const sid = r.existingSessionId ?? 'sess-tok-e2e'
+          await r.onSessionBound?.(sid)
+          if (run === 1) {
+            return { sessionId: sid, error: 'max-tokens' }
+          }
+          await h.callTool(MR_PUBLISH_REVIEW_TOOL_NAME, {
+            headSha: 'sha-tok-1',
+            verdict: 'approve',
+            body: 'Completed on retry',
+          }, sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(() => h.dispose())
+
+    const sup = h.service.mrSupervisorInstance()!
+    const dom = await h.service.supervisorDomain()
+    const key1 = supervisedMrKey(origin, 1)
+
+    await sup.pollNow()
+    await sup.flushDebouncedDue()
+    await sup.waitForIdle()
+    expect(run).toBe(1)
+    expect(dom.supervisedMrs.get(key1)?.pendingSignals.map(s => s.kind)).toEqual(['opened'])
+    expect(dom.supervisedMrs.get(key1)?.lastReviewedSha).toBeUndefined()
+
+    await sup.pollNow()
+    await sup.flushDebouncedDue()
+    await sup.waitForIdle()
+    expect(run).toBe(2)
+    expect(dom.supervisedMrs.get(key1)?.lastReviewedSha).toBe('sha-tok-1')
+    expect(dom.supervisedMrs.get(key1)?.pendingSignals).toEqual([])
+  })
+
+  it('deduplicates active CI repairs across polls and prunes obsolete queued CI failures', async () => {
+    const { dir, cleanup } = await tempDir('mr-ci-dedupe-')
+    cleanups.push(cleanup)
+
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    const origin = 'https://git.example/org/app.git'
+    fakeV8.base.setCatalog([{ url: origin, base: 'main' }], ['mr-review'])
+    const stored20 = fakeV8.upsertMr(
+      origin,
+      20,
+      { headSha: 'sha-fail-1', updatedAt: '2026-11-01T15:00:00Z' },
+      { status: { headSha: 'sha-fail-1', checks: [{ name: 'test', state: 'failure' }], overall: 'failure', mergeable: true } },
+    )
+
+    let repairTurns = 0
+    let turn1EnteredResolve: (() => void) | undefined
+    let releaseTurn1: (() => void) | undefined
+    const turn1Entered = new Promise<void>(resolve => { turn1EnteredResolve = resolve })
+    let nowMs = Date.parse('2026-11-01T15:00:00Z')
+
+    let h!: Awaited<ReturnType<typeof createServiceHarness>>
+    h = await createServiceHarness({
+      fakeV8,
+      dir,
+      clock: () => nowMs,
+      mrConfig: { debounceMs: 5_000, maxAutoFixAttempts: 2 },
+      driver: {
+        async runTurn(req) {
+          repairTurns += 1
+          const sid = req.existingSessionId ?? 'sess-ci-20'
+          await req.onSessionBound?.(sid)
+          if (repairTurns === 1) {
+            turn1EnteredResolve?.()
+            await new Promise<void>(resolve => { releaseTurn1 = resolve })
+            // Fix pushed and CI now passing on sha-fix-2.
+            stored20.info = { ...stored20.info, headSha: 'sha-fix-2', updatedAt: '2026-11-01T15:02:00Z' }
+            stored20.status = { headSha: 'sha-fix-2', checks: [{ name: 'test', state: 'success' }], overall: 'success', mergeable: true }
+            await h.callTool(MR_CHECKPOINT_TOOL_NAME, { ownPushedSha: 'sha-fix-2' }, sid)
+          }
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(() => h.dispose())
+
+    const sup = h.service.mrSupervisorInstance()!
+    const dom = await h.service.supervisorDomain()
+    const key20 = supervisedMrKey(origin, 20)
+
+    await sup.registerSelfMr({
+      repo: origin,
+      mrNumber: 20,
+      origin: 'self-fix',
+      issueId: 'iss-20',
+      feishuLaunchKey: 'feishu:20',
+      headSha: 'sha-fail-1',
+    })
+
+    // Poll detects failing CI -> wait past debounce -> Turn 1 starts.
+    nowMs += 1_000
+    await sup.pollNow()
+    nowMs += 6_000
+    const flush1 = sup.flushDebouncedDue()
+    await turn1Entered
+
+    // While Turn 1 is actively repairing sha-fail-1, another poll runs -> must NOT duplicate `ci-failed`!
+    nowMs += 1_000
+    await sup.pollNow()
+    expect(dom.supervisedMrs.get(key20)?.pendingSignals.filter(s => s.kind === 'ci-failed')).toHaveLength(1)
+
+    releaseTurn1?.()
+    await flush1
+    await sup.waitForIdle()
+    expect(repairTurns).toBe(1)
+    expect(dom.supervisedMrs.get(key20)?.autoFixAttempts).toBe(1)
+    expect(dom.supervisedMrs.get(key20)?.pendingSignals).toEqual([])
+
+    // Queue a ci-failed for sha-fix-2, then CI flips back to passing BEFORE debounce flushes -> pruned without running Turn 2!
+    stored20.status = { headSha: 'sha-fix-2', checks: [{ name: 'test', state: 'failure' }], overall: 'failure', mergeable: true }
+    stored20.info = { ...stored20.info, updatedAt: '2026-11-01T15:03:00Z' }
+    nowMs += 1_000
+    await sup.pollNow()
+    expect(dom.supervisedMrs.get(key20)?.pendingSignals.map(s => s.kind)).toEqual(['ci-failed'])
+
+    stored20.status = { headSha: 'sha-fix-2', checks: [{ name: 'test', state: 'success' }], overall: 'success', mergeable: true }
+    nowMs += 6_000
+    await sup.flushDebouncedDue()
+    await sup.waitForIdle()
+    expect(repairTurns).toBe(1)
+    expect(dom.supervisedMrs.get(key20)?.autoFixAttempts).toBe(1)
+    expect(dom.supervisedMrs.get(key20)?.pendingSignals).toEqual([])
+  })
 })
