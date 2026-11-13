@@ -126,6 +126,7 @@ export class SkillViewer {
     const agent = exec.agent
     if (agent !== undefined && isDelegatedAgent(agent)) throw new Error(`${SHOW_TOOL_NAME} 不能在子 Agent 中调用`)
     const { app, url, commit } = this.deps.registry.readyApp(parsed.data.app)
+    if (app.skill === undefined) throw new Error('该应用没有旧版 SKILL 改进目标；仍可直接分析日志与代码，创建初版 SKILL 待知识改进功能接入')
     const dir = skillDir(app.skill)
     const path = parsed.data.path ?? 'SKILL.md'
     const { files, text } = await this.deps.repos.withSnapshot(url, commit, exec.signal, async (lease) => {

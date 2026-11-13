@@ -9,6 +9,8 @@
 export const STATE_ROUTE = '/logalyze/state'
 /** PUT：保存可编辑设置；DELETE：清除面板覆盖、恢复 cordis.yml 默认值。应用仓库不在这里编辑，来自 dsh-repo 的仓库清单。 */
 export const SETTINGS_ROUTE = '/logalyze/settings'
+/** PUT：更新某个已开启「日志分析」仓库的应用描述与触发别名。 */
+export const APPLICATION_ROUTE = '/logalyze/applications'
 /** POST：body `{ id }` 立即把一次分析的报告重新上传到它的每份日志，不论上次是否成功。 */
 export const REPORT_UPLOAD_ROUTE = '/logalyze/reports/upload'
 /** PUT：body `{ tokenEnv, value }` 把凭据存入 DSH 凭据库；DELETE：body `{ tokenEnv }` 删除已存的值。只接受分析接口令牌和日志平台 client_secret 的名称。 */
@@ -147,20 +149,26 @@ export const EDITABLE_KEYS = ['fetchIntervalMs', 'maxAppsPerRequest', 'dispatchT
 /** One editable key. */
 export type EditableKey = (typeof EDITABLE_KEYS)[number]
 
-/** Application description read from `<repo>/.agents/logalyze.yaml`. */
+/** Editable application metadata, independent of repository membership. */
+export interface ApplicationMetadata {
+  description: string
+  aliases: string[]
+}
+
+/** Application identity and metadata, assigned or migrated from a legacy manifest. */
 export interface AppManifest {
   /** Registry id the dispatch tool and analysis requests address. */
   id: string
   /** Display name, also the child agent's label. */
   name: string
-  /** What the application does, used for intent recognition. */
+  /** Panel-owned description used for intent recognition. */
   description: string
   /** Other names users call the application by. */
   aliases: string[]
   /** Strings that identify this application's log lines (tags, process names, class names). */
   logHints: string[]
-  /** Project skill name under `.agents/skills/<skill>/SKILL.md` that analyzes this application's logs. */
-  skill: string
+  /** Legacy improvement target; optional and never an analysis prerequisite. */
+  skill?: string
 }
 
 /** Lifecycle of one repository checkout. */
@@ -175,16 +183,27 @@ export interface RepoStatusWire {
   commit?: string
   /** Last completed sync attempt, epoch milliseconds. */
   syncedAt?: number
-  /** Application description read from {@link commit}. */
+  /** Persisted application metadata, independent of the code commit. */
   app?: AppManifest
   /** Why the repository is unusable (`failed`), or why the last update failed while an older commit stays usable (`ready`). */
   error?: string
   /** Whether the application is offered to intent recognition and dispatch. */
   available: boolean
-  /** Whether the catalog entry's access lets setups and SKILL improvements push; a read-only repository is only analyzed. */
+  /** Whether the catalog entry's access lets SKILL improvements push; a read-only repository is only analyzed. */
   writable: boolean
   /** Child analyses currently running in snapshots of this repository. */
   activeRuns: number
+}
+
+/** One repository in `dsh-repo` with the `mr-review` feature turned on. */
+export interface MrRepoStatusWire {
+  url: string
+  /** Branch MR supervision tracks (`mr-review` feature branch, else catalog baseline branch). */
+  branch?: string
+  /** Catalog baseline branch when configured. */
+  base?: string
+  /** Whether `dsh-repo` access permits write/merge operations (`access !== 'read'`). */
+  writable: boolean
 }
 
 /** Whether one referenced token has a value — never the value. */
@@ -202,15 +221,20 @@ export interface TokenStatusWire {
 
 /**
  * Whether dsh-repo provides the `dshRepos` service this plugin mirrors
- * repositories and submits SKILL improvements and setup drafts through: `missing` while it is not
- * loaded, `incompatible` when its contract version is not the one this
- * plugin speaks.
+ * repositories and submits SKILL improvements through: `missing` while it is not
+ * loaded, `incompatible` when its contract version is not one this plugin speaks.
  */
 export type ReposAvailability = 'ready' | 'missing' | 'incompatible'
 
 /** dsh-repo view of the panel. */
 export interface ReposWire {
   availability: ReposAvailability
+  /** Connected `dshRepos` contract version when `ready` (`7` or `8`). */
+  version?: 7 | 8
+  /** Whether `dshRepos` provides v8 MR inline review & discussion APIs. */
+  mrReviewReady?: boolean
+  /** Actionable upgrade/compatibility reason when `mrReviewReady` is false. */
+  mrReviewProblem?: string
   /** Mirror directory; absent unless `ready`, and absent while the provider has none chosen (repositories cannot be fetched until it is set in the provider's settings). */
   mirrorDir?: string
   /** The provider's reason for not using its stored mirror directory; absent otherwise. */
@@ -224,6 +248,12 @@ export interface ReposWire {
  * state and link table methods (`state`, `launchKeyOf`, `updateLinks`).
  */
 export type TopicsAvailability = 'ready' | 'missing' | 'incompatible'
+
+/**
+ * Whether the Feishu channel plugin provides the `feishuActions` service (v1)
+ * for semi-automatic action cards (`propose` / `supersede`).
+ */
+export type ActionsAvailability = 'ready' | 'missing' | 'incompatible'
 
 /** How the first turn of an analysis ended, or how the analysis failed to start. */
 export type ReportStatus = 'done' | 'stopped' | 'error' | 'failed' | 'interrupted'
@@ -301,6 +331,8 @@ export interface AnalyzeWire {
   /** What the platform settings lack; absent when address, token endpoint, and client id are set. */
   platformProblem?: string
   topics: TopicsAvailability
+  /** `feishuActions` v1 availability for semi-automatic action cards. */
+  actions?: ActionsAvailability
   /** Most recently accepted analyses, newest first. */
   reports: AnalysisWire[]
   /** Reports of the former command upload, newest first. */
@@ -318,6 +350,8 @@ export interface StateWire {
   /** Why the overlay file was ignored (unreadable or invalid); panel saves replace it. */
   overlayError?: string
   repos: RepoStatusWire[]
+  /** Repositories in `dsh-repo` with the `mr-review` feature enabled. */
+  mrRepos: MrRepoStatusWire[]
   dshRepo: ReposWire
   /** Whether the DSH composition provides `ctx.credentials`; without it the analyze token cannot be stored or read. */
   credentialsAvailable: boolean

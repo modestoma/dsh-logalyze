@@ -1,12 +1,13 @@
-# 观象（dsh-logalyze）
+# 智能监管（dsh-logalyze）
 
-> **观其象，知其因。**
+> **观象察志，审微知著。**
 
-观象是面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的日志分析插件。
+智能监管（保持 npm 包名 `dsh-logalyze` 与 Cordis 插件名 `logalyze` 不变）是面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的 AI 原生智能监管中心底座与统一交付插件，下辖两大领域监管能力：
 
-名称取意于《周易》的观象思想：以日志为象，以推理为径，从复杂的系统运行痕迹中洞察异常、关联线索、追溯根因。
+- **观象（日志监管）**：`/logalyze` 入口识别应用与派发子 Agent、日志平台分析接口与报告回传、面板归属的应用描述与触发别名设置、可选 DSH SKILL 发现与加载。
+- **审微（MR 自动评审）**：自动跟随 `dsh-repo` 中启用「MR 自动评审」的代码仓库，依托 `dshRepos` v8 行级评审契约与 `dsh_supervisor` 共享运行时提供持续增量评审支撑。
 
-界面上显示的插件名是「观象」；npm 包名、入口命令、工具、路由、配置文件和代码标识统一使用 logalyze。
+详细架构与设计文档见 [`docs/supervisor/README.md`](docs/supervisor/README.md)。
 
 ## 项目状态
 
@@ -331,22 +332,23 @@ pnpm check        # 类型检查（Host 与 Client）+ 单元测试 + 构建 + �
 
 | 路径 | 内容 |
 |---|---|
-| `src/index.ts` | Cordis 插件入口 |
-| `src/service.ts` | 组装各部分，注册入口 SKILL 和工具，提供面板状态 |
-| `src/deps/` | 其他插件的服务：`dshRepos`、`feishuTopics` 的接口声明与查找 |
-| `src/apps/` | 应用描述校验、快照文件读取、应用注册表、跟随 dsh-repo 仓库清单 |
+| `src/index.ts` | Cordis 插件入口（`name = 'logalyze'`） |
+| `src/service.ts` | 组装共享监管运行时、入口 SKILL、工具与面板状态 |
+| `src/runtime/` | 共享监管运行时：`dsh_supervisor` 7 张状态表、并发池、键控防抖器、滑动窗口熔断器、单调修订 Outbox |
+| `src/deps/` | 跨插件窄契约：`dshRepos`（v7/v8）、`feishuTopics`、`feishuActions`（v1）声明与查找 |
+| `src/apps/` | 应用注册表、一次性旧元数据迁移、跟随 dsh-repo 仓库清单（`log-analysis` 与 `mr-review`） |
 | `src/runs/` | 运行目录、日志准入与下载、子 Agent 运行、工作区准备、改动检查、推送与合并请求 |
 | `src/dispatch/` | 派发工具与分析子 Agent 首条消息 |
 | `src/improve/` | SKILL 查看工具、SKILL 不足记录、改进工具与改进子 Agent 首条消息 |
-| `src/onboard/` | 在对话中添加仓库、在工作区起草应用描述与 SKILL、推送接入合并请求 |
-| `src/skill/` | `/logalyze` 入口 SKILL 与随包指导 SKILL（`/logalyze-kit`、`/logalyze-improve`）的 provider |
-| `skills/logalyze-kit/` | 接入套件 SKILL 正文 |
+| `src/skill/` | `/logalyze` 入口 SKILL、快照可选 SKILL 发现封装与随包指导 SKILL（`/logalyze-kit`、`/logalyze-improve`） |
+| `skills/logalyze-kit/` | 应用接入指南 SKILL 正文 |
 | `skills/logalyze-improve/` | SKILL 改进指南正文 |
 | `src/analyze/` | 日志平台分析接口：请求校验、令牌、到 `feishuTopics` 的转换 |
 | `src/report/` | 报告回传：轮次记录、每份日志的 `report.md` 生成、文件清单、修订上传、持久化 |
-| `src/settings/` | 面板契约、生效设置与覆盖文件、HTTP 路由 |
+| `src/settings/` | 面板契约、应用元数据 `applications.json`、生效设置与覆盖文件、HTTP 路由 |
 | `src/util/` | 取消、文件读写、HTTP 等通用小工具 |
-| `src/client/` | 左侧栏入口与设置页面 |
+| `src/client/` | 左侧栏「智能监管」入口与设置页面（含可编辑描述与可删除触发别名标签） |
+| `docs/supervisor/` | AI 原生智能监管中心（观象 + 审微）架构与设计规格 |
 | `examples/order-service/` | 示例应用仓库 |
 
 ## 路线图

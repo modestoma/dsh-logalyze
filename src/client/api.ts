@@ -4,8 +4,8 @@
  * @module dsh-logalyze/client/api
  */
 
-import { REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
-import type { EditableSettings, MutationError, MutationOk, StateWire } from '../settings/contract.ts'
+import { APPLICATION_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
+import type { ApplicationMetadata, EditableSettings, MutationError, MutationOk, StateWire } from '../settings/contract.ts'
 
 /**
  * Error text of a value thrown by a request.
@@ -93,4 +93,9 @@ export async function clearToken(tokenEnv: string): Promise<StateWire> {
  */
 export async function retryReport(id: string): Promise<StateWire> {
   return (await request<MutationOk>(REPORT_UPLOAD_ROUTE, { method: 'POST', body: JSON.stringify({ id }) })).state
+}
+
+/** Save the description and aliases of one enabled catalog repository. */
+export async function saveApplication(url: string, metadata: ApplicationMetadata): Promise<StateWire> {
+  return (await request<MutationOk>(APPLICATION_ROUTE, { method: 'PUT', body: JSON.stringify({ url, ...metadata }) })).state
 }

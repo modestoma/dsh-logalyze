@@ -1,11 +1,16 @@
 /**
- * 观象运行时的组装：生效设置、应用注册表与仓库清单跟随、入口 SKILL、五个
- * 工具的注册条件、分析接口令牌、日志平台客户端、分析请求的受理和报告回传，
- * 并为设置面板提供状态与写入口。
+ * 智能监管中心（观象 + 审微）运行时的组装：
+ * - 共享监管运行时（`dsh_supervisor` 存储域与 `logPool` / `mrPool` 并发隔离池）；
+ * - 生效设置、应用注册表与仓库清单跟随（同时注册 `log-analysis` 与 `mr-review` 功能开关）；
+ * - 入口 SKILL、分析派发及旧版 SKILL 工具注册；
+ * - 分析接口令牌、日志平台客户端、分析请求受理与报告回传；
+ * - Web 设置面板状态与写入口。
  *
  * @module dsh-logalyze/service
  */
 
+import { dirname, join } from 'node:path'
+import { z } from 'zod'
 import { resolveBatch } from './analyze/batch.ts'
 import { analyzeRequestHash } from './analyze/contract.ts'
 import type { AnalyzeRequest, AnalyzeResponse } from './analyze/contract.ts'
@@ -13,10 +18,13 @@ import { newAnalysisRecord } from './analyze/record.ts'
 import type { AnalyzeGate } from './analyze/server.ts'
 import { StoredCredential } from './analyze/token.ts'
 import { analysisTopicSpec, analyzeResponseOf, refused } from './analyze/topics.ts'
+import { LOGALYZE_APPLICATIONS_SERVICE } from './apps/access.ts'
+import type { ApplicationAccess } from './apps/access.ts'
 import { CatalogFollower } from './apps/catalog.ts'
 import { RepoRegistry } from './apps/registry.ts'
 import type { LogalyzeConfig } from './config.ts'
 import { describeIssue } from './config.ts'
+import { FEISHU_ACTIONS_SERVICE, lookupActions } from './deps/actions.ts'
 import { DSH_REPOS_SERVICE, ReposClient } from './deps/repos.ts'
 import type { DshRepos } from './deps/repos-contract.ts'
 import { FEISHU_TOPICS_STATUS_EVENT } from './deps/topics-contract.ts'
@@ -26,7 +34,6 @@ import { Dispatcher } from './dispatch/tool.ts'
 import type { HostContext, HostCredentials, ToolActivationContext, ToolDefinition, WorkingDirectoryService } from './host.ts'
 import { SkillViewer } from './improve/show.ts'
 import { SkillImprover } from './improve/tool.ts'
-import { RepoInitializer } from './onboard/init.ts'
 import { PlatformClient, PlatformError, platformProblem } from './platform/client.ts'
 import { LegacyReports, legacyReportsDir } from './report/legacy.ts'
 import { AnalysisStore, defaultAnalysesDir } from './report/store.ts'
@@ -34,6 +41,11 @@ import { ReportTracker } from './report/tracker.ts'
 import { admitPlatformUrl, downloadLog, DownloadError } from './runs/download.ts'
 import type { PlatformLogDownloader, PlatformLogRef } from './runs/logs.ts'
 import { inRunDirectory, isDelegatedAgent, isInside } from './runs/run-dir.ts'
+import { openSupervisorDomain } from './runtime/domain.ts'
+import type { SupervisorDomain } from './runtime/domain.ts'
+import { createSupervisionPools } from './runtime/pool.ts'
+import type { SupervisionPools } from './runtime/pool.ts'
+import { ApplicationSettings } from './settings/applications.ts'
 import { ANALYZE_ROUTE } from './settings/contract.ts'
 import type { StateWire } from './settings/contract.ts'
 import { SettingsController, SettingsError } from './settings/controller.ts'
@@ -42,7 +54,6 @@ import type { BundledSkill } from './skill/bundled.ts'
 import { createEntrySkillProvider } from './skill/entry.ts'
 import { abortable } from './util/abort.ts'
 import { messageOf } from './util/errors.ts'
-import { z } from 'zod'
 
 const reportRetrySchema = z.object({ id: z.string().regex(/^[0-9a-f]{24}$/u, '分析 id 不合法') }).strict()
 const credentialNameSchema = z.object({ tokenEnv: z.string() }).loose()
@@ -55,6 +66,8 @@ export interface ServiceOptions {
   readonly analysesDir?: string
   /** Directory of the former report records; defaults to `$DSH_HOME/logalyze/reports`. */
   readonly legacyReportsDir?: string
+  /** Local fallback directory for `dsh_supervisor` when host `storageDomain` is absent. */
+  readonly supervisorDir?: string
 }
 
 /** Package files the service serves. */
@@ -66,6 +79,7 @@ export interface ServiceAssets {
 /** The plugin's long-lived state. */
 export class LogalyzeService {
   readonly registry: RepoRegistry
+  readonly pools: SupervisionPools
   private readonly settings: SettingsController
   private readonly repos: ReposClient
   private readonly catalog: CatalogFollower
@@ -78,9 +92,10 @@ export class LogalyzeService {
   private readonly dispatcher: Dispatcher
   private readonly improver: SkillImprover
   private readonly viewer: SkillViewer
-  private readonly initializer: RepoInitializer
   private readonly skill: ReturnType<typeof createEntrySkillProvider>
   private readonly reports: ReportTracker
+  private readonly supervisorDir: string
+  private supervisorPromise: Promise<SupervisorDomain> | undefined
   private active = true
   private readonly refreshWaitMs: number
   private readonly booted = Promise.withResolvers<void>()
@@ -103,6 +118,8 @@ export class LogalyzeService {
     const settings = (): ReturnType<SettingsController['get']> => this.settings.get()
     const workingDirectory = (): WorkingDirectoryService | undefined => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined
     const fetchSeam = options.fetch === undefined ? {} : { fetch: options.fetch }
+    this.supervisorDir = options.supervisorDir ?? join(dirname(store.path), 'supervisor')
+    this.pools = createSupervisionPools()
     this.settings = new SettingsController(config, store, warn)
     this.refreshWaitMs = config.refreshWaitMs
     this.repos = new ReposClient(() => ctx.get?.(DSH_REPOS_SERVICE))
@@ -111,7 +128,12 @@ export class LogalyzeService {
     this.secret = new StoredCredential(config.platformSecretRef, '日志平台 client_secret', credentials, warn)
     this.platform = new PlatformClient({ settings: () => this.settings.get().analyze.platform, secret: () => this.secret.value(), ...fetchSeam })
     this.legacy = new LegacyReports(options.legacyReportsDir ?? legacyReportsDir(), warn)
-    this.registry = new RepoRegistry({ repos: this.repos, onChange: () => { this.onRegistryChange() } })
+    this.registry = new RepoRegistry({
+      repos: this.repos,
+      applications: new ApplicationSettings(join(dirname(store.path), 'applications.json')),
+      skills: ctx.skills,
+      onChange: () => { this.onRegistryChange() },
+    })
     this.catalog = new CatalogFollower({
       registry: this.registry,
       repos: this.repos,
@@ -122,7 +144,6 @@ export class LogalyzeService {
     this.improver = new SkillImprover({ ...children, repos: this.repos })
     this.viewer = new SkillViewer({ registry: this.registry, repos: this.repos })
     this.dispatcher = new Dispatcher({ ...children, gaps: this.improver, platformLogs: sessionId => this.platformLogsOf(sessionId), platform: this.platformDownloader(options.fetch) })
-    this.initializer = new RepoInitializer({ ...children, repos: this.repos })
     this.reports = new ReportTracker({
       store: new AnalysisStore(options.analysesDir ?? defaultAnalysesDir(), warn),
       topics: () => this.topicsService(),
@@ -133,7 +154,6 @@ export class LogalyzeService {
     this.skill = createEntrySkillProvider({
       prepare: signal => this.prepareCatalog(signal),
       apps: () => this.registry.readyApps().map(ready => ready.app),
-      setupPending: () => this.registry.setupPending(),
       maxAppsPerRequest: () => this.settings.get().maxAppsPerRequest,
       skillUpdates: () => this.settings.get().skillUpdates.enabled,
       autoInvoke: config.autoInvoke,
@@ -146,16 +166,34 @@ export class LogalyzeService {
     })
   }
 
-  /** Register the entry skill provider; called once from `apply()`. */
+  /** Open or return the initialized `dsh_supervisor` storage domain. */
+  supervisorDomain(): Promise<SupervisorDomain> {
+    if (this.supervisorPromise === undefined) {
+      this.supervisorPromise = openSupervisorDomain({
+        ctx: this.ctx,
+        fallbackDir: this.supervisorDir,
+      })
+    }
+    return this.supervisorPromise
+  }
+
+  /** Register the entry skill provider and `logalyzeApplications` service; called once from `apply()`. */
   registerSkill(): void {
+    if (typeof this.ctx.provide === 'function') {
+      const access: ApplicationAccess = {
+        list: async () => { await this.prepared(); return this.registry.readyApps() },
+        resolve: async name => { await this.prepared(); return this.registry.resolve(name) },
+        acquire: async ids => { await this.prepared(); return this.registry.acquire(ids) },
+      }
+      this.ctx.effect(() => this.ctx.provide?.(LOGALYZE_APPLICATIONS_SERVICE, access), 'logalyze: application access')
+    }
     this.ctx.effect(() => this.ctx.skills.registerProvider(this.skill.factory), 'logalyze: entry skill')
   }
 
   /**
-   * Register the five tools and the Session listeners they need; called once
+   * Register the analysis and legacy SKILL tools and the Session listeners they need; called once
    * from `apply()`. The definitions stay fixed because a step drops a tool
-   * whose registration changed after the step resolved its tools. The
-   * improvement tool counts finished turns from `turn/end` Session events.
+   * whose registration changed after the step resolved its tools.
    */
   registerTools(): void {
     this.ctx.on('session/event', (session, event) => {
@@ -168,32 +206,16 @@ export class LogalyzeService {
       this.ctx.effect(() => this.ctx.tools.register(definition, { when: context => this.offers(context, condition) }), `logalyze: ${label} tool`)
     }
     register(this.dispatcher.definition(), hasApps, 'dispatch')
-    register(this.improver.definition(), () => this.settings.get().skillUpdates.enabled && this.registry.readyApps().some(ready => ready.writable), 'skill improvement')
-    register(this.viewer.definition(), hasApps, 'skill view')
-    register(this.initializer.initDefinition(), () => this.registry.setupPending().length > 0, 'draft repository setup')
-    register(this.initializer.submitDefinition(), context => this.initializer.hasDraft(context.agent.session.header.id), 'submit repository setup')
+    register(this.improver.definition(), () => this.settings.get().skillUpdates.enabled && this.registry.readyApps().some(ready => ready.writable && ready.app.skill !== undefined), 'skill improvement')
+    register(this.viewer.definition(), () => this.registry.readyApps().some(ready => ready.app.skill !== undefined), 'skill view')
   }
 
-  /**
-   * Offer a tool to top-level agents once the first sync settled and the
-   * tool's own condition holds.
-   * @param context - the preparing step.
-   * @param condition - the tool's condition, read after the first sync.
-   * @returns whether the step may call the tool.
-   */
   private async offers(context: ToolActivationContext, condition: (context: ToolActivationContext) => boolean): Promise<boolean> {
     if (isDelegatedAgent(context.agent)) return false
     await abortable(this.booted.promise, context.signal)
     return this.active && condition(context)
   }
 
-  /**
-   * Wait for the first sync, then sync the repositories older than
-   * `fetchIntervalMs`, waiting at most `refreshWaitMs` for them; a refresh
-   * still running then finishes in the background.
-   * @param signal - entry skill load cancellation.
-   * @throws the signal's reason when the load is cancelled.
-   */
   private async prepareCatalog(signal: AbortSignal | undefined): Promise<void> {
     await abortable(this.booted.promise, signal)
     if (!this.active) return
@@ -207,12 +229,14 @@ export class LogalyzeService {
   }
 
   /**
-   * Load the panel overlay and the report records, take the application
-   * repositories from the dsh-repo catalog, and sync every repository.
-   * @returns when the first sync round settled.
+   * Open the supervision storage domain, load panel overlay & report records,
+   * take configured repositories from `dsh-repo`, and sync every repository.
    */
   async boot(): Promise<void> {
     try {
+      await this.supervisorDomain().catch((error: unknown) => {
+        this.ctx.logger?.error?.('logalyze: 打开监管存储域失败：%s', messageOf(error))
+      })
       await this.settings.load()
       await this.reports.boot().catch((error: unknown) => {
         this.ctx.logger?.error?.('logalyze: 读取分析记录失败：%s', messageOf(error))
@@ -226,53 +250,38 @@ export class LogalyzeService {
     }
   }
 
-  /**
-   * React to dsh-repo becoming available after boot or reloading.
-   * @returns when the syncs settled.
-   */
+  /** React to dsh-repo becoming available after boot or reloading. */
   async reposAvailable(): Promise<void> {
     await this.booted.promise
     if (!this.active) return
     await this.catalog.serviceAppeared()
   }
 
-  /**
-   * Register the log analysis feature with dsh-repo and follow its catalog and host changes.
-   * @param repos - the `dshRepos` service.
-   * @returns disposer that withdraws the feature and stops watching.
-   */
+  /** Register both features with dsh-repo and follow its catalog and host changes. */
   watchRepos(repos: DshRepos): () => void {
     return this.catalog.watch(repos)
   }
 
-  /** Stop registering tools and retrying uploads; in-flight syncs and uploads finish without side effects on the host. */
-  shutdown(): void {
+  /** Stop admission, drain pools and metadata writes/refreshes, and close the supervision storage domain. */
+  async shutdown(): Promise<void> {
     this.active = false
     this.reports.shutdown()
     this.booted.resolve()
+    await Promise.allSettled([
+      this.pools.drainAndClose(),
+      this.registry.close(),
+      this.supervisorPromise?.then(domain => domain.close(), () => undefined),
+    ])
   }
 
-  /**
-   * Check reports waiting for their first turn against `feishuTopics`; called
-   * whenever the service appears.
-   * @returns when the check settled.
-   */
+  /** Check reports waiting for their first turn against `feishuTopics`; called whenever the service appears. */
   async topicsAvailable(): Promise<void> {
     await this.booted.promise
     if (!this.active) return
     await this.reports.reconcile()
   }
 
-  /**
-   * Accept one validated analyze request: replay an accepted key, otherwise
-   * read the logs from the platform, check the batch, record the analysis,
-   * and launch its topic. Concurrent requests with one key share the first
-   * one's answer.
-   * @param topics - the loaded `feishuTopics`.
-   * @param request - the validated request.
-   * @param key - its `Idempotency-Key`.
-   * @returns the HTTP answer.
-   */
+  /** Accept one validated analyze request with idempotency protection. */
   async acceptAnalysis(topics: FeishuTopicService, request: AnalyzeRequest, key: string): Promise<AnalyzeResponse> {
     const pending = this.accepting.get(key)
     if (pending !== undefined) {
@@ -322,11 +331,6 @@ export class LogalyzeService {
     return response
   }
 
-  /**
-   * The platform logs of the analyze API topic a Session belongs to.
-   * @param sessionId - the dispatching top-level Session.
-   * @returns a resolver of log numbers, or undefined when the Session is not such a topic.
-   */
   private platformLogsOf(sessionId: string): ((ref: string) => PlatformLogRef) | undefined {
     const key = this.topicsService()?.launchKeyOf(sessionId)
     const record = key === undefined ? undefined : this.reports.byKey(key)
@@ -355,12 +359,7 @@ export class LogalyzeService {
     }
   }
 
-  /**
-   * Upload one analysis's reports again now.
-   * @param raw - request body `{ id }`.
-   * @returns the new panel state.
-   * @throws SettingsError when the body is invalid or the analysis is unknown.
-   */
+  /** Upload one analysis's reports again now. */
   async retryReport(raw: unknown): Promise<StateWire> {
     const parsed = reportRetrySchema.safeParse(raw)
     if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
@@ -381,16 +380,18 @@ export class LogalyzeService {
     return {
       ...this.settings.panel(),
       repos: this.registry.status(),
+      mrRepos: this.registry.mrStatus(),
       dshRepo: this.repos.panelState(),
       credentialsAvailable: this.token.available(),
       analyze: {
         route: ANALYZE_ROUTE,
         tokenEnv: this.token.ref,
-        ...token === undefined ? {} : { token },
+        ...(token === undefined ? {} : { token }),
         secretEnv: this.secret.ref,
-        ...secret === undefined ? {} : { secret },
-        ...problem === undefined ? {} : { platformProblem: problem },
+        ...(secret === undefined ? {} : { secret }),
+        ...(problem === undefined ? {} : { platformProblem: problem }),
         topics: lookupTopics(this.ctx.get?.(FEISHU_TOPICS_SERVICE)).availability,
+        actions: lookupActions(this.ctx.get?.(FEISHU_ACTIONS_SERVICE)).availability,
         reports: this.reports.list(),
         legacyReports: this.legacy.list(),
       },
@@ -408,24 +409,14 @@ export class LogalyzeService {
     }
   }
 
-  /**
-   * Store the analyze API's bearer token or the platform client secret in DSH's credential store.
-   * @param raw - request body `{ tokenEnv, value }`.
-   * @returns the new panel state.
-   * @throws SettingsError when the body is invalid, the name is neither credential's, or no credential store is loaded.
-   */
+  /** Store the analyze API's bearer token or the platform client secret in DSH's credential store. */
   async setToken(raw: unknown): Promise<StateWire> {
     await this.credentialOf(raw).set(raw)
     this.platform.reset()
     return await this.state()
   }
 
-  /**
-   * Remove a stored credential.
-   * @param raw - request body `{ tokenEnv }`.
-   * @returns the new panel state.
-   * @throws SettingsError on the same conditions as {@link setToken}.
-   */
+  /** Remove a stored credential. */
   async clearToken(raw: unknown): Promise<StateWire> {
     await this.credentialOf(raw).clear(raw)
     this.platform.reset()
@@ -441,24 +432,28 @@ export class LogalyzeService {
     return slot
   }
 
-  /**
-   * Validate and persist a complete settings payload from the panel.
-   * @param raw - request body.
-   * @returns the new panel state.
-   * @throws SettingsError when the payload is invalid.
-   */
+  /** Validate and persist a complete settings payload from the panel. */
   async save(raw: unknown): Promise<StateWire> {
     await this.settings.save(raw)
     return await this.state()
   }
 
-  /**
-   * Remove every panel override.
-   * @returns the new panel state.
-   */
+  /** Remove every panel override. */
   async reset(): Promise<StateWire> {
     await this.settings.reset()
     return await this.state()
+  }
+
+  /** Save only application metadata; catalog membership is checked on each write. */
+  async saveApplication(raw: unknown): Promise<StateWire> {
+    await this.prepared()
+    await this.registry.saveApplication(raw)
+    return await this.state()
+  }
+
+  private async prepared(): Promise<void> {
+    await this.booted.promise
+    if (!this.active) throw new Error('智能监管已停止，不能准备新的应用任务')
   }
 
   private onRegistryChange(): void {

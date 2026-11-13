@@ -1,6 +1,5 @@
 /**
- * 应用仓库内 `.agents/logalyze.yaml` 应用描述的解析与校验，以及对应日志分析
- * SKILL 的存在性检查。
+ * 旧 SKILL 改进工具使用的 manifest 与目标文件检查；应用分析就绪不调用此检查。
  *
  * @module dsh-logalyze/apps/manifest
  */
@@ -29,7 +28,7 @@ const manifestSchema = z.object({
 
 /** Outcome of reading one repository's application description. */
 export type ManifestRead =
-  | { readonly ok: true; readonly app: AppManifest }
+  | { readonly ok: true; readonly app: AppManifest & { skill: string } }
   | { readonly ok: false; readonly error: string }
 
 /**

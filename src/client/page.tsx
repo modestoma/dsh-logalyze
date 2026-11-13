@@ -1,19 +1,19 @@
 /**
- * 左侧栏「观象」主区页面：应用仓库、日志下载、分析接口、高级（含 SKILL 改进）四个
- * 分页，后三个共用一份草稿和底部保存条。应用仓库分页只读：仓库在 dsh-repo 的
- * 仓库清单中添加并打开「日志分析」功能，镜像的拉取和拉取状态都在 dsh-repo；
- * 分页显示各仓库的应用状态并提供跳转。读取应用描述期间每 2 秒刷新状态；打开「分析接口」分页时每 5 秒刷新回传记录。
+ * 左侧栏「智能监管」主区页面：应用仓库（观象日志监管 + 审微 MR 监管仓库概览）、
+ * 日志下载、分析接口、高级四个分页，后三个共用一份草稿和底部保存条。
+ * 应用仓库逐项保存应用描述与触发别名；仓库在 dsh-repo 的仓库清单中添加并打开
+ * 「日志分析」或「MR 自动评审」功能，镜像拉取归 dsh-repo 管理。
  *
  * @module dsh-logalyze/client/page
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { AnalysisWire, AnalyzeWire, EditableKey, EditableSettings, LegacyReportWire, PlatformClientAuth, ReportStatus, RepoStatusWire, StateWire, TokenStatusWire, UploadPhase } from '../settings/contract.ts'
-import { clearToken, fetchState, messageOf, resetSettings, retryReport, saveSettings, saveToken } from './api.ts'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import type { AnalysisWire, AnalyzeWire, ApplicationMetadata, EditableKey, EditableSettings, LegacyReportWire, PlatformClientAuth, ReportStatus, RepoStatusWire, StateWire, TokenStatusWire, UploadPhase } from '../settings/contract.ts'
+import { clearToken, fetchState, messageOf, resetSettings, retryReport, saveApplication, saveSettings, saveToken } from './api.ts'
 import { CHAT_ID_PATTERN } from '../settings/contract.ts'
 
 /** Sidebar label and page title. */
-export const PANEL_TITLE = '观象'
+export const PANEL_TITLE = '智能监管'
 
 const KB = 1024
 const MB = 1024 * 1024
@@ -177,7 +177,6 @@ function formatTime(iso: string | number | undefined): string {
 function appPill(repo: RepoStatusWire): JSX.Element {
   if (repo.phase === 'syncing') return <span className="lz__pill lz__pill--warn"><span className="lz__dot" />读取中</span>
   if (repo.available) return <span className="lz__pill lz__pill--ok"><span className="lz__dot" />已配置</span>
-  if (repo.commit !== undefined && repo.app === undefined) return <span className="lz__pill lz__pill--warn" title={repo.writable ? '在对话中让观象起草接入（logalyze_init_repo）' : undefined}><span className="lz__dot" />{repo.writable ? '缺应用描述，可初始化' : '缺应用描述'}</span>
   if (repo.phase === 'failed' || repo.phase === 'ready') return <span className="lz__pill lz__pill--bad"><span className="lz__dot" />不可用</span>
   return <span className="lz__pill"><span className="lz__dot" />等待读取</span>
 }
@@ -278,6 +277,19 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
     }
   }
 
+  const saveApp = async (url: string, metadata: ApplicationMetadata): Promise<ApplicationMetadata> => {
+    setBusy(true)
+    setNotice(undefined)
+    try {
+      const next = await saveApplication(url, metadata)
+      adopt(next, false)
+      setNotice({ kind: 'ok', text: '已保存应用描述与触发别名' })
+      return next.repos.find(repo => repo.url === url)?.app ?? metadata
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const save = (): void => {
     if (draft === undefined) return
     let settings: EditableSettings
@@ -301,15 +313,17 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
   }
 
   const available = state.repos.filter(repo => repo.available).length
+  const mrCount = state.mrRepos.length
   return (
     <div className="lz">
       <header className="lz__head">
         <div className="lz__headRow">
           <h1 className="lz__title">{PANEL_TITLE}</h1>
-          <span className={`lz__pill ${available > 0 ? 'lz__pill--ok' : 'lz__pill--warn'}`}><span className="lz__dot" />{available} 个应用可用</span>
+          <span className={`lz__pill ${available > 0 ? 'lz__pill--ok' : 'lz__pill--warn'}`}><span className="lz__dot" />{available} 个日志应用可用</span>
+          <span className={`lz__pill ${mrCount > 0 && state.dshRepo.mrReviewReady !== false ? 'lz__pill--ok' : ''}`}><span className="lz__dot" />{mrCount} 个 MR 评审仓库</span>
           {syncing ? <span className="lz__pill lz__pill--warn"><span className="lz__dot" />读取中</span> : null}
         </div>
-        <div className="lz__meta">观其象，知其因。在对话中输入 /logalyze 描述问题并附上日志，观象会按应用派发分析。</div>
+        <div className="lz__meta">观象察志，审微知著：统一管理观象应用日志诊断（/logalyze）与审微合并请求自动评审。</div>
         <div className="lz__tabs" role="tablist">
           {TABS.map(item => (
             <button key={item.id} type="button" role="tab" className="lz__tab" aria-selected={tab === item.id} onClick={() => { setTab(item.id) }}>{item.label}</button>
@@ -318,7 +332,7 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
       </header>
       {state.overlayError === undefined ? null : <div className="lz__notice lz__notice--error">面板设置文件未生效：{state.overlayError}。保存一次会用当前内容覆盖它。</div>}
       <div className="lz__body" role="tabpanel">
-        {tab === 'repos' ? <ReposTab state={state} openRepoSettings={openRepoSettings} /> : null}
+        <div hidden={tab !== 'repos'}><ReposTab state={state} openRepoSettings={openRepoSettings} busy={busy} onSave={saveApp} /></div>
         {tab === 'download' ? <DownloadTab draft={draft} setDraft={setDraft} overridden={state.overridden} /> : null}
         {tab === 'analyze'
           ? <AnalyzeTab
@@ -336,11 +350,11 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
         {tab === 'advanced' ? <AdvancedTab draft={draft} setDraft={setDraft} overridden={state.overridden} busy={busy} onReset={() => { void run(resetSettings, '已恢复为 cordis.yml 中的配置', true) }} /> : null}
       </div>
       {notice === undefined ? null : <div className={`lz__notice lz__notice--${notice.kind}`}>{notice.text}</div>}
-      <div className="lz__saveBar">
+      {tab === 'repos' ? null : <div className="lz__saveBar">
         <span className="lz__saveMsg">{dirty ? '有未保存的修改' : '设置已保存'}</span>
         <button type="button" className="lz__btn lz__btn--ghost" disabled={!dirty || busy} onClick={() => { setDraft(toDraft(state.settings)); setNotice(undefined) }}>放弃修改</button>
         <button type="button" className="lz__btn lz__btn--primary" disabled={!dirty || busy} onClick={save}>保存</button>
-      </div>
+      </div>}
     </div>
   )
 }
@@ -350,41 +364,141 @@ interface TabProps {
   setDraft: (next: Draft) => void
 }
 
-function ReposTab({ state, openRepoSettings }: LogalyzePageProps & { state: StateWire }): JSX.Element {
+function ReposTab({ state, openRepoSettings, busy, onSave }: LogalyzePageProps & { state: StateWire; busy: boolean; onSave: (url: string, metadata: ApplicationMetadata) => Promise<ApplicationMetadata> }): JSX.Element {
   return (
-    <section className="lz__sec">
-      <h2 className="lz__secTitle">应用仓库</h2>
-      <div className="lz__list">
-        {state.repos.length === 0 ? <div className="lz__emptyRow">还没有应用仓库。请管理员在 dsh-repo 的「代码仓库 → 仓库」中添加仓库并打开「日志分析」。</div> : null}
-        {state.repos.map(repo => (
-          <div key={repo.url} className="lz__row lz__row--top">
-            <div className="lz__rowText">
-              <div className="lz__rowLabel">
-                <span className="lz__mono">{repo.url}</span>
-                {repo.branch === undefined ? null : <span className="lz__tag" title="日志分析读取的分支">{repo.branch}</span>}
-                {appPill(repo)}
-                {repo.writable ? null : <span className="lz__pill" title="dsh-repo 中权限为只读：只分析，不起草接入、不改进 SKILL">只读</span>}
+    <>
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">应用仓库（观象 · 日志分析）</h2>
+        <div className="lz__list">
+          {state.repos.length === 0 ? <div className="lz__emptyRow">还没有应用仓库。请管理员在 dsh-repo 的「代码仓库 → 仓库」中添加仓库并打开「日志分析」。</div> : null}
+          {state.repos.map(repo => (
+            <div key={repo.url} className="lz__row lz__row--top">
+              <div className="lz__rowText">
+                <div className="lz__rowLabel">
+                  <span className="lz__mono">{repo.url}</span>
+                  {repo.branch === undefined ? null : <span className="lz__tag" title="日志分析读取的分支">{repo.branch}</span>}
+                  {appPill(repo)}
+                  {repo.writable ? null : <span className="lz__pill" title="dsh-repo 中权限为只读：代码只读，不能推送 SKILL 修改">只读</span>}
+                </div>
+                {repo.app !== undefined
+                  ? <div className="lz__rowSummary">{repo.app.name}（<span className="lz__mono">{repo.app.id}</span>）{repo.activeRuns > 0 ? ` · ${repo.activeRuns} 个分析进行中` : ''}</div>
+                  : null}
+                {repo.app !== undefined ? <ApplicationEditor repo={repo} busy={busy} onSave={onSave} /> : null}
+                {repo.commit !== undefined
+                  ? <div className="lz__rowSummary">读取的提交 <span className="lz__mono">{repo.commit.slice(0, 8)}</span> · {formatTime(repo.syncedAt)}</div>
+                  : null}
+                {repo.error !== undefined ? <div className="lz__rowError">{repo.error}</div> : null}
               </div>
-              {repo.app !== undefined
-                ? <div className="lz__rowSummary">{repo.app.name}（<span className="lz__mono">{repo.app.id}</span>）· SKILL <span className="lz__mono">/{repo.app.skill}</span>{repo.activeRuns > 0 ? ` · ${repo.activeRuns} 个分析进行中` : ''}</div>
-                : null}
-              {repo.app !== undefined ? <div className="lz__rowSummary">{repo.app.description}</div> : null}
-              {repo.commit !== undefined
-                ? <div className="lz__rowSummary">读取的提交 <span className="lz__mono">{repo.commit.slice(0, 8)}</span> · {formatTime(repo.syncedAt)}</div>
-                : null}
-              {repo.error !== undefined ? <div className="lz__rowError">{repo.error}</div> : null}
             </div>
-          </div>
-        ))}
-      </div>
-      {state.dshRepo.availability === 'ready' ? null : <div className="lz__notice lz__notice--error">{state.dshRepo.availability === 'missing' ? '没有加载 dsh-repo 插件，应用仓库来自它的仓库清单。请安装 dsh-repo。' : 'dsh-repo 版本与观象不兼容，无法读取仓库清单。'}</div>}
-      {state.dshRepo.availability === 'ready' && state.dshRepo.mirrorDir === undefined ? <div className="lz__notice lz__notice--error">{state.dshRepo.mirrorProblem ?? 'dsh-repo 的镜像目录未设置，仓库无法读取。'}请到 dsh-repo 的设置页「高级」里设置镜像目录。</div> : null}
-      <p className="lz__secFoot">应用仓库是 dsh-repo 仓库清单中打开了「日志分析」功能的仓库，只能在 dsh-repo 中添加；地址、分支和权限也都在那里修改，镜像的拉取状态和「重新拉取」也在那里。分析读取「日志分析」开关旁选的分支（留空用基线分支），起草接入和改进 SKILL 从基线分支开始，合并请求合回基线分支，仓库权限需为「可改代码」。每个仓库的日志分析分支上需包含 <span className="lz__mono">.agents/logalyze.yaml</span> 与其中声明的日志分析 SKILL。</p>
-      <div className="lz__headRow">
-        {openRepoSettings === undefined || state.dshRepo.availability === 'missing' ? null : <button type="button" className="lz__btn lz__btn--ghost" onClick={openRepoSettings}>{state.dshRepo.availability === 'ready' && state.dshRepo.mirrorDir === undefined ? '去设置镜像目录' : '在 dsh-repo 中管理仓库'}</button>}
-      </div>
-    </section>
+          ))}
+        </div>
+        {state.dshRepo.availability === 'ready' ? null : <div className="lz__notice lz__notice--error">{state.dshRepo.availability === 'missing' ? '没有加载 dsh-repo 插件，应用仓库来自它的仓库清单。请安装 dsh-repo。' : 'dsh-repo 版本与智能监管不兼容，无法读取仓库清单。'}</div>}
+        {state.dshRepo.availability === 'ready' && state.dshRepo.mirrorDir === undefined ? <div className="lz__notice lz__notice--error">{state.dshRepo.mirrorProblem ?? 'dsh-repo 的镜像目录未设置，仓库无法读取。'}请到 dsh-repo 的设置页「高级」里设置镜像目录。</div> : null}
+        <p className="lz__secFoot">应用仓库是 dsh-repo 仓库清单中打开了「日志分析」功能的仓库，只能在 dsh-repo 中添加；地址、分支和权限也都在那里修改，镜像的拉取状态和「重新拉取」也在那里。分析读取「日志分析」开关旁选的分支（留空用基线分支），改进现有 SKILL 从基线分支开始，合并请求合回基线分支，仓库权限需为「可改代码」。只在这里配置描述和触发别名；飞书名称与平台 component_code 使用同一份别名。SKILL 由 DSH 按需发现，没有 SKILL 也可分析。</p>
+      </section>
+
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">MR 自动评审仓库（审微）</h2>
+        <div className="lz__list">
+          {state.mrRepos.length === 0 ? <div className="lz__emptyRow">还没有启用 MR 自动评审的仓库。可在 dsh-repo 的「代码仓库 → 仓库」中为目标仓库打开「MR 自动评审」。</div> : null}
+          {state.mrRepos.map(repo => (
+            <div key={repo.url} className="lz__row lz__row--top">
+              <div className="lz__rowText">
+                <div className="lz__rowLabel">
+                  <span className="lz__mono">{repo.url}</span>
+                  {repo.branch === undefined ? null : <span className="lz__tag" title="MR 自动评审跟踪的目标分支">{repo.branch}</span>}
+                  <span className={`lz__pill ${state.dshRepo.mrReviewReady !== false ? 'lz__pill--ok' : 'lz__pill--warn'}`}>
+                    <span className="lz__dot" />
+                    {state.dshRepo.mrReviewReady !== false ? '已启用' : '待升级 dsh-repo'}
+                  </span>
+                  {repo.writable ? null : <span className="lz__pill" title="dsh-repo 中权限为只读：评审写回评论需在 dsh-repo 开启写入权限">只读</span>}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+        {state.dshRepo.availability === 'ready' && state.dshRepo.mrReviewReady === false && state.mrRepos.length > 0
+          ? <div className="lz__notice lz__notice--error">{state.dshRepo.mrReviewProblem}</div>
+          : null}
+        <p className="lz__secFoot">MR 自动评审仓库来自 dsh-repo 仓库清单中打开了「MR 自动评审」功能的仓库。审微依托 dshRepos v8 行级评审与讨论线程接口对新合并请求及后续增量提交持续评审。</p>
+        <div className="lz__headRow">
+          {openRepoSettings === undefined || state.dshRepo.availability === 'missing' ? null : <button type="button" className="lz__btn lz__btn--ghost" onClick={openRepoSettings}>{state.dshRepo.availability === 'ready' && state.dshRepo.mirrorDir === undefined ? '去设置镜像目录' : '在 dsh-repo 中管理仓库'}</button>}
+        </div>
+      </section>
+    </>
   )
+}
+
+function ApplicationEditor({ repo, busy, onSave }: { repo: RepoStatusWire; busy: boolean; onSave: (url: string, metadata: ApplicationMetadata) => Promise<ApplicationMetadata> }): JSX.Element {
+  const app = repo.app!
+  const [description, setDescription] = useState(app.description)
+  const [aliases, setAliases] = useState(app.aliases)
+  const [aliasInput, setAliasInput] = useState('')
+  const [error, setError] = useState<string>()
+  const input = useRef<HTMLInputElement>(null)
+  const inputId = useId()
+  const previous = useRef({ description: app.description, aliases: JSON.stringify(app.aliases) })
+  const aliasText = JSON.stringify(app.aliases)
+  const dirty = description !== app.description || JSON.stringify(aliases) !== aliasText || aliasInput.trim() !== ''
+  useEffect(() => {
+    if (description === previous.current.description && JSON.stringify(aliases) === previous.current.aliases) {
+      setDescription(app.description)
+      setAliases(app.aliases)
+    }
+    previous.current = { description: app.description, aliases: aliasText }
+  }, [app.description, aliasText])
+  const restore = (): void => { setDescription(app.description); setAliases(app.aliases); setAliasInput(''); setError(undefined) }
+  const withPending = (): string[] | undefined => {
+    const value = aliasInput.trim()
+    if (value === '') return aliases
+    const key = value.normalize('NFKC').toLowerCase()
+    if (aliases.some(alias => alias.normalize('NFKC').trim().toLowerCase() === key)) { setError('该别名已存在（忽略大小写及全角差异）'); return }
+    if (value.length > 256) { setError('别名不能超过 256 个字符'); return }
+    if (aliases.length >= 100) { setError('每个应用最多添加 100 个别名'); return }
+    return [...aliases, value]
+  }
+  const add = (): void => {
+    const values = withPending()
+    if (values === undefined) return
+    setAliases(values)
+    setAliasInput('')
+    setError(undefined)
+    input.current?.focus()
+  }
+  const save = async (): Promise<void> => {
+    const values = withPending()
+    if (values === undefined) return
+    setError(undefined)
+    try {
+      const saved = await onSave(repo.url, { description, aliases: values })
+      setDescription(saved.description)
+      setAliases(saved.aliases)
+      setAliasInput('')
+    } catch (err) {
+      setError(messageOf(err))
+    }
+  }
+  return <div className="lz__appForm">
+    <label className="lz__field">应用描述<textarea aria-label={`${app.name} 应用描述`} disabled={busy} className="lz__input lz__textarea" rows={3} maxLength={8000} value={description} onChange={event => { setDescription(event.target.value) }} /></label>
+    <div className="lz__field"><label htmlFor={inputId}>触发别名</label>
+      <div className="lz__aliasInput">
+        <input id={inputId} ref={input} aria-label={`${app.name} 触发别名`} disabled={busy} className="lz__input" placeholder="输入别名，按 Enter 添加" value={aliasInput} onChange={event => { setAliasInput(event.target.value); setError(undefined) }} onKeyDown={event => { if (event.key === 'Enter' && !event.nativeEvent.isComposing) { event.preventDefault(); add() } }} />
+        <button type="button" className="lz__btn" disabled={busy || aliasInput.trim() === ''} onClick={add}>添加</button>
+      </div>
+    </div>
+    {aliases.length === 0 ? null : <ul className="lz__aliases" aria-label={`${app.name} 已添加别名`}>
+      {aliases.map((alias, index) => <li key={`${index}:${alias}`} className="lz__alias">
+        <span className="lz__aliasLabel">{alias}</span>
+        <button type="button" className="lz__aliasRemove" disabled={busy} aria-label={`${app.name} 删除别名 ${alias}`} title={`删除别名 ${alias}`} onClick={() => { setAliases(aliases.filter((_, position) => position !== index)); setError(undefined); input.current?.focus() }}>×</button>
+      </li>)}
+    </ul>}
+    <div className="lz__rowSummary">可填写中文名称、简称或平台 component_code；空描述和无 SKILL 均可分析。</div>
+    {error === undefined ? null : <div role="alert" className="lz__rowError">{error}</div>}
+    <div className="lz__headRow">
+      <button type="button" className="lz__btn lz__btn--primary" disabled={busy || !dirty} onClick={() => { void save() }}>保存应用设置</button>
+      <button type="button" className="lz__btn lz__btn--ghost" disabled={busy || !dirty} onClick={restore}>放弃应用修改</button>
+    </div>
+  </div>
 }
 
 /** Credential store layers of `@deepseek-ai/dsh-credentials-local` other than its own file. */
