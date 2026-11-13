@@ -1,28 +1,21 @@
 /**
- * 观象 Logalyze —— DeepSeek Harness 日志分析插件。观其象，知其因。
+ * 智能监管（dsh-logalyze）—— DeepSeek Harness AI 原生智能监管中心底座运行时（观象日志监管 + 审微 MR 监管）。
  *
- * 提供入口 SKILL `/logalyze`（识别日志属于哪个应用；用户显式调用，或在
- * 任务匹配已注册应用时由顶层 Agent 自行加载）和
- * `logalyze_dispatch` 工具（按应用派发子 Agent，工作目录为该应用的代码
- * 仓库，首条消息用 `/<skill>` 加载仓库里的日志分析 SKILL），以及 SKILL 改进
- * 工具：`logalyze_show_skill` 只读查看应用 SKILL；`logalyze_improve_skill` 在
- * 用户于分析结论之后的消息中同意改进时，由一个改进子 Agent 把该应用的所有改进点
- * 在运行目录的可写工作区里按 `/logalyze-improve` 改进 SKILL 并沉淀案例，经
- * `dshRepos` 服务推送到新分支并创建合并请求。应用仓库是 dsh-repo 仓库清单中
- * 打开了「日志分析」功能的仓库，只能在 dsh-repo 的设置页添加，镜像由 dsh-repo
- * 拉取；应用描述来自各仓库日志分析分支上的 `.agents/logalyze.yaml`。顶层 Agent
- * 还可以用 `logalyze_init_repo` / `logalyze_submit_init` 为缺少应用描述
- * 的仓库在工作区里起草并推送接入合并请求。另提供日志平台分析接口 `POST /open-api/logalyze`：
- * 调用方传一批日志平台的 log_id，观象作为 OAuth2 客户端向日志平台查元数据，
- * 经飞书渠道插件的 `feishuTopics` 服务在飞书群话题中开始分析，话题每轮结束后
- * 把报告作为新修订传到每份日志。
+ * 从 `dsh-repo` 的仓库目录读取启用「日志分析」与「MR 自动评审」的代码仓库，提供：
+ * - `dsh_supervisor` 共享监管运行时（7 张强类型状态表、并发池、键控防抖器、滑动窗口熔断器、单调修订 Outbox）；
+ * - 跨插件窄契约（`dshRepos` v7/v8 与 `feishuActions` v1）；
+ * - 面板归属的应用描述与触发别名设置、可选 DSH SKILL 发现与加载、分析派发与报告回传。
+ *
+ * 保持包名 `dsh-logalyze` 与 Cordis 插件名 `logalyze` 不变，确保 npm OIDC 发布及宿主装配完全兼容。
  *
  * @module dsh-logalyze
  */
 
 import { mountAnalyzeRoute } from './analyze/server.ts'
+import { LOGALYZE_APPLICATIONS_SERVICE } from './apps/access.ts'
 import { resolveConfig } from './config.ts'
-import { DSH_REPOS_SERVICE, lookupRepos } from './deps/repos.ts'
+import { FEISHU_ACTIONS_SERVICE, FEISHU_ACTIONS_VERSION, lookupActions } from './deps/actions.ts'
+import { DSH_REPOS_SERVICE, LOG_ANALYSIS_FEATURE, lookupRepos, lookupReposV8, MR_REVIEW_FEATURE } from './deps/repos.ts'
 import { FEISHU_TOPICS_SERVICE } from './deps/topics.ts'
 import type { HostContext } from './host.ts'
 import { LogalyzeService } from './service.ts'
@@ -33,9 +26,25 @@ import { loadBundledSkills } from './skill/bundled.ts'
 import { messageOf } from './util/errors.ts'
 
 export type * from './settings/contract.ts'
+export type * from './deps/repos-contract.ts'
+export type * from './deps/actions-contract.ts'
+export * from './runtime/index.ts'
+export type { ApplicationAccess } from './apps/access.ts'
+export type { LeasedApp, ReadyApp, RepoLease } from './apps/registry.ts'
+export {
+  DSH_REPOS_SERVICE,
+  FEISHU_ACTIONS_SERVICE,
+  FEISHU_ACTIONS_VERSION,
+  LOG_ANALYSIS_FEATURE,
+  LOGALYZE_APPLICATIONS_SERVICE,
+  lookupActions,
+  lookupRepos,
+  lookupReposV8,
+  MR_REVIEW_FEATURE,
+}
 export type { LogalyzeConfig } from './config.ts'
 
-/** Cordis plugin name. */
+/** Cordis plugin name (kept stable for host loader and `cordis.patch.yml` compatibility). */
 export const name = 'logalyze'
 
 /** Host services the plugin needs before `apply()`. */
@@ -51,12 +60,9 @@ export interface LogalyzePluginOptions extends ServiceOptions {
 }
 
 /**
- * Install the entry skill, the bundled guide skills, the dispatch, SKILL
- * view and improvement, and repository
- * onboarding tools, the settings routes, and the analyze route, then mirror
- * or update the application repositories (the dsh-repo catalog repositories
- * with the log analysis feature) in the background, again after each catalog
- * or host change in dsh-repo.
+ * Install the supervision runtime, entry skill, bundled guide skills, analysis and
+ * SKILL improvement tools, settings routes, and analyze route, then follow `dsh-repo`
+ * catalog and host changes for both `log-analysis` and `mr-review` features.
  * @param ctx - plugin context.
  * @param config - loader-validated configuration.
  * @param options - test seams.
@@ -72,7 +78,7 @@ export function apply(ctx: HostContext, config?: unknown, options: LogalyzePlugi
     void service.boot().catch((error: unknown) => {
       ctx.logger?.error?.('logalyze: 启动失败：%s', messageOf(error))
     })
-    return () => { service.shutdown() }
+    return () => service.shutdown()
   }, 'logalyze: repositories')
   // Check reports waiting for their first turn whenever the Feishu channel plugin's service appears.
   ctx.inject?.([FEISHU_TOPICS_SERVICE], () => {
@@ -81,8 +87,8 @@ export function apply(ctx: HostContext, config?: unknown, options: LogalyzePlugi
     })
   })
   // Whenever dsh-repo's service appears, including after it reloads: register
-  // the log analysis feature, follow its catalog and host changes, and take the
-  // application repositories from the catalog again.
+  // both `log-analysis` and `mr-review` features, follow catalog and host changes,
+  // and take the enabled repositories from the catalog again.
   ctx.inject?.([DSH_REPOS_SERVICE], (child) => {
     const lookup = lookupRepos(child.get?.(DSH_REPOS_SERVICE))
     if (lookup.availability === 'ready') child.effect(() => service.watchRepos(lookup.service), 'logalyze: dsh-repo catalog')

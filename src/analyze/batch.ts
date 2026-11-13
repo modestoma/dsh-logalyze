@@ -8,6 +8,7 @@
  */
 
 import type { PlatformLog } from '../platform/client.ts'
+import { applicationKey } from '../settings/applications.ts'
 import type { AppManifest } from '../settings/contract.ts'
 
 /** A batch that passed every check, with its logs in request order. */
@@ -84,12 +85,12 @@ export function resolveBatch(logIds: readonly string[], found: readonly Platform
   if (logs.some(log => log.error_code !== first.error_code)) {
     return { ok: false, error: `这批日志的 error_code 不一致：${groups(logs, 'error_code')}；一次请求只能分析同一错误码的日志` }
   }
-  const matches = apps.filter(app => app.id === componentCode || app.aliases.includes(componentCode))
+  const matches = apps.filter(app => [app.id, app.name, ...app.aliases].some(value => applicationKey(value) === applicationKey(componentCode)))
   if (matches.length === 0) {
-    return { ok: false, error: `component_code ${componentCode} 没有对应的应用：请在该应用仓库 .agents/logalyze.yaml 的 aliases 里加上它（应用的仓库也要在 dsh-repo 中打开「日志分析」并同步完成）` }
+    return { ok: false, error: `component_code ${componentCode} 没有对应的应用：请在智能监管设置的应用触发别名中加上它（应用的仓库也要在 dsh-repo 中打开「日志分析」并同步完成）` }
   }
   if (matches.length > 1) {
-    return { ok: false, error: `component_code ${componentCode} 同时对应多个应用（${matches.map(app => app.id).join('、')}）：请只在一个应用的 id 或 aliases 里保留它` }
+    return { ok: false, error: `component_code ${componentCode} 同时对应多个应用（${matches.map(app => app.id).join('、')}）：请在智能监管设置中移除冲突别名，或提供唯一应用 id` }
   }
   const [app] = matches
   if (app === undefined) return { ok: false, error: `component_code ${componentCode} 没有对应的应用` }

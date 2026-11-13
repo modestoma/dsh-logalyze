@@ -53,6 +53,17 @@ const CSS = `
 .lz__addRow .lz__input--branch{flex:0 1 140px}
 .lz__addRow--flush{padding:6px 0 0}
 .lz__addForm{display:flex;flex-direction:column;gap:6px;padding:10px 14px}
+.lz__appForm{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+.lz__appForm .lz__field{flex:none}
+.lz__aliasInput{display:flex;align-items:center;gap:8px;margin-top:6px}
+.lz__appForm .lz__aliasInput .lz__input{flex:1 1 auto;width:0}
+.lz__aliases{display:flex;flex-wrap:wrap;gap:6px;margin:0;padding:0;list-style:none}
+.lz__alias{display:inline-flex;align-items:center;gap:4px;max-width:100%;box-sizing:border-box;padding:3px 4px 3px 10px;border:1px solid var(--lz-line);border-radius:6px;background:var(--lz-hover);color:var(--lz-fg2);font-size:12px;line-height:20px}
+.lz__aliasLabel{min-width:0;overflow-wrap:anywhere}
+.lz__aliasRemove{display:inline-flex;align-items:center;justify-content:center;flex:none;width:24px;height:24px;border:0;border-radius:4px;background:transparent;color:var(--lz-fg3);font:inherit;font-size:16px;cursor:pointer}
+.lz__aliasRemove:hover:not(:disabled){background:var(--lz-hover);color:var(--lz-bad)}
+.lz__aliasRemove:disabled{color:var(--lz-dim);cursor:default}
+.lz__aliasRemove:focus-visible{outline:2px solid var(--lz-accent);outline-offset:2px}
 .lz__field{display:flex;flex-direction:column;gap:2px;flex:1 1 160px;color:var(--lz-fg3);font-size:12px}
 .lz__field .lz__input{flex:none;width:100%}
 .lz__btn--end{align-self:flex-end;height:30px}

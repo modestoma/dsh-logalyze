@@ -1,6 +1,5 @@
 /**
- * 子 Agent 首条消息。首行的 `/<skill>` 由 DSH 的 skill 手势确定性注入应用的
- * 日志分析 SKILL（子 Agent 首条消息的来源是 user）。
+ * 子 Agent 首条消息：代码快照、日志与可选 SKILL 使用方式。
  *
  * @module dsh-logalyze/dispatch/prompt
  */
@@ -51,7 +50,7 @@ function multiLogSection(count: number): string {
 /**
  * Render the child's first message.
  * @param input - application, question, logs, writable directory, and whether SKILL gaps are recorded.
- * @returns prompt text whose first line is the `/<skill>` gesture.
+ * @returns prompt text; DSH discovers optional skills at the child working directory.
  */
 export function renderChildPrompt(input: ChildPromptInput): string {
   const { app, commit, question, logs, workDir, gaps } = input
@@ -62,9 +61,7 @@ export function renderChildPrompt(input: ChildPromptInput): string {
     const filter = log.filter === undefined ? '' : `；只看本应用相关部分：${log.filter}`
     return `- \`${log.path}\`${origin}${filter}`
   })
-  return `/${app.skill}
-
-你是观象派发的日志分析子任务，负责应用「${app.name}」（id: \`${app.id}\`）。当前工作目录是该应用的代码仓库，检出提交 \`${commit.slice(0, 12)}\`。
+  return `你是观象派发的日志分析子任务，负责应用「${app.name}」（id: \`${app.id}\`）。当前工作目录是该应用的代码仓库，检出提交 \`${commit.slice(0, 12)}\`。
 
 ## 问题
 
@@ -74,14 +71,14 @@ ${question}
 
 ${logLines.join('\n')}
 
-日志可能是压缩包，按上面加载的日志分析 SKILL 处理；需要解压时解压到运行目录。
+日志可能是压缩包，需要解压时解压到运行目录。按 DSH 提供的 SKILL 目录判断适用性，按需加载仓库或宿主 SKILL；没有适用 SKILL 时直接分析日志与代码。
 ${logs.length > 1 ? multiLogSection(logs.length) : ''}
 ## 工作约束
 
 - 应用仓库只读：不要修改、新建或删除仓库中的文件，不要执行任何 git 写操作。
 - 解压结果和中间文件只放在运行目录 \`${workDir}\`。
 - 日志可能来自与当前代码不同的版本；行号或逻辑对不上时，在结论中说明版本差异。
-${gaps ? gapSection(app.skill, workDir) : ''}
+${gaps && app.skill !== undefined ? gapSection(app.skill, workDir) : ''}
 ## 返回格式
 
 最终回复只包含以下五部分：

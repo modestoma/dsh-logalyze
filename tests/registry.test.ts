@@ -35,7 +35,7 @@ describe('repository registry', () => {
     expect(registry.readyApps().map(app => app.app.id)).toEqual(['order-service'])
   })
 
-  it('records catalog access without syncing again and offers only writable repositories for drafting', async () => {
+  it('records catalog access without syncing again and keeps repositories without manifests usable', async () => {
     const { root, registry } = await setup()
     const origin = await createAppRepo(join(root, 'origin'))
     const bare = await createAppRepo(join(root, 'bare'))
@@ -43,12 +43,11 @@ describe('repository registry', () => {
     git(bare, 'commit', '-qm', 'drop manifest')
     registry.configure([{ url: origin, writable: false }, { url: bare, writable: false }])
     await registry.syncAll()
-    expect(registry.status()).toMatchObject([{ url: origin, available: true, writable: false }, { url: bare, available: false, writable: false }])
+    expect(registry.status()).toMatchObject([{ url: origin, available: true, writable: false }, { url: bare, available: true, writable: false }])
     expect(registry.readyApp('order-service').writable).toBe(false)
-    expect(registry.setupPending()).toEqual([])
     expect(registry.configure([{ url: origin, writable: true }, { url: bare, writable: true }])).toEqual([])
     expect(registry.readyApp('order-service').writable).toBe(true)
-    expect(registry.setupPending()).toEqual([bare])
+    expect(registry.readyApps()).toHaveLength(2)
   })
 
   it('updates to the remote head and follows a configured branch', async () => {
@@ -95,7 +94,7 @@ describe('repository registry', () => {
     expect(registry.status()[0]).toMatchObject({ phase: 'ready', available: true })
   })
 
-  it('marks a repository without a manifest as failed', async () => {
+  it('readies a repository without a manifest or skill', async () => {
     const { root, registry } = await setup()
     const origin = join(root, 'bare-app')
     await mkdir(origin)
@@ -105,8 +104,9 @@ describe('repository registry', () => {
     git(origin, '-c', 'user.name=t', '-c', 'user.email=t@e', 'commit', '-qm', 'init')
     registry.configure([{ url: origin, writable: true }])
     await registry.syncAll()
-    expect(registry.status()[0]).toMatchObject({ phase: 'failed', available: false, error: '仓库缺少应用描述 .agents/logalyze.yaml' })
-    expect(registry.readyApps()).toEqual([])
+    expect(registry.status()[0]).toMatchObject({ phase: 'ready', available: true })
+    expect(registry.readyApps()[0]?.app).toMatchObject({ name: 'bare-app', description: '', aliases: [] })
+    expect(registry.readyApps()[0]?.app.skill).toBeUndefined()
   })
 
   it('reports clone failures', async () => {
@@ -129,7 +129,7 @@ describe('repository registry', () => {
     await expect(registry.acquire(['order-service'])).rejects.toThrow('不在应用注册表中')
     repos.value = { version: 1 }
     await registry.resyncAll()
-    expect(registry.status()[0]?.error).toContain('服务与观象不兼容')
+    expect(registry.status()[0]?.error).toContain('与智能监管不兼容')
     repos.value = service
     await registry.resyncAll()
     expect(registry.status()[0]).toMatchObject({ phase: 'ready', available: true })
@@ -165,7 +165,7 @@ describe('repository registry', () => {
     const head = await commitFile(origin, MANIFEST_PATH, manifest)
     await registry.syncAll()
     expect(registry.status()[0]).toMatchObject({ commit: head, activeRuns: 1 })
-    expect(registry.readyApps()[0]?.app.logHints).toContain('NewHint')
+    expect(registry.readyApps()[0]?.app.logHints).not.toContain('NewHint')
     expect(await readFile(join(held!.dir, MANIFEST_PATH), 'utf8')).not.toContain('NewHint')
 
     const next = await registry.acquire(['order-service'])
@@ -196,7 +196,7 @@ describe('repository registry', () => {
     expect(registry.status()[0]?.commit).toBe(head)
   })
 
-  it('reports a manifest that is a symbolic link as unreadable', async () => {
+  it('reports a skipped legacy symlink import while keeping code analysis usable', async () => {
     const { root, registry } = await setup()
     const origin = await createAppRepo(join(root, 'origin'))
     await rename(join(origin, MANIFEST_PATH), join(origin, '.agents', 'real.yaml'))
@@ -205,7 +205,7 @@ describe('repository registry', () => {
     git(origin, 'commit', '-qm', 'link')
     registry.configure([{ url: origin, writable: true }])
     await registry.syncAll()
-    expect(registry.status()[0]).toMatchObject({ phase: 'failed', error: `无法读取 ${MANIFEST_PATH}：${MANIFEST_PATH} 不是普通文件（不接受符号链接等）` })
+    expect(registry.status()[0]).toMatchObject({ phase: 'ready', available: true, error: expect.stringContaining(`旧应用配置未迁移：${MANIFEST_PATH} 不是普通文件`) })
   })
 
   it('releases every application when a snapshot cannot be created', async () => {

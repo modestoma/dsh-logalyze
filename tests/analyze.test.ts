@@ -90,7 +90,7 @@ async function harness(services: Record<string, unknown>, config: Record<string,
   const repos = new FakeRepos(join(dir, 'mirrors'))
   repos.setCatalog([{ url: await createAppRepo(join(dir, 'order-service')) }])
   const routes = new Map<string, Handler>()
-  const disposers: (() => void)[] = []
+  const disposers: (() => Promise<void>)[] = []
   const warn = vi.fn()
   const webServer = {
     register: (route: { path: string; handler: Handler }) => {
@@ -107,16 +107,17 @@ async function harness(services: Record<string, unknown>, config: Record<string,
     logger: { warn },
     get: (name: string) => all[name],
     on: () => () => {},
+    provide: (name, value) => { all[name] = value; return () => { delete all[name] } },
     effect: (callback) => {
       const dispose = callback()
-      const wrapped = (): void => { dispose?.() }
+      const wrapped = async (): Promise<void> => { await dispose?.() }
       disposers.push(wrapped)
-      return wrapped
+      return () => { void wrapped() }
     },
     // Like Cordis, the callback runs only once every dependency is present.
     inject: (deps, callback) => { if (deps.every(dep => all[dep] !== undefined)) callback(ctx) },
   }
-  apply(ctx, config, { overlayPath: join(dir, 'settings.json'), analysesDir: join(dir, 'analyses'), legacyReportsDir: join(dir, 'reports') })
+  apply(ctx, config, { overlayPath: join(dir, 'settings.json'), analysesDir: join(dir, 'analyses'), legacyReportsDir: join(dir, 'reports'), supervisorDir: join(dir, 'supervisor') })
   const server: Server = createServer((req, res) => {
     const handler = routes.get(new URL(req.url ?? '/', 'http://x').pathname)
     if (handler === undefined) {
@@ -128,7 +129,7 @@ async function harness(services: Record<string, unknown>, config: Record<string,
   })
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   cleanups.push(async () => {
-    for (const dispose of disposers.reverse()) dispose()
+    for (const dispose of disposers.reverse()) await dispose()
     await new Promise(resolve => server.close(resolve))
     await cleanup()
   })
@@ -233,6 +234,8 @@ describe('analysis batch', () => {
     expect(resolved.ok && resolved.value).toMatchObject({ componentCode: 'order', errorCode: 'E1001' })
     const byId = resolveBatch([logUuid(1)], [platformLog(orderLog(1, { component_code: 'pay-service' }))], [ORDER, PAY])
     expect(byId.ok && byId.value.app.id).toBe('pay-service')
+    const fullwidth = resolveBatch([logUuid(1)], [platformLog(orderLog(1, { component_code: ' ＯＲＤＥＲ ' }))], [ORDER, PAY])
+    expect(fullwidth.ok && fullwidth.value.app.id).toBe('order-service')
   })
 
   it('lists every log that cannot be analyzed', () => {
@@ -261,8 +264,8 @@ describe('analysis batch', () => {
 
   it('refuses a component code with no application or with several', () => {
     const none = resolveBatch([logUuid(1)], [platformLog(orderLog(1))], [PAY])
-    expect(none.ok === false && none.error).toContain('component_code order 没有对应的应用：请在该应用仓库 .agents/logalyze.yaml 的 aliases 里加上它')
-    const several = resolveBatch([logUuid(1)], [platformLog(orderLog(1))], [ORDER, { ...PAY, aliases: ['order'] }])
+    expect(none.ok === false && none.error).toContain('component_code order 没有对应的应用：请在智能监管设置的应用触发别名中加上它')
+    const several = resolveBatch([logUuid(1)], [platformLog(orderLog(1))], [ORDER, { ...PAY, aliases: ['ORDER'] }])
     expect(several.ok === false && several.error).toContain('同时对应多个应用（order-service、pay-service）')
   })
 })
@@ -358,6 +361,7 @@ describe('analyze route', () => {
       secret: { tokenEnv: 'LOGALYZE_PLATFORM_CLIENT_SECRET', configured: false, writable: true },
       platformProblem: expect.stringContaining('缺少接口地址、令牌地址、client_id'),
       topics: 'missing',
+      actions: 'missing',
       reports: [],
       legacyReports: [],
     })

@@ -11,7 +11,7 @@ import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
 import type { LogalyzeService } from '../service.ts'
 import { HttpError, mediaTypeOf, readBody, sendJson } from '../util/http.ts'
 import { SettingsError } from './controller.ts'
-import { REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from './contract.ts'
+import { APPLICATION_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
@@ -89,6 +89,13 @@ function guarded(gate: HostRequestGate, methods: readonly string[], handler: Web
  */
 export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: LogalyzeService): () => void {
   const disposers = [
+    server.register({
+      kind: 'exact',
+      path: APPLICATION_ROUTE,
+      handler: guarded(gate, ['PUT'], async (req, res) => {
+        sendJson(res, 200, { ok: true, state: await service.saveApplication(await readJsonBody(req)) })
+      }),
+    }),
     server.register({
       kind: 'exact',
       path: STATE_ROUTE,

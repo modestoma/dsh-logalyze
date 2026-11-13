@@ -302,6 +302,19 @@ describe('logalyze_improve_skill', () => {
     expect(text).toContain('改进子 Agent 的说明：\n- SKILL.md：补充 traceId')
   })
 
+  it('keeps code-only applications analyzable and refuses legacy improvement before opening a workspace', async () => {
+    const { root, origin, registry, improver, agent, repos, started } = await setup()
+    const code = await createAppRepo(join(root, 'code-only'), { '.agents/logalyze.yaml': 'id: code-only\nname: 代码应用\ndescription: 代码直读\n' })
+    git(code, 'rm', '-qr', '.agents/skills')
+    git(code, 'commit', '-qm', 'no skill')
+    registry.configure([{ url: origin, writable: true }, { url: code, writable: true }])
+    await registry.syncAll()
+    expect(registry.readyApp('code-only').app.skill).toBeUndefined()
+    await expect(improver.execute({ app: 'code-only', feedback: '创建排查知识' }, { signal: new AbortController().signal, agent })).rejects.toThrow('创建初版 SKILL 待知识改进功能接入')
+    expect(repos.service.creates).toEqual([])
+    expect(started).toEqual([])
+  })
+
   it('merges every improvement point of an application into one child', async () => {
     const { root, origin, task, improver, agent, repos, started, skill } = await setup(false)
     const second = join(root, 'project', '.logalyze', 'runs', 'r2', '1-order-service')

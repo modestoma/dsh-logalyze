@@ -191,7 +191,7 @@ export class FakeRepos implements DshRepos {
     this.acquires.push(params)
     if (this.snapshotError !== undefined) throw this.snapshotError
     const { repo } = params
-    const mirror = await this.sync(repo)
+    const mirror = await this.sync(repo, params.signal)
     const commit = await this.resolve(mirror, params.ref ?? this.catalog.find(entry => entry.url === repo)?.base)
     const path = join(this.root, '.snapshots', basename(mirror), commit.slice(0, 12))
     if (!await exists(path)) {
@@ -223,7 +223,7 @@ export class FakeRepos implements DshRepos {
     const mirror = await this.sync(repo)
     const base = params.base ?? this.catalog.find(entry => entry.url === repo)?.base ?? (await git(mirror, ['symbolic-ref', '--short', 'HEAD'])).trim()
     // Like dsh-repo's default template `dsh/{session}`.
-    const branch = params.branch ?? `dsh/${params.agent.session?.header.id.replace(/[^A-Za-z0-9]/g, '').slice(0, 8).toLowerCase() || 'nosession'}`
+    const branch = params.branch ?? `dsh/${params.agent?.session?.header.id.replace(/[^A-Za-z0-9]/g, '').slice(0, 8).toLowerCase() || 'nosession'}`
     if (branch === base) throw repoError('invalid', `不能推送到基线分支 ${branch}`)
     const existing = (await git(mirror, ['for-each-ref', '--format=%(objectname)', `refs/heads/${branch}`])).trim()
     if (existing !== '' && params.commit !== undefined) throw repoError('invalid', `远端已有分支 ${branch}，不能指定起始提交`)
@@ -284,7 +284,7 @@ export class FakeRepos implements DshRepos {
     for (const file of (await git(path, ['diff', '--name-only', '--diff-filter=AM', baseCommit, commit])).split('\n').filter(Boolean)) {
       files[file] = await git(path, ['cat-file', 'blob', `${commit}:${file}`])
     }
-    this.pushes.push({ path, branch, message: params.message, session: params.agent.session?.header.id, callId: params.callId, commit, files, mr: params.mr })
+    this.pushes.push({ path, branch, message: params.message, session: params.agent?.session?.header.id, callId: params.callId, commit, files, mr: params.mr })
     const result = { branch, commit }
     if (params.mr === undefined) return { ...result, openMrs: [] }
     if (this.openMr === undefined) return { ...result, openMrs: [], mrError: this.mrError }
@@ -303,10 +303,13 @@ export class FakeRepos implements DshRepos {
   }
 
   /** Clone or fetch the mirror of an address. */
-  private async sync(url: string): Promise<string> {
+  private async sync(url: string, signal?: AbortSignal): Promise<string> {
     if (!acceptedAddress(url)) throw repoError('invalid', `只支持 HTTPS 地址、file: URL 和本机绝对路径：${url}`)
     if (this.mirrorUnset) throw repoError('unavailable', '镜像目录未设置：请到「代码仓库」设置页的「高级」里选择一个目录')
-    if (this.stalled) return await new Promise(() => {})
+    if (this.stalled) return await new Promise((_resolve, reject) => {
+      if (signal?.aborted === true) { reject(signal.reason); return }
+      signal?.addEventListener('abort', () => { reject(signal.reason) }, { once: true })
+    })
     const dir = this.mirrorDir(url)
     try {
       if (await exists(dir)) await git(dir, ['fetch', '-q', '--prune', 'origin', '+refs/heads/*:refs/heads/*'])

@@ -107,7 +107,8 @@ describe('logalyze_dispatch', () => {
     expect(child?.spec).toMatchObject({ provider: 'spawn', label: '订单服务分析', delivery: 'caller', parent, maxDepth: 1 })
     expect(child?.spec.cwd).toBe(join(repos.root, '.snapshots', basename(repos.mirrorDir(registry.status()[0]!.url)), registry.status()[0]!.commit!.slice(0, 12)))
     const prompt = child?.spec.prompt[0]?.text as string
-    expect(prompt.split('\n')[0]).toBe('/log-analysis')
+    expect(prompt).not.toMatch(/^\/log-analysis/u)
+    expect(prompt).toContain('没有适用 SKILL 时直接分析日志与代码')
     const workDir = join(project, 'sample-logs', '.logalyze', 'runs')
     expect(prompt).toContain(`- \`${log}\``)
     expect(prompt).toContain(`（下载自 http://127.0.0.1:${port}/bucket/app.tar.gz?sig=x）；只看本应用相关部分：tag=order`)

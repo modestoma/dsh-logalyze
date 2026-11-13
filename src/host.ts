@@ -11,6 +11,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { FEISHU_TOPICS_STATUS_EVENT, TopicLaunchState } from './deps/topics-contract.ts'
+import type { StorageDomainFacility } from './runtime/storage.ts'
 
 /** One model-facing content block (text is the only kind this plugin produces). */
 export interface ContentBlock {
@@ -89,26 +90,29 @@ export interface SkillInvocationPolicy {
   readonly userInvocable: boolean
 }
 
-/** One provider catalog entry. */
-export interface SkillCandidate {
+/** One invocation-neutral DSH skill summary. */
+export interface SkillSummary {
+  readonly path?: string
+  readonly resourceBase?:
+    | { readonly kind: 'directory'; readonly path: string }
+    | { readonly kind: 'url'; readonly url: string }
+    | { readonly kind: 'opaque'; readonly description: string }
   readonly name: string
   readonly description: string
   readonly whenToUse?: string
   readonly invocation: SkillInvocationPolicy
   readonly source: string
   readonly provider: string
+}
+
+/** One provider catalog entry. */
+export interface SkillCandidate extends SkillSummary {
   readonly rank: number
   readonly locator: unknown
 }
 
 /** A loaded skill body. */
-export interface SkillDefinition {
-  readonly name: string
-  readonly description: string
-  readonly whenToUse?: string
-  readonly invocation: SkillInvocationPolicy
-  readonly source: string
-  readonly provider: string
+export interface SkillDefinition extends SkillSummary {
   readonly content: string
 }
 
@@ -133,6 +137,10 @@ export interface SkillProviderControl {
 
 /** The `ctx.skills` registry slice. */
 export interface SkillRegistry {
+  /** DSH registry readers; small embedding hosts may omit these and receive an explicit discovery error. */
+  snapshot?(options: SkillLookupOptions & { readonly scope?: Agent }): Promise<{ readonly skills: readonly SkillSummary[]; readonly complete: boolean }>
+  list?(options: SkillLookupOptions & { readonly scope?: Agent }): Promise<readonly SkillSummary[]>
+  get?(name: string, options: SkillLookupOptions & { readonly scope?: Agent }): Promise<SkillDefinition | undefined>
   registerProvider(create: (control: SkillProviderControl) => SkillProvider): () => void
 }
 
@@ -224,8 +232,10 @@ export interface HostContext {
   readonly tools: ToolRegistry
   readonly skills: SkillRegistry
   readonly subagents: SubagentService
+  readonly storageDomain?: StorageDomainFacility
   readonly logger?: HostLogger
   get?(name: string): unknown
+  provide?(name: string, value: unknown): () => void | Promise<void>
   /**
    * Listen to the post-commit append feed of every Session (`session/event`).
    * @param name - the event name.
@@ -240,6 +250,6 @@ export interface HostContext {
    * @returns the disposer.
    */
   on(name: typeof FEISHU_TOPICS_STATUS_EVENT, listener: (state: TopicLaunchState) => void): () => unknown
-  effect(callback: () => (() => void) | void, label?: string): () => unknown
+  effect(callback: () => (() => void | Promise<void>) | void, label?: string): () => unknown
   inject?(dependencies: string[], callback: (child: HostContext) => void): unknown
 }

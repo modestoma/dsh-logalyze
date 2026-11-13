@@ -43,7 +43,7 @@ async function harness(services: Record<string, unknown> = {}): Promise<Harness>
   const routes = new Map<string, Handler>()
   const tools: Harness['tools'] = []
   const skills: SkillProvider[] = []
-  const disposers: (() => void)[] = []
+  const disposers: (() => Promise<void>)[] = []
   const rejection: Harness['rejection'] = { value: undefined }
   const sessionListeners: Harness['sessionListeners'] = []
   const statusListeners: Harness['statusListeners'] = []
@@ -71,11 +71,12 @@ async function harness(services: Record<string, unknown> = {}): Promise<Harness>
       listeners.push(listener)
       return () => { listeners.splice(listeners.indexOf(listener), 1) }
     },
+    provide: (name, value) => { services[name] = value; return () => { delete services[name] } },
     effect: (callback) => {
       const dispose = callback()
-      const wrapped = (): void => { dispose?.() }
+      const wrapped = async (): Promise<void> => { await dispose?.() }
       disposers.push(wrapped)
-      return wrapped
+      return () => { void wrapped() }
     },
     inject: (_deps, callback) => { callback(ctx) },
   }
@@ -93,7 +94,7 @@ async function harness(services: Record<string, unknown> = {}): Promise<Harness>
   return {
     ctx, repos, tools, skills, base, rejection, sessionListeners, statusListeners,
     dispose: async () => {
-      for (const dispose of disposers.reverse()) dispose()
+      for (const dispose of disposers.reverse()) await dispose()
       await new Promise(resolve => server.close(resolve))
       await cleanup()
     },
@@ -140,8 +141,8 @@ describe('plugin', () => {
     h.repos.setCatalog([{ url: origin }])
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
     expect(h.skills.map(skill => skill.name)).toEqual(['dsh-logalyze'])
-    expect(h.tools.map(tool => tool.definition.name)).toEqual(['logalyze_dispatch', 'logalyze_improve_skill', 'logalyze_show_skill', 'logalyze_init_repo', 'logalyze_submit_init'])
-    const [tool, improve, show, init, submit] = h.tools
+    expect(h.tools.map(tool => tool.definition.name)).toEqual(['logalyze_dispatch', 'logalyze_improve_skill', 'logalyze_show_skill'])
+    const [tool, improve, show] = h.tools
     const signal = new AbortController().signal
     const step = (depth?: number) => ({ agent: { id: 'a', session: { header: { id: 'a', ...depth === undefined ? {} : { delegationDepth: depth } } } }, signal })
     // The condition waits for the first sync, so a step prepared during startup still sees the cloned application.
@@ -152,16 +153,15 @@ describe('plugin', () => {
     expect(await improve!.when?.(step(1))).toBe(false)
     expect(await show!.when?.(step())).toBe(true)
     expect(await show!.when?.(step(1))).toBe(false)
-    // Drafting needs a repository without an application, submitting a draft.
-    expect(await init!.when?.(step())).toBe(false)
-    expect(await submit!.when?.(step())).toBe(false)
     const [candidate] = await h.skills[0]!.list({})
     expect((await h.skills[0]!.get(candidate!, {}))?.content).toContain('`order-service`')
     // The improvement tool and report tracking read the Session event feed; reports also follow launch states.
     expect(h.sessionListeners).toHaveLength(1)
     expect(h.statusListeners).toHaveLength(1)
-    // The log analysis feature is registered with dsh-repo while the plugin runs.
+    // Both log-analysis and mr-review features are registered with dsh-repo while the plugin runs.
     expect(h.repos.features.get('log-analysis')).toMatchObject({ id: 'log-analysis', title: '日志分析' })
+    expect(h.repos.features.get('mr-review')).toMatchObject({ id: 'mr-review', title: 'MR 自动评审' })
+    expect(h.ctx.get?.('logalyzeApplications')).toBeDefined()
     // A repository the catalog lists as read-only is analyzed, but its SKILL cannot be improved.
     h.repos.catalog = h.repos.catalog.map(repo => ({ ...repo, access: 'read' }))
     h.repos.emitReposChange()
@@ -185,28 +185,21 @@ describe('plugin', () => {
     }
   })
 
-  it('offers drafting while a writable catalog repository lacks a description', async () => {
+  it('keeps a repository with an invalid legacy manifest usable without offering initialization', async () => {
     const { dir, cleanup } = await tempDir()
     cleanups.push(cleanup)
-    const local = await createAppRepo(join(dir, 'order-service'))
-    await commitFile(local, '.agents/logalyze.yaml', 'not: [valid')
-    const origin = 'https://git.example.com/shop/order-service.git'
+    const origin = await createAppRepo(join(dir, 'order-service'))
+    await commitFile(origin, '.agents/logalyze.yaml', 'not: [valid')
     const h = await harness()
     cleanups.push(h.dispose)
-    h.repos.origins.set(origin, local)
     h.repos.setCatalog([{ url: origin }])
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
-    const [, , , init] = h.tools
-    const step = { agent: { id: 'a', session: { header: { id: 'a' } } }, signal: new AbortController().signal, callId: 'call-1' }
-    expect(await init!.when?.(step)).toBe(true)
+    const step = { agent: { id: 'a', session: { header: { id: 'a' } } }, signal: new AbortController().signal }
+    expect(await h.tools[0]!.when?.(step)).toBe(true)
     const state = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
-    expect(state.repos).toMatchObject([{ url: origin, available: false, writable: true }])
+    expect(state.repos).toMatchObject([{ url: origin, available: true, writable: true, error: expect.stringContaining('旧应用配置未迁移') }])
+    expect(h.tools.map(tool => tool.definition.name)).not.toContain('logalyze_init_repo')
     expect(state.settings).not.toHaveProperty('repos')
-
-    // A read-only entry is analyzed only, so nothing is drafted for it.
-    h.repos.catalog = h.repos.catalog.map(repo => ({ ...repo, access: 'read' }))
-    h.repos.emitReposChange()
-    await waitFor(async () => await init!.when?.(step) === false)
   })
 
   it('follows the dsh-repo catalog: repositories with the log analysis feature are the application repositories', async () => {
@@ -256,14 +249,14 @@ describe('plugin', () => {
     await waitFor(async () => (await json<StateWire>(await fetch(`${h.base}/logalyze/state`))).repos[0]?.phase === 'ready')
 
     await addHint('PushedHint')
-    expect((await provider.get(candidate!, {}))?.content).toContain('`PushedHint`')
+    expect((await provider.get(candidate!, {}))?.content).not.toContain('`PushedHint`')
 
     h.repos.stalled = true
     await addHint('LateHint')
     const started = Date.now()
     const content = (await provider.get(candidate!, {}))?.content
     expect(Date.now() - started).toBeLessThan(5000)
-    expect(content).toContain('`PushedHint`')
+    expect(content).not.toContain('`PushedHint`')
     expect(content).not.toContain('LateHint')
     await expect(provider.get(candidate!, { signal: AbortSignal.abort(new Error('stop')) })).rejects.toThrow('stop')
   })
@@ -288,6 +281,44 @@ describe('plugin', () => {
         expect((await provider.list({ cwd })).map(skill => skill.name)).toEqual(['logalyze-kit', 'logalyze-improve'])
       }
     }
+  })
+
+  it('persists application metadata through guarded HTTP routes without changing the repository catalog, and tracks mr-review repositories', async () => {
+    const { dir, cleanup } = await tempDir()
+    cleanups.push(cleanup)
+    const origin = await createAppRepo(join(dir, 'order-service'))
+    const mrOnly = await createAppRepo(join(dir, 'mr-only'))
+    const h = await harness()
+    cleanups.push(h.dispose)
+    h.repos.catalog = [
+      { id: '000000000001', url: origin, base: 'main', access: 'write', features: [{ id: 'log-analysis' }, { id: 'mr-review' }] },
+      { id: '000000000002', url: mrOnly, base: 'develop', access: 'read', features: [{ id: 'mr-review', branch: 'release' }] },
+    ]
+    apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
+    const step = { agent: { id: 'a', session: { header: { id: 'a' } } }, signal: new AbortController().signal }
+    await h.tools[0]!.when?.(step)
+    const initialState = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
+    expect(initialState.mrRepos).toEqual([
+      { url: origin, branch: 'main', base: 'main', writable: true },
+      { url: mrOnly, branch: 'release', base: 'develop', writable: false },
+    ])
+    const payload = { url: origin, description: '面板描述', aliases: ['orders-v2', '订单新版'] }
+    const put = (body: unknown, headers: Record<string, string> = {}) => fetch(`${h.base}/logalyze/applications`, { method: 'PUT', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) })
+    const catalog = structuredClone(h.repos.catalog)
+    h.rejection.value = 401
+    expect((await put(payload)).status).toBe(401)
+    h.rejection.value = undefined
+    expect((await put(payload, { origin: 'https://elsewhere.test' })).status).toBe(403)
+    expect((await put({ ...payload, branch: 'other' })).status).toBe(400)
+    const response = await put(payload)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ ok: true, state: { repos: [{ app: { description: '面板描述', aliases: ['orders-v2', '订单新版'] } }] } })
+    expect(JSON.parse(await readFile(join(dir, 'applications.json'), 'utf8'))).toMatchObject({ applications: { [origin]: { description: '面板描述' } } })
+    expect(h.repos.catalog).toEqual(catalog)
+    expect((await put({ ...payload, aliases: ['order', 'ORDER'] })).status).toBe(400)
+    h.repos.setCatalog([])
+    await waitFor(async () => (await json<StateWire>(await fetch(`${h.base}/logalyze/state`))).repos.length === 0)
+    expect((await put(payload)).status).toBe(400)
   })
 
   it('serves the panel state and persists only overridden settings', async () => {
@@ -351,9 +382,20 @@ describe('plugin', () => {
     const state = async (): Promise<StateWire> => await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
 
     await waitFor(async () => (await state()).repos[0]?.available === true)
-    expect((await state()).dshRepo).toEqual({ availability: 'ready', mirrorDir: h.repos.root })
+    expect((await state()).dshRepo).toEqual({
+      availability: 'ready',
+      version: 7,
+      mrReviewReady: false,
+      mrReviewProblem: expect.stringContaining('服务版本 8'),
+      mirrorDir: h.repos.root,
+    })
     h.repos.mirrorUnset = true
-    expect((await state()).dshRepo).toEqual({ availability: 'ready' })
+    expect((await state()).dshRepo).toEqual({
+      availability: 'ready',
+      version: 7,
+      mrReviewReady: false,
+      mrReviewProblem: expect.stringContaining('服务版本 8'),
+    })
     h.repos.mirrorUnset = false
     expect((await fetch(`${h.base}/logalyze/hosts`, { method: 'POST' })).status).not.toBe(200)
     expect((await fetch(`${h.base}/logalyze/token`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tokenEnv: 'GITLAB_TOKEN', value: 'x' }) })).status).toBe(400)

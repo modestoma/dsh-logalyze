@@ -1,7 +1,7 @@
 {
   "name": "dsh-logalyze",
   "version": "0.0.0",
-  "description": "观象（dsh-logalyze）：DeepSeek Harness (DSH) 日志分析插件。/logalyze 识别日志所属应用，把分析派发给工作目录为该应用代码仓库的子 Agent；Web 左侧栏提供「观象」设置面板",
+  "description": "智能监管（dsh-logalyze）：DeepSeek Harness (DSH) AI 原生智能监管中心插件（观象日志监管 + 审微 MR 自动评审）；Web 左侧栏提供「智能监管」设置面板",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/modestoma/dsh-logalyze.git"

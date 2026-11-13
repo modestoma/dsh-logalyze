@@ -13,9 +13,3 @@ export const SHOW_TOOL_NAME = 'logalyze_show_skill'
 
 /** Drafts and submits one improvement of an application's SKILL after the user agreed in conversation. */
 export const IMPROVE_TOOL_NAME = 'logalyze_improve_skill'
-
-/** Drafts the application description and SKILL of a repository that lacks them. */
-export const INIT_REPO_TOOL_NAME = 'logalyze_init_repo'
-
-/** Submits a draft as a merge request. */
-export const SUBMIT_INIT_TOOL_NAME = 'logalyze_submit_init'

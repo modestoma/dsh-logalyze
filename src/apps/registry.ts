@@ -1,26 +1,21 @@
 /**
- * 应用注册表：经 dsh-repo 取仓库清单里打开了日志分析的仓库在日志分析分支最新
- * 提交的只读快照，从中读取各仓库的应用描述，对外提供「已就绪的应用」，并为每次
- * 派发持有该提交的快照。
- *
- * - 镜像、拉取、快照和令牌都由 dsh-repo 管理：每次读取取日志分析分支的快照，
- *   读完应用描述与 SKILL 即释放，不受正在进行的分析影响。快照在所有持有者释放
- *   后由 dsh-repo 清理。
- * - dsh-repo 不可用或更新失败时继续使用已有提交，并在状态里给出原因；应用描述
- *   或 SKILL 不合法时该应用不可用。
- * - 多个仓库声明同一个应用 id 时，这些仓库全部不可用。
- * - 记录每个仓库在清单中是否可写（权限「可改代码」或「可合并」）；只读仓库
- *   照常分析，但不起草接入、不改进 SKILL。
+ * 跟随 dsh-repo 启用的仓库，执行一次性旧版元数据迁移，并租借固定提交快照。
+ * 仓库缺少 manifest 或 SKILL 属于正常状态；仅当应用 id 重复冲突时标记不可用。
+ * 已移除或关闭「日志分析」的仓库拒绝新租借，已持有的快照租约保持固定提交不变。
  *
  * @module dsh-logalyze/apps/registry
  */
 
+import { z } from 'zod'
 import type { AppRepo, ReposClient } from '../deps/repos.ts'
 import type { SnapshotLease } from '../deps/repos-contract.ts'
-import type { AppManifest, RepoSpec, RepoStatusWire } from '../settings/contract.ts'
+import type { SkillRegistry } from '../host.ts'
+import { ApplicationSettings, applicationKey, applicationMetadataSchema } from '../settings/applications.ts'
+import type { ApplicationImport } from '../settings/applications.ts'
+import type { AppManifest, MrRepoStatusWire, RepoSpec, RepoStatusWire } from '../settings/contract.ts'
+import { SettingsError } from '../settings/controller.ts'
+import { SnapshotSkills } from '../skill/snapshot.ts'
 import { messageOf } from '../util/errors.ts'
-import { checkAppManifest } from './manifest.ts'
-import type { ManifestRead } from './manifest.ts'
 import { MAX_REPO_FILE_BYTES, treeReader } from './tree.ts'
 
 /** Collaborators of the registry. */
@@ -30,6 +25,8 @@ export interface RepoRegistryDeps {
   /** Called after any status change (sync start/end, configuration, leases). */
   readonly onChange: () => void
   readonly now?: () => number
+  readonly applications?: ApplicationSettings
+  readonly skills?: SkillRegistry
 }
 
 /** A usable application at its latest synced commit. */
@@ -37,7 +34,9 @@ export interface ReadyApp {
   readonly app: AppManifest
   readonly url: string
   readonly commit: string
-  /** Whether drafting setups and SKILL improvements may push to the repository. */
+  /** Selected analysis branch; independent of the version declared by a log. */
+  readonly branch?: string
+  /** Whether existing SKILL improvements may push to the repository. */
   readonly writable: boolean
 }
 
@@ -45,6 +44,8 @@ export interface ReadyApp {
 export interface LeasedApp extends ReadyApp {
   /** Read-only checkout of {@link ReadyApp.commit}; unchanged until the lease is released. */
   readonly dir: string
+  /** DSH discovery/loading at this held snapshot, including host skills. */
+  readonly skills: SnapshotSkills
 }
 
 /** Held snapshots of one dispatch; release exactly once. */
@@ -60,6 +61,7 @@ interface RepoEntry {
   commit?: string
   app?: AppManifest
   error?: string
+  migrationWarning?: string
   syncedAt?: number
   syncing?: Promise<void>
   activeRuns: number
@@ -67,23 +69,32 @@ interface RepoEntry {
   retired: boolean
 }
 
-/** Mirrors, updates, and indexes the configured application repositories. */
+/** Mirrors, updates, and indexes the configured application and MR-review repositories. */
 export class RepoRegistry {
   private entries: RepoEntry[] = []
+  private mrEntries: MrRepoStatusWire[] = []
   private readonly now: () => number
+  private readonly applications: ApplicationSettings
+  private saving: Promise<void> = Promise.resolve()
+  private closed = false
+  private readonly workAbort = new AbortController()
+  private readonly syncing = new Set<Promise<void>>()
+  private readonly acquiring = new Set<Promise<RepoLease>>()
 
   /** @param deps - service lookup and change notification. */
   constructor(private readonly deps: RepoRegistryDeps) {
     this.now = deps.now ?? Date.now
+    this.applications = deps.applications ?? new ApplicationSettings()
   }
 
   /**
-   * Replace the configured repositories. An address keeps its status when its
+   * Replace the configured log-analysis repositories. An address keeps its status when its
    * branch is unchanged; a change of access alone needs no sync.
    * @param repos - configured repositories.
    * @returns addresses that are new or changed and therefore need a sync.
    */
   configure(repos: readonly AppRepo[]): string[] {
+    if (this.closed) return []
     const previous = new Map(this.entries.map(entry => [entry.spec.url, entry]))
     const changed: string[] = []
     this.entries = repos.map(({ writable, ...spec }) => {
@@ -99,6 +110,21 @@ export class RepoRegistry {
     for (const entry of previous.values()) entry.retired = true
     this.deps.onChange()
     return changed
+  }
+
+  /**
+   * Replace the configured `mr-review` repositories from `dsh-repo`.
+   * @param repos - catalog repositories with `mr-review` enabled.
+   */
+  configureMrRepos(repos: readonly MrRepoStatusWire[]): void {
+    if (this.closed) return
+    this.mrEntries = repos.map(repo => ({ ...repo }))
+    this.deps.onChange()
+  }
+
+  /** @returns panel view of repositories with `mr-review` enabled in `dsh-repo`. */
+  mrStatus(): MrRepoStatusWire[] {
+    return this.mrEntries.map(repo => ({ ...repo }))
   }
 
   /**
@@ -122,14 +148,11 @@ export class RepoRegistry {
   /**
    * Sync every configured repository again after any sync already running for
    * it, so the new sync sees changes made since that sync started (a host
-   * token, for example). An idle repository starts syncing before this
-   * returns, so its status reads `syncing` at once.
-   * @returns when those syncs settled.
+   * token, for example).
    */
   async resyncAll(): Promise<void> {
     await Promise.all(this.entries.map(entry => entry.syncing === undefined
       ? this.syncEntry(entry)
-      // The running sync's outcome is superseded by the one started after it.
       : entry.syncing.then(() => undefined, () => undefined).then(() => this.syncEntry(entry))))
   }
 
@@ -137,7 +160,6 @@ export class RepoRegistry {
    * Sync the repositories that never synced or whose last sync is at least
    * `maxAgeMs` old, and join syncs already running.
    * @param maxAgeMs - age threshold; 0 syncs every repository.
-   * @returns when those syncs settled.
    */
   async refresh(maxAgeMs: number): Promise<void> {
     const now = this.now()
@@ -147,15 +169,13 @@ export class RepoRegistry {
   }
 
   /**
-   * Whether an address is configured.
-   * @param url - git address.
-   * @returns whether it is in the current configuration.
+   * Whether an address is configured for log analysis.
    */
   has(url: string): boolean {
     return this.entries.some(entry => entry.spec.url === url)
   }
 
-  /** @returns the panel view of every configured repository. */
+  /** @returns the panel view of every configured log-analysis repository. */
   status(): RepoStatusWire[] {
     const duplicates = this.duplicateIds()
     return this.entries.map((entry) => {
@@ -163,17 +183,28 @@ export class RepoRegistry {
       const conflict = duplicate !== undefined && duplicate.length > 1
         ? `应用 id「${entry.app?.id}」同时出现在 ${duplicate.join('、')}，这些仓库均不可用`
         : undefined
-      const phase = entry.syncing !== undefined ? 'syncing' : entry.app !== undefined ? 'ready' : entry.error !== undefined ? 'failed' : 'pending'
-      const error = conflict ?? entry.error
+      const phase = entry.syncing !== undefined
+        ? 'syncing'
+        : entry.app !== undefined && entry.commit !== undefined
+          ? 'ready'
+          : entry.error !== undefined
+            ? 'failed'
+            : 'pending'
+      const aliases = this.aliasConflicts(entry)
+      const error = conflict ?? ([
+        entry.error,
+        entry.migrationWarning,
+        aliases.length === 0 ? undefined : `触发名称冲突：${aliases.join('、')}；请在智能监管设置中修改别名，不能唯一匹配时不会选择仓库`,
+      ].filter(Boolean).join('；') || undefined)
       return {
         url: entry.spec.url,
-        ...entry.spec.branch === undefined ? {} : { branch: entry.spec.branch },
+        ...(entry.spec.branch === undefined ? {} : { branch: entry.spec.branch }),
         phase,
-        ...entry.commit === undefined ? {} : { commit: entry.commit },
-        ...entry.syncedAt === undefined ? {} : { syncedAt: entry.syncedAt },
-        ...entry.app === undefined ? {} : { app: entry.app },
-        ...error === undefined ? {} : { error },
-        available: entry.app !== undefined && conflict === undefined,
+        ...(entry.commit === undefined ? {} : { commit: entry.commit }),
+        ...(entry.syncedAt === undefined ? {} : { syncedAt: entry.syncedAt }),
+        ...(entry.app === undefined ? {} : { app: entry.app }),
+        ...(error === undefined ? {} : { error }),
+        available: entry.app !== undefined && entry.commit !== undefined && conflict === undefined,
         writable: entry.writable,
         activeRuns: entry.activeRuns,
       }
@@ -191,7 +222,16 @@ export class RepoRegistry {
     for (const entry of this.entries) {
       if (entry.app === undefined || entry.commit === undefined) continue
       if ((duplicates.get(entry.app.id)?.length ?? 0) > 1) continue
-      ready.push({ entry, ready: { app: entry.app, url: entry.spec.url, commit: entry.commit, writable: entry.writable } })
+      ready.push({
+        entry,
+        ready: {
+          app: entry.app,
+          url: entry.spec.url,
+          commit: entry.commit,
+          ...(entry.spec.branch === undefined ? {} : { branch: entry.spec.branch }),
+          writable: entry.writable,
+        },
+      })
     }
     return ready
   }
@@ -199,8 +239,6 @@ export class RepoRegistry {
   /**
    * Find one usable application.
    * @param id - application id.
-   * @returns the application with its repository and latest synced commit.
-   * @throws when the id does not name a usable application; the message says why and lists the usable ids.
    */
   readyApp(id: string): ReadyApp {
     const found = this.readyApps().find(ready => ready.app.id === id)
@@ -210,13 +248,16 @@ export class RepoRegistry {
 
   /**
    * Hold a snapshot of each requested application's latest synced commit for
-   * one dispatch. Every id must resolve to a usable application, or nothing is
-   * held.
-   * @param ids - requested application ids (duplicates allowed).
-   * @returns the lease.
-   * @throws when an id is unknown, its repository is not usable, dsh-repo is unavailable, or a snapshot cannot be created.
+   * one dispatch. Every id must resolve to a usable application, or nothing is held.
    */
-  async acquire(ids: readonly string[]): Promise<RepoLease> {
+  acquire(ids: readonly string[]): Promise<RepoLease> {
+    if (this.closed) return Promise.reject(new Error('智能监管已停止，不能取得新的应用快照'))
+    const pending = this.acquireReady(ids).finally(() => { this.acquiring.delete(pending) })
+    this.acquiring.add(pending)
+    return pending
+  }
+
+  private async acquireReady(ids: readonly string[]): Promise<RepoLease> {
     const unique = [...new Set(ids)]
     const ready = new Map(this.readyEntries().map(item => [item.ready.app.id, item]))
     const missing = unique.filter(id => !ready.has(id))
@@ -225,7 +266,7 @@ export class RepoRegistry {
     const held = unique.map((id) => {
       const { entry, ready: app } = ready.get(id) as { entry: RepoEntry; ready: ReadyApp }
       entry.activeRuns += 1
-      return { id, entry, app, snapshot: service.snapshotAcquire({ repo: app.url, ref: app.commit }) }
+      return { id, entry, app, snapshot: service.snapshotAcquire({ repo: app.url, ref: app.commit, signal: this.workAbort.signal }) }
     })
     this.deps.onChange()
     const outcomes = await Promise.allSettled(held.map(item => item.snapshot))
@@ -238,34 +279,81 @@ export class RepoRegistry {
       for (const { entry } of held) entry.activeRuns -= 1
       this.deps.onChange()
     }
+    if (this.closed) {
+      release()
+      throw new Error('智能监管已停止，未交付新的应用快照')
+    }
     for (const [index, outcome] of outcomes.entries()) {
       if (outcome.status === 'fulfilled') continue
       release()
       throw new Error(`应用「${held[index]?.id}」的代码快照创建失败：${messageOf(outcome.reason)}`)
     }
     return {
-      apps: new Map(held.map(({ id, app }, index) => [id, { ...app, dir: (leases[index] as SnapshotLease).path }])),
+      apps: new Map(held.map(({ id, app }, index) => {
+        const dir = (leases[index] as SnapshotLease).path
+        return [id, { ...app, dir, skills: new SnapshotSkills(this.deps.skills, dir, () => !released) }]
+      })),
       release,
     }
   }
 
   /**
    * The panel view of one configured repository.
-   * @param url - git address.
-   * @returns its status, or undefined when it is not configured.
    */
   statusOf(url: string): RepoStatusWire | undefined {
     return this.status().find(repo => repo.url === url)
   }
 
-  /**
-   * Writable addresses that synced but have no application: the description
-   * or its SKILL is missing or invalid at the latest synced commit, and a
-   * drafted setup can be pushed.
-   * @returns those addresses, ordered as configured.
-   */
-  setupPending(): string[] {
-    return this.entries.filter(entry => entry.writable && entry.commit !== undefined && entry.app === undefined && entry.syncing === undefined).map(entry => entry.spec.url)
+  /** Resolve a Feishu name or raw platform component code without guessing. */
+  resolve(name: string): ReadyApp {
+    const key = applicationKey(name)
+    const matches = this.readyApps().filter(({ app }) =>
+      [app.id, app.name, ...app.aliases].some(value => applicationKey(value) === key),
+    )
+    if (matches.length === 1) return matches[0]!
+    if (matches.length > 1) {
+      throw new Error(`「${name}」同时对应多个应用（${matches.map(item => item.app.id).join('、')}）；请在智能监管设置中移除冲突别名，或提供唯一应用 id`)
+    }
+    throw new Error(`「${name}」没有对应的可用应用；请在智能监管设置中添加触发别名，并确认 dsh-repo 中已打开「日志分析」且仓库读取成功`)
+  }
+
+  /** Validate and save only description/aliases for a currently enabled repository. */
+  saveApplication(raw: unknown): Promise<void> {
+    if (this.closed) return Promise.reject(new SettingsError('智能监管已停止，不能保存新的应用设置'))
+    const operation = this.saving.then(() => this.updateApplication(raw))
+    this.saving = operation.catch((_error: unknown) => { /* The caller receives the failure; later saves remain possible. */ })
+    return operation
+  }
+
+  private async updateApplication(raw: unknown): Promise<void> {
+    const parsed = z.object({ url: z.string().min(1), ...applicationMetadataSchema.shape }).strict().safeParse(raw)
+    if (!parsed.success) throw new SettingsError(parsed.error.issues[0]?.message ?? '应用设置不合法')
+    const metadata = applicationMetadataSchema.safeParse({ description: parsed.data.description, aliases: parsed.data.aliases })
+    if (!metadata.success) throw new SettingsError(metadata.error.issues[0]?.message ?? '应用设置不合法')
+    const entry = this.entries.find(candidate => candidate.spec.url === parsed.data.url)
+    if (entry === undefined || entry.retired) throw new SettingsError('仓库已移除或关闭「日志分析」；请到 dsh-repo 检查')
+    const conflicts = metadata.data.aliases.filter(alias =>
+      this.entries.some(other =>
+        other !== entry
+        && other.app !== undefined
+        && [other.app.id, other.app.name, ...other.app.aliases].some(value => applicationKey(value) === applicationKey(alias)),
+      ),
+    )
+    if (conflicts.length > 0) throw new SettingsError(`别名「${conflicts.join('、')}」已被其他应用使用；请使用唯一别名`)
+    const app = await this.applications.save(entry.spec.url, metadata.data, entry.app)
+    const current = this.entries.find(candidate => candidate.spec.url === entry.spec.url)
+    if (current !== undefined) {
+      current.app = app
+      current.migrationWarning = undefined
+    }
+    this.deps.onChange()
+  }
+
+  /** Stop new metadata work and wait for admitted writes and all commit refreshes, including retired entries. */
+  async close(): Promise<void> {
+    this.closed = true
+    this.workAbort.abort(new Error('智能监管已停止读取应用仓库'))
+    await Promise.allSettled([this.saving, ...this.syncing, ...this.acquiring])
   }
 
   private unknownMessage(ids: readonly string[]): string {
@@ -278,6 +366,17 @@ export class RepoRegistry {
     return `${details.join('；')}。可用的应用 id：${available.length === 0 ? '（无）' : available.join('、')}`
   }
 
+  private aliasConflicts(entry: RepoEntry): string[] {
+    if (entry.app === undefined) return []
+    return [...new Set([entry.app.id, entry.app.name, ...entry.app.aliases])].filter(name =>
+      this.entries.some(other =>
+        other !== entry
+        && other.app !== undefined
+        && [other.app.id, other.app.name, ...other.app.aliases].some(value => applicationKey(value) === applicationKey(name)),
+      ),
+    )
+  }
+
   private duplicateIds(): Map<string, string[]> {
     const urls = new Map<string, string[]>()
     for (const entry of this.entries) {
@@ -288,23 +387,26 @@ export class RepoRegistry {
   }
 
   private syncEntry(entry: RepoEntry): Promise<void> {
+    if (this.closed) return Promise.resolve()
     if (entry.syncing !== undefined) return entry.syncing
     const run = this.runSync(entry).finally(() => {
       entry.syncing = undefined
+      this.syncing.delete(run)
       this.deps.onChange()
     })
     entry.syncing = run
+    this.syncing.add(run)
     this.deps.onChange()
     return run
   }
 
   private async runSync(entry: RepoEntry): Promise<void> {
     if (entry.retired) return
-    let head: { commit: string; manifest: ManifestRead }
+    let head: { commit: string; imported: ApplicationImport }
     try {
-      head = await this.deps.repos.withSnapshot(entry.spec.url, entry.spec.branch, undefined, async lease => ({
+      head = await this.deps.repos.withSnapshot(entry.spec.url, entry.spec.branch, this.workAbort.signal, async lease => ({
         commit: lease.commit,
-        manifest: await checkAppManifest(treeReader(lease.path, MAX_REPO_FILE_BYTES)),
+        imported: await this.applications.ensure(entry.spec.url, treeReader(lease.path, MAX_REPO_FILE_BYTES)),
       }))
     } catch (error) {
       entry.syncedAt = this.now()
@@ -313,15 +415,12 @@ export class RepoRegistry {
         : messageOf(error)
       return
     }
-    const { manifest } = head
+    const { imported } = head
     entry.syncedAt = this.now()
     entry.commit = head.commit
-    if (manifest.ok) {
-      entry.app = manifest.app
-      entry.error = undefined
-    } else {
-      entry.app = undefined
-      entry.error = manifest.error
-    }
+    const current = this.applications.current(entry.spec.url)
+    entry.app = current ?? imported.app
+    entry.error = undefined
+    entry.migrationWarning = current === undefined ? imported.warning : undefined
   }
 }

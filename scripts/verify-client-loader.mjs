@@ -63,7 +63,7 @@ assert.deepEqual(registrations.map(({ declaration }) => declaration.name), ['mai
 const [page, entry] = registrations
 assert.equal(page.declaration.key, 'logalyze')
 assert.equal(entry.declaration.id, 'logalyze', 'sidebar row id must address the main page key')
-assert.equal(entry.declaration.label(), '观象')
+assert.equal(entry.declaration.label(), '智能监管')
 for (const { component } of registrations) assert.equal(typeof component, 'function')
 
 console.log('OK: lib/client.js loads through __ModuleLoader__ and registers the sidebar entry and page')

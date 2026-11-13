@@ -2,8 +2,7 @@
  * 观象随包提供的指导 SKILL，正文是包内的 `skills/<name>/SKILL.md`，插件加载时
  * 读取并校验，文件缺失或不合法时加载失败：
  *
- * - `/logalyze-kit` 接入套件：怎样为应用仓库编写应用描述和日志分析 SKILL。
- *   接入起草子 Agent 用首行手势加载它。
+ * - `/logalyze-kit` 接入指南：仓库功能开关、描述与别名设置和可选 SKILL。
  * - `/logalyze-improve` 改进指南：怎样把一次分析中 SKILL 没有覆盖的问题整理为
  *   案例并改进 SKILL。SKILL 改进子 Agent 用首行手势加载它。
  *

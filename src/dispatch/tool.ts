@@ -286,7 +286,7 @@ export class Dispatcher {
       }))
       const gaps = this.deps.gaps?.enabled() === true ? this.deps.gaps : undefined
       // Read-only repositories cannot take a SKILL improvement, so their children record no gaps.
-      const recordsGaps = (ready: LeasedApp): boolean => gaps !== undefined && ready.writable
+      const recordsGaps = (ready: LeasedApp): boolean => gaps !== undefined && ready.writable && ready.app.skill !== undefined
       const results = await Promise.all(prepared.map(async ({ task, ready, workDir, logs }): Promise<TaskResult> => {
         const outcome = await runChild({
           subagents: this.deps.subagents,

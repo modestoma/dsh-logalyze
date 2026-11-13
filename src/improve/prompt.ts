@@ -90,6 +90,7 @@ function originOf(analyses: readonly ImproveAnalysis[]): string {
  */
 export function renderImprovePrompt(input: ImprovePromptInput): string {
   const { app, commit, analyses, feedback, logs, workDir, maxFiles, caseRequired, date } = input
+  if (app.skill === undefined) throw new Error('没有可改进的现有 SKILL')
   const dir = skillDir(app.skill)
   const logSection = logs.length === 0
     ? ''

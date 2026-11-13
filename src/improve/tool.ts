@@ -398,6 +398,7 @@ export class SkillImprover {
     const settings = this.deps.settings()
     const { feedback } = args
     const { app, url, writable } = this.deps.registry.readyApp(args.app)
+    if (app.skill === undefined) throw new Error(`应用「${app.id}」没有旧版 SKILL 改进目标；仍可直接分析日志与代码，创建初版 SKILL 待知识改进功能接入`)
     if (!writable) throw new Error(`应用「${app.id}」的仓库在 dsh-repo 仓库清单中的权限是「只读」，观象不能推送 SKILL 改进；请在 dsh-repo「代码仓库 → 仓库」把权限改为「可改代码」，或由仓库维护者自己修改 SKILL`)
     const turn = this.turnOf(sessionId)
     const analyzed = [...this.tasks.values()].filter(record => record.task.sessionId === sessionId && record.task.app.id === app.id)

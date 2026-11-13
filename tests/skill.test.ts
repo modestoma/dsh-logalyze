@@ -15,11 +15,6 @@ describe('entry skill', () => {
     expect(renderCatalog([order])).toContain('| `order-service` | 订单服务 | 下单 \\| 支付 | 订单 | `OrderController` |')
     expect(renderCatalog([])).toContain('当前没有可用的应用')
     expect(renderCatalog([])).toContain('应用的代码仓库要由管理员在 dsh-repo 的「代码仓库 → 仓库」中添加，并打开「日志分析」')
-    // A repository already added but missing its description points to drafting instead of asking for it again.
-    const pending = renderCatalog([], ['https://git.example.com/shop/billing.git'])
-    expect(pending).toContain('已经添加，但还缺少应用描述或日志分析 SKILL：`https://git.example.com/shop/billing.git`')
-    expect(pending).toContain('用户同意后用 `logalyze_init_repo` 起草')
-    expect(pending).not.toContain('由管理员')
     expect(renderEntrySkill([order], 3, true)).toContain('推送前可能还会弹出审批请用户再批准一次')
     const body = renderEntrySkill([order], 3, false)
     expect(body).toContain('`logalyze_dispatch`')
@@ -36,7 +31,7 @@ describe('entry skill', () => {
     for (const body of [renderEntrySkill([order], 3, false), renderEntrySkill([order], 3, true)]) {
       expect(body).not.toContain('不要自己用 git 推送或修改仓库')
       expect(body).toContain('用户之后要求修复分析发现的代码问题时，按普通编码任务处理：从派发结果中该应用的仓库地址和提交开始修改')
-      expect(body).not.toMatch(/dsh-repo|repo_/)
+      expect(body).not.toContain('logalyze_init_repo')
     }
     expect(renderEntrySkill([order], 3, true)).toContain('SKILL 改进一律通过这个工具，不要自己修改或推送 SKILL 文件。')
   })
@@ -44,7 +39,7 @@ describe('entry skill', () => {
   it('is user-invocable only and renders the live catalog on each load', async () => {
     let apps: AppManifest[] = []
     const ready = Promise.withResolvers<void>()
-    const { factory, invalidate } = createEntrySkillProvider({ prepare: signal => abortable(ready.promise, signal), apps: () => apps, setupPending: () => [], maxAppsPerRequest: () => 4, skillUpdates: () => false, autoInvoke: false, inRepositories: () => false, bundled })
+    const { factory, invalidate } = createEntrySkillProvider({ prepare: signal => abortable(ready.promise, signal), apps: () => apps, maxAppsPerRequest: () => 4, skillUpdates: () => false, autoInvoke: false, inRepositories: () => false, bundled })
     const control = { signal: new AbortController().signal, invalidate: vi.fn() }
     const provider = factory(control)
     const [candidate] = await provider.list({})
@@ -69,7 +64,6 @@ describe('entry skill', () => {
     const { factory, invalidate } = createEntrySkillProvider({
       prepare: () => Promise.resolve(),
       apps: () => apps,
-      setupPending: () => [],
       maxAppsPerRequest: () => 4,
       skillUpdates: () => false,
       autoInvoke: true,
@@ -106,7 +100,7 @@ describe('entry skill', () => {
   })
 
   it('serves the bundled guides everywhere for users and children, never for model choice', async () => {
-    const { factory } = createEntrySkillProvider({ prepare: () => Promise.resolve(), apps: () => [order], setupPending: () => [], maxAppsPerRequest: () => 4, skillUpdates: () => false, autoInvoke: true, inRepositories: cwd => cwd.startsWith('/repos'), bundled })
+    const { factory } = createEntrySkillProvider({ prepare: () => Promise.resolve(), apps: () => [order], maxAppsPerRequest: () => 4, skillUpdates: () => false, autoInvoke: true, inRepositories: cwd => cwd.startsWith('/repos'), bundled })
     const provider = factory({ signal: new AbortController().signal, invalidate: vi.fn() })
     const listed = await provider.list({ cwd: '/project' })
     expect(listed.map(skill => skill.name)).toEqual(['logalyze', 'logalyze-kit', 'logalyze-improve'])
@@ -122,9 +116,9 @@ describe('bundled skills', () => {
   it('ships valid SKILL.md files for the kit and the improvement guide', () => {
     const [kit, improve] = loadBundledSkills(new URL('../skills/', import.meta.url))
     expect(kit?.name).toBe('logalyze-kit')
-    expect(kit?.description).toContain('logalyze.yaml')
-    expect(kit?.content).toContain('references/<领域>.md')
-    expect(kit?.content).toContain('## 案例索引')
+    expect(kit?.description).toContain('触发别名')
+    expect(kit?.content).toContain('不需要创建 `.agents/logalyze.yaml`')
+    expect(kit?.content).toContain('没有适用 SKILL 就直接读日志与代码')
     expect(improve?.name).toBe('logalyze-improve')
     expect(improve?.content).toContain('cases/<YYYY-MM-DD>-<slug>.md')
     expect(improve?.content).toContain('## 案例索引')
