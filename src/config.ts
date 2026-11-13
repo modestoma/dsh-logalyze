@@ -72,6 +72,18 @@ const analyzeSchema = z.object({
   upload: uploadSchema.prefault({}),
 }).strict()
 
+const mrReviewSchema = z.object({
+  enabled: z.boolean().default(true),
+  pollIntervalMs: durationMs(1000).default(60 * 1000),
+  debounceMs: durationMs(0).default(45 * 1000),
+  maxConcurrentSessions: z.number().int().min(1).max(16).default(3),
+  skipDraft: z.boolean().default(true),
+  ignoreLabels: z.array(z.string().trim().min(1, '忽略标签不能为空').max(128)).default([]),
+  maxAutoFixAttempts: z.number().int().min(0).max(10).default(2),
+  dailyMrTurnLimit: z.number().int().min(1).max(200).default(12),
+  repoHourlyTurnLimit: z.number().int().min(1).max(500).default(30),
+}).strict()
+
 /**
  * The former `repos` key: application repositories are now the dsh-repo
  * catalog repositories with the log analysis feature turned on, so any value
@@ -90,6 +102,7 @@ export const editableFields = {
   download: downloadSchema.prefault({}),
   skillUpdates: skillUpdatesSchema.prefault({}),
   analyze: analyzeSchema.prefault({}),
+  mrReview: mrReviewSchema.prefault({}),
 }
 
 /** A complete editable settings payload, as the panel saves it. */
@@ -143,6 +156,7 @@ export const overlaySchema = z.object({
   download: downloadSchema.optional(),
   skillUpdates: skillUpdatesSchema.optional(),
   analyze: analyzeSchema.optional(),
+  mrReview: mrReviewSchema.optional(),
 }).strict()
 
 /** Validated panel overlay. */

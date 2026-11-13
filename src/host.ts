@@ -227,6 +227,28 @@ export interface HostLogger {
   error?(message: string, ...args: unknown[]): void
 }
 
+/** Resumed agent handle returned by Host `sessionController.resolveAgent` or `repo/resolve-agent`. */
+export interface HostResolvedAgent {
+  readonly id: string
+  readonly session: { readonly header: SessionHeader }
+  prompt?(content: string | readonly ContentBlock[], options?: { readonly signal?: AbortSignal }): Promise<unknown>
+}
+
+/** Optional Host `sessionController` service slice used for stateful MR supervision sessions. */
+export interface SessionControllerService {
+  create?(request: { readonly cwd?: string; readonly blankSessionId?: string }): Promise<{ readonly sessionId: string }>
+  resolveAgent?(sessionId: string): Promise<{ readonly agent: HostResolvedAgent } | { readonly error: { readonly message: string; readonly code?: string } }>
+  prompt?(
+    request: {
+      readonly sessionId: string
+      readonly requestId: string
+      readonly content: readonly ContentBlock[]
+      readonly mode?: 'queue' | 'steer'
+    },
+    signal: AbortSignal,
+  ): Promise<{ readonly accepted: boolean }>
+}
+
 /** The plugin context slice this plugin uses. */
 export interface HostContext {
   readonly tools: ToolRegistry
@@ -236,6 +258,7 @@ export interface HostContext {
   readonly logger?: HostLogger
   get?(name: string): unknown
   provide?(name: string, value: unknown): () => void | Promise<void>
+  waterfall?<T>(name: string, ...args: unknown[]): Promise<T>
   /**
    * Listen to the post-commit append feed of every Session (`session/event`).
    * @param name - the event name.

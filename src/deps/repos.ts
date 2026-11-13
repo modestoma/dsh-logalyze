@@ -200,11 +200,13 @@ export class ReposClient {
     if (lookup.availability !== 'ready') return []
     const repos = await lookup.service.repoList({ feature: MR_REVIEW_FEATURE.id })
     return repos.map((repo) => {
-      const branch = repo.features.find(feature => feature.id === MR_REVIEW_FEATURE.id)?.branch ?? repo.base
+      const featureBranch = repo.features.find(feature => feature.id === MR_REVIEW_FEATURE.id)?.branch
+      const branch = featureBranch ?? repo.base
       return {
         id: repo.id,
         url: repo.url,
         ...(branch === undefined ? {} : { branch }),
+        ...(featureBranch === undefined ? {} : { targetBranch: featureBranch }),
         ...(repo.base === undefined ? {} : { base: repo.base }),
         access: repo.access,
         writable: repo.access !== 'read',
