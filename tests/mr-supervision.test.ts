@@ -9,12 +9,14 @@ import type {
   MrDetail,
   MrDiscussion,
   MrInfo,
+  MrListParams,
   MrReviewParams,
   MrStatus,
   RepoUser,
 } from '../src/deps/repos-contract.ts'
-import { DSH_REPOS_SERVICE } from '../src/deps/repos.ts'
+import { DSH_REPOS_SERVICE, ReposClient } from '../src/deps/repos.ts'
 import type { HostContext, ToolActivationContext, ToolDefinition } from '../src/host.ts'
+import { MrSupervisor, createHostMrSessionDriver } from '../src/mr/index.ts'
 import {
   classifyMrPollUpdate,
   isSameBotUser,
@@ -22,7 +24,9 @@ import {
 } from '../src/mr/signals.ts'
 import type { MrSessionDriver, MrSessionTurnRequest } from '../src/mr/session-driver.ts'
 import { resolveConfig } from '../src/config.ts'
+import { CircuitBreakerRegistry } from '../src/runtime/breaker.ts'
 import { openSupervisorDomain, supervisedMrKey } from '../src/runtime/domain.ts'
+import { createSupervisionPools } from '../src/runtime/pool.ts'
 import { LogalyzeService } from '../src/service.ts'
 import type { StateWire } from '../src/settings/contract.ts'
 import { OverlayStore } from '../src/settings/overlay.ts'
@@ -76,6 +80,7 @@ class FakeReposV8 {
   botUser: RepoUser = { username: 'dsh-bot', webUrl: 'https://git.example/dsh-bot' }
   failCurrentBotUser = false
   readonly mrs = new Map<string, Map<number, StoredFakeMr>>()
+  readonly mrListCalls: MrListParams[] = []
   readonly reviewCalls: MrReviewParams[] = []
   readonly replyCalls: { discussionId: string; body: string }[] = []
   readonly resolveCalls: { discussionId: string; resolved: boolean }[] = []
@@ -125,13 +130,22 @@ class FakeReposV8 {
         return this.botUser
       },
       mrList: async (params) => {
+        this.mrListCalls.push(params)
         const list = [...(this.mrs.get(params.repo)?.values() ?? [])]
           .map(entry => entry.info)
           .filter(item => params.state === 'all' || params.state === undefined || item.state === params.state)
           .filter(item => params.targetBranch === undefined || item.targetBranch === params.targetBranch)
           .filter(item => params.updatedAfter === undefined || item.updatedAt >= params.updatedAfter)
           .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-        return { items: list }
+        const page = Math.max(1, params.page ?? 1)
+        const perPage = Math.max(1, params.perPage ?? 50)
+        const start = (page - 1) * perPage
+        const items = list.slice(start, start + perPage)
+        const nextPage = start + perPage < list.length ? page + 1 : undefined
+        return {
+          items,
+          ...(nextPage === undefined ? {} : { nextPage }),
+        }
       },
       mrGet: async ({ repo, number }) => {
         this.mrGetCalls += 1
@@ -304,6 +318,7 @@ async function createServiceHarness(options: {
   service.registerTools()
   mountSettingsRoutes(ctx, service)
   await service.boot()
+  const unwatchRepos = service.watchRepos(dshRepos)
 
   httpServer = createServer((req, res) => {
     const pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
@@ -331,6 +346,7 @@ async function createServiceHarness(options: {
   }
 
   const dispose = async () => {
+    unwatchRepos()
     await service.shutdown()
     await new Promise<void>(resolve => httpServer?.close(() => resolve()))
   }
@@ -1255,5 +1271,392 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     rec = domain.supervisedMrs.get(key47)
     expect(rec?.pendingSignals).toEqual([])
     expect(rec?.lastReviewedSha).toBe('sha-push-2')
+  })
+
+  it('discovers MRs beyond 500 items across >10 pages without stranding older MRs', async () => {
+    const { dir, cleanup } = await tempDir('mr-pagination-505-')
+    cleanups.push(cleanup)
+
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    const origin = 'https://git.example/org/large-app.git'
+    fakeV8.base.catalog = [{ id: 'r1', url: origin, base: 'main', access: 'write', features: [{ id: 'mr-review' }] }]
+
+    // Seed 504 newer draft MRs (skipDraft ignores without creating records) and 1 older reviewable MR on page 11.
+    const baseMs = Date.parse('2026-11-01T10:00:00Z')
+    for (let num = 2; num <= 505; num += 1) {
+      fakeV8.upsertMr(origin, num, {
+        draft: true,
+        updatedAt: new Date(baseMs + num * 1000).toISOString(),
+      })
+    }
+    fakeV8.upsertMr(origin, 1, {
+      draft: false,
+      headSha: 'sha-old-1',
+      updatedAt: '2026-11-01T01:00:00Z',
+    })
+
+    let h!: Awaited<ReturnType<typeof createServiceHarness>>
+    h = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 0 },
+      driver: {
+        async runTurn(req) {
+          const sid = 'sess-large-1'
+          await req.onSessionBound?.(sid)
+          await h.callTool(MR_PUBLISH_REVIEW_TOOL_NAME, {
+            headSha: 'sha-old-1',
+            verdict: 'approve',
+            body: 'Reviewed old MR #1 on page 11',
+          }, sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(h.dispose)
+
+    const supervisor = h.service.mrSupervisorInstance()!
+    const domain = await h.service.supervisorDomain()
+
+    await supervisor.pollNow()
+    await supervisor.waitForIdle()
+
+    expect(fakeV8.mrListCalls.some(c => (c.page ?? 1) === 11)).toBe(true)
+    expect(fakeV8.reviewCalls.map(c => c.number)).toContain(1)
+    expect(domain.supervisedMrs.get(supervisedMrKey(origin, 1))?.lastReviewedSha).toBe('sha-old-1')
+  })
+
+  it('preserves pagination progress across polls before advancing repoCursors when maxListPagesPerPoll is reached', async () => {
+    const { dir, cleanup } = await tempDir('mr-pagination-backfill-')
+    cleanups.push(cleanup)
+
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    const origin = 'https://git.example/org/backfill.git'
+    fakeV8.base.catalog = [{ id: 'r1', url: origin, base: 'main', access: 'write', features: [{ id: 'mr-review' }] }]
+
+    // 110 MRs = 3 pages at perPage=50. Page 1-2 hold #2..#101 (newest) and Page 3 holds #1..#10 (oldest).
+    const baseMs = Date.parse('2026-11-01T10:00:00Z')
+    for (let num = 2; num <= 110; num += 1) {
+      fakeV8.upsertMr(origin, num, {
+        draft: true,
+        updatedAt: new Date(baseMs + num * 1000).toISOString(),
+      })
+    }
+    fakeV8.upsertMr(origin, 1, {
+      draft: false,
+      headSha: 'sha-page3-mr1',
+      updatedAt: '2026-11-01T01:00:00Z',
+    })
+
+    const fakeCtx: HostContext = {
+      tools: { register: () => () => {} },
+      skills: { registerProvider: () => () => {} },
+      subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('unused')) },
+      on: () => () => {},
+      effect: () => () => {},
+    }
+    const domain = await openSupervisorDomain({ ctx: fakeCtx, fallbackDir: join(dir, 'supervisor') })
+    cleanups.push(() => domain.close())
+
+    const pools = createSupervisionPools()
+    cleanups.push(() => pools.drainAndClose({ cancelQueued: true, abortActive: true }))
+
+    const settings = resolveConfig({ mrReview: { debounceMs: 0 } }).mrReview
+    const breakers = new CircuitBreakerRegistry({ table: domain.circuitBreakers, resolvePolicy: () => undefined })
+    const repos = new ReposClient(() => fakeV8.service())
+    let sup!: MrSupervisor
+    sup = new MrSupervisor({
+      table: domain.supervisedMrs,
+      breakers,
+      issues: domain.issues,
+      repos,
+      mrPool: pools.mrPool,
+      workspacesRoot: join(dir, 'mr-workspaces'),
+      sessionDriver: {
+        async runTurn(req) {
+          const sid = 'sess-backfill-1'
+          await req.onSessionBound?.(sid)
+          await sup.updateRecord(req.repo, req.mrNumber, cur => ({
+            ...cur,
+            lastReviewedSha: 'sha-page3-mr1',
+            reviewedHeadSha: 'sha-page3-mr1',
+          }))
+          return { sessionId: sid }
+        },
+      },
+      getSettings: () => settings,
+      getMrRepos: () => [{ url: origin, writable: true }],
+      autoPollTimer: false,
+      maxListPagesPerPoll: 2,
+    })
+    cleanups.push(() => sup.drainAndClose())
+    await sup.boot()
+
+    // Poll 1: fetches pages 1 and 2 only (capped at 2 pages); MR #1 on page 3 is not yet visited.
+    await sup.pollNow()
+    await sup.waitForIdle()
+    expect(fakeV8.mrListCalls.map(c => c.page)).toEqual([1, 2])
+    expect(domain.supervisedMrs.get(supervisedMrKey(origin, 1))).toBeUndefined()
+
+    // Poll 2: continues backfill from page 3 with same unfiltered scan -> discovers and reviews MR #1!
+    await sup.pollNow()
+    await sup.waitForIdle()
+    expect(fakeV8.mrListCalls.slice(2).map(c => ({ page: c.page, updatedAfter: c.updatedAfter }))).toEqual([
+      { page: 3, updatedAfter: undefined },
+    ])
+    expect(domain.supervisedMrs.get(supervisedMrKey(origin, 1))?.lastReviewedSha).toBe('sha-page3-mr1')
+
+    // Poll 3: backfill completed -> cursor has now advanced, so poll 3 queries page 1 with `updatedAfter` set.
+    await sup.pollNow()
+    await sup.waitForIdle()
+    expect(fakeV8.mrListCalls.at(-1)?.page).toBe(1)
+    expect(fakeV8.mrListCalls.at(-1)?.updatedAfter).toBeTypeOf('string')
+  })
+
+  it('rechecks repository eligibility when mr-review is disabled during debounce, pool wait, or across restart', async () => {
+    const { dir, cleanup } = await tempDir('mr-repo-eligibility-')
+    cleanups.push(cleanup)
+
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    const originA = 'https://git.example/org/repo-a.git'
+    const originB = 'https://git.example/org/repo-b.git'
+    fakeV8.base.catalog = [
+      { id: 'ra', url: originA, base: 'main', access: 'write', features: [{ id: 'mr-review' }] },
+      { id: 'rb', url: originB, base: 'main', access: 'write', features: [{ id: 'mr-review' }] },
+    ]
+
+    let nowMs = 1_000_000
+    const turnsExecuted: string[] = []
+    let releaseRepoATurn: (() => void) | undefined
+    let enteredRepoATurn: (() => void) | undefined
+    const repoATurnEntered = new Promise<void>(resolve => { enteredRepoATurn = resolve })
+
+    let h!: Awaited<ReturnType<typeof createServiceHarness>>
+    const makeDriver = (harnessRef: () => typeof h): MrSessionDriver => ({
+      async runTurn(req) {
+        turnsExecuted.push(`${req.repo}#${req.mrNumber}`)
+        const sid = `sess-${req.mrNumber}`
+        await req.onSessionBound?.(sid)
+        if (req.repo === originA && req.mrNumber === 10) {
+          enteredRepoATurn?.()
+          await new Promise<void>(resolve => { releaseRepoATurn = resolve })
+        }
+        await harnessRef().callTool(MR_PUBLISH_REVIEW_TOOL_NAME, {
+          headSha: `sha-mr-${req.mrNumber}-v1`,
+          verdict: 'comment',
+          body: 'ok',
+        }, sid)
+        return { sessionId: sid }
+      },
+    })
+
+    // Seed MR on repo B while debouncing (5s window).
+    fakeV8.upsertMr(originB, 1, { updatedAt: '2026-11-01T09:00:00Z' })
+    h = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 5_000, maxConcurrentSessions: 1 },
+      clock: () => nowMs,
+      driver: makeDriver(() => h),
+    })
+
+    let supervisor = h.service.mrSupervisorInstance()!
+    let domain = await h.service.supervisorDomain()
+    const keyB1 = supervisedMrKey(originB, 1)
+
+    await supervisor.pollNow()
+    expect(domain.supervisedMrs.get(keyB1)?.pendingSignals.map(s => s.kind)).toEqual(['opened'])
+    expect(domain.supervisedMrs.get(keyB1)?.dueAt).toBeDefined()
+
+    // Disable `mr-review` on repo B while MR B#1 is in its debounce window.
+    fakeV8.base.catalog = [
+      { id: 'ra', url: originA, base: 'main', access: 'write', features: [{ id: 'mr-review' }] },
+      { id: 'rb', url: originB, base: 'main', access: 'write', features: [] },
+    ]
+    fakeV8.base.emitReposChange()
+    await vi.waitFor(() => {
+      expect(domain.supervisedMrs.get(keyB1)?.dueAt).toBeUndefined()
+    })
+    await supervisor.waitForIdle()
+
+    expect(domain.supervisedMrs.get(keyB1)?.dueAt).toBeUndefined()
+    expect(domain.supervisedMrs.get(keyB1)?.pendingSignals.map(s => s.kind)).toEqual(['opened'])
+
+    nowMs += 10_000
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+    expect(turnsExecuted).toEqual([])
+
+    // Restart service while repo B still has `mr-review` disabled -> B#1 stays dormant across restart!
+    await h.dispose()
+    h = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 0, maxConcurrentSessions: 1 },
+      clock: () => nowMs,
+      driver: makeDriver(() => h),
+    })
+    cleanups.push(() => h.dispose())
+    supervisor = h.service.mrSupervisorInstance()!
+    domain = await h.service.supervisorDomain()
+
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+    expect(turnsExecuted).toEqual([])
+    expect(domain.supervisedMrs.get(keyB1)?.dueAt).toBeUndefined()
+
+    // Test pool-slot queue case: occupy the single pool slot with repo A#10, while B#1 is queued in `mrPool`.
+    fakeV8.upsertMr(originA, 10, { updatedAt: '2026-11-01T09:01:00Z' })
+    await supervisor.pollNow()
+    await repoATurnEntered
+
+    // Re-enable `mr-review` on repo B so B#1 becomes eligible and queues into `mrPool` behind A#10.
+    fakeV8.base.setCatalog([
+      { url: originA, base: 'main' },
+      { url: originB, base: 'main' },
+    ], ['mr-review'])
+    await vi.waitFor(() => {
+      expect(domain.supervisedMrs.get(keyB1)?.dueAt).toBeDefined()
+    })
+    const flushB1 = supervisor.flushDebouncedDue()
+
+    // While A#10 holds the slot and B#1 waits in `mrPool`, disable `mr-review` on repo B again!
+    fakeV8.base.setCatalog([{ url: originA, base: 'main' }], ['mr-review'])
+    await vi.waitFor(() => {
+      expect(h.service.registry.mrStatus().some(r => r.url === originB)).toBe(false)
+    })
+
+    releaseRepoATurn?.()
+    await flushB1
+    await supervisor.waitForIdle()
+
+    expect(turnsExecuted).toEqual([`${originA}#10`])
+    expect(domain.supervisedMrs.get(keyB1)?.dueAt).toBeUndefined()
+    expect(domain.supervisedMrs.get(keyB1)?.pendingSignals.map(s => s.kind)).toEqual(['opened'])
+
+    // Finally re-enable `mr-review` on repo B -> dormant B#1 resumes and executes!
+    fakeV8.base.setCatalog([
+      { url: originA, base: 'main' },
+      { url: originB, base: 'main' },
+    ], ['mr-review'])
+    await vi.waitFor(() => {
+      expect(h.service.registry.mrStatus().some(r => r.url === originB)).toBe(true)
+    })
+    await supervisor.waitForIdle()
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+
+    expect(turnsExecuted).toEqual([`${originA}#10`, `${originB}#1`])
+    expect(domain.supervisedMrs.get(keyB1)?.pendingSignals).toEqual([])
+    expect(domain.supervisedMrs.get(keyB1)?.lastReviewedSha).toBe('sha-mr-1-v1')
+  })
+
+  it('createHostMrSessionDriver correlates completion with submitted requestId and ignores preceding human turn/end', async () => {
+    const submittedRequests: Array<{ readonly sessionId: string; readonly requestId: string; readonly mode?: string }> = []
+    const ctx: HostContext = {
+      tools: { register: () => () => {} },
+      skills: { registerProvider: () => () => {} },
+      subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('unused')) },
+      on: () => () => {},
+      effect: () => () => {},
+      get: (name: string) => {
+        if (name !== 'sessionController') return undefined
+        return {
+          resolveAgent: async (sessionId: string) => ({
+            agent: { id: 'agent-1', session: { header: { id: sessionId } } },
+          }),
+          prompt: async (req: { readonly sessionId: string; readonly requestId: string; readonly mode?: string }) => {
+            submittedRequests.push(req)
+            return { accepted: true }
+          },
+        }
+      },
+    }
+
+    const driver = createHostMrSessionDriver(ctx)
+    cleanups.push(async () => { driver.dispose?.() })
+
+    let resolved1 = false
+    const turnPromise1 = driver.runTurn({
+      repo: 'https://git.example/org/app.git',
+      mrNumber: 1,
+      origin: 'external',
+      existingSessionId: 'sess-shared',
+      workDir: '/tmp/mr-test',
+      prompt: 'Incremental MR review',
+      signal: new AbortController().signal,
+    }).then((res) => {
+      resolved1 = true
+      return res
+    })
+
+    // Wait for `prompt()` to receive requestId 1.
+    await vi.waitFor(() => { expect(submittedRequests).toHaveLength(1) })
+    const req1 = submittedRequests[0]!
+    expect(req1.mode).toBe('queue')
+
+    // Session is currently running human Turn 1; MR prompt is spliced into inbox next-turn queue.
+    driver.onSessionEvent('sess-shared', 'turn/start', { turn: 1 })
+    driver.onSessionEvent('sess-shared', 'agent/inbox/spliced', {
+      target: 'next-turn',
+      start: 0,
+      inserted: [{ id: 'msg-mr-1', source: { kind: 'user', rpcId: req1.requestId } }],
+    })
+
+    // Preceding human Turn 1 completes -> queued MR turn must NOT resolve early!
+    driver.onSessionEvent('sess-shared', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(resolved1).toBe(false)
+
+    // Turn 2 starts and claims `msg-mr-1`, then fails with LLM error.
+    driver.onSessionEvent('sess-shared', 'turn/start', { turn: 2 })
+    driver.onSessionEvent('sess-shared', 'agent/inbox/spliced', {
+      target: 'next-turn',
+      start: 0,
+      removedCount: 1,
+      inserted: [],
+    })
+    driver.onSessionEvent('sess-shared', 'user/message', {
+      id: 'msg-mr-1',
+      source: { kind: 'user', rpcId: req1.requestId },
+    })
+    driver.onSessionEvent('sess-shared', 'turn/end', {
+      turn: 2,
+      reason: { kind: 'error', error: { message: 'llm rate limit' } },
+    })
+
+    expect(await turnPromise1).toEqual({ sessionId: 'sess-shared', error: 'llm rate limit' })
+
+    // Second queued prompt gets canceled from inbox before claiming -> waiter settles cleanly with error.
+    const turnPromise2 = driver.runTurn({
+      repo: 'https://git.example/org/app.git',
+      mrNumber: 2,
+      origin: 'external',
+      existingSessionId: 'sess-shared',
+      workDir: '/tmp/mr-test',
+      prompt: 'Queued prompt to cancel',
+      signal: new AbortController().signal,
+    })
+    await vi.waitFor(() => { expect(submittedRequests).toHaveLength(2) })
+    const req2 = submittedRequests[1]!
+
+    driver.onSessionEvent('sess-shared', 'agent/inbox/spliced', {
+      target: 'next-turn',
+      start: 0,
+      inserted: [{ id: 'msg-mr-2', source: { kind: 'user', rpcId: req2.requestId } }],
+    })
+    driver.onSessionEvent('sess-shared', 'agent/inbox/spliced', {
+      target: 'next-turn',
+      start: 0,
+      removedCount: 1,
+      inserted: [],
+      outcome: 'canceled',
+    })
+
+    expect(await turnPromise2).toEqual({
+      sessionId: 'sess-shared',
+      error: '排队的 MR 评审消息已被取消',
+    })
   })
 })

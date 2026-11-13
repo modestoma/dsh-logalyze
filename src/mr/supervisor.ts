@@ -54,9 +54,17 @@ const HOUR_MS = 60 * 60 * 1000
 const WORKDIR_RETENTION_MS = 14 * DAY_MS
 const RECORD_RETENTION_MS = 60 * DAY_MS
 const DEBOUNCE_MAX_WAIT_MS = 5 * 60 * 1000
-const MAX_MR_LIST_PAGES = 10
+const MAX_MR_LIST_PAGES = 1_000
 
 type TurnOutcome = 'ran' | 'noop' | 'blocked'
+
+interface RepoPaginationProgress {
+  readonly nextPage: number
+  readonly state: 'open' | 'all'
+  readonly targetBranch: string | undefined
+  readonly updatedAfter: string | undefined
+  readonly watermarkMs: number | undefined
+}
 
 /** Parameters to register a self-authored MR (`self-fix` / `self-skill`). */
 export interface RegisterSelfMrInput {
@@ -100,6 +108,8 @@ export interface MrSupervisorDeps {
   readonly logger?: HostLogger
   /** Override periodic timer creation in tests. */
   readonly autoPollTimer?: boolean
+  /** Override maximum `mrList` pages fetched per repository per poll (primarily for tests). */
+  readonly maxListPagesPerPoll?: number
 }
 
 function breakerStorageKey(scope: BreakerStatusWire['scope'], key: string): string {
@@ -126,12 +136,17 @@ async function listRepoMrs(
     readonly state: 'open' | 'all'
     readonly targetBranch?: string
     readonly updatedAfter?: string
+    readonly startPage?: number
+    readonly maxPages?: number
   },
   signal?: AbortSignal,
-): Promise<MrInfo[]> {
+): Promise<{ readonly items: MrInfo[]; readonly nextPage: number | undefined }> {
   const collected: MrInfo[] = []
-  let page = 1
-  for (let i = 0; i < MAX_MR_LIST_PAGES; i += 1) {
+  const maxPages = Math.max(1, params.maxPages ?? MAX_MR_LIST_PAGES)
+  let page = Math.max(1, params.startPage ?? 1)
+  let nextPage: number | undefined
+  for (let i = 0; i < maxPages; i += 1) {
+    signal?.throwIfAborted()
     const res = await repos.mrList({
       repo: params.repo,
       state: params.state,
@@ -143,20 +158,26 @@ async function listRepoMrs(
       signal,
     })
     collected.push(...res.items)
-    if (res.nextPage === undefined) break
+    if (res.nextPage === undefined || res.items.length === 0 || res.nextPage <= page) {
+      nextPage = undefined
+      break
+    }
+    nextPage = res.nextPage
     page = res.nextPage
   }
-  return collected
+  return { items: collected, nextPage }
 }
 
 /** Stateful orchestrator supervising MR discovery, debounced wakeups, persistent sessions, and safety limits. */
 export class MrSupervisor implements MrToolsRuntime {
   private readonly now: () => number
   private readonly autoPollTimer: boolean
+  private readonly maxListPagesPerPoll: number
   private readonly debouncer: KeyedDebouncer<MrPendingSignal, string>
   private readonly keyLocks = new Map<string, Promise<unknown>>()
   private readonly sessionToKey = new Map<string, string>()
   private readonly repoCursors = new Map<string, number>()
+  private readonly repoBackfill = new Map<string, RepoPaginationProgress>()
   private readonly runningKeys = new Set<string>()
   private readonly rerunNeeded = new Set<string>()
   private readonly activeFlushPromises = new Set<Promise<void>>()
@@ -170,6 +191,7 @@ export class MrSupervisor implements MrToolsRuntime {
   constructor(private readonly deps: MrSupervisorDeps) {
     this.now = deps.now ?? Date.now
     this.autoPollTimer = deps.autoPollTimer ?? true
+    this.maxListPagesPerPoll = Math.max(1, deps.maxListPagesPerPoll ?? MAX_MR_LIST_PAGES)
     this.debouncer = new KeyedDebouncer<MrPendingSignal, string>({
       windowMs: Math.max(0, deps.getSettings().debounceMs),
       mode: 'sliding',
@@ -202,6 +224,7 @@ export class MrSupervisor implements MrToolsRuntime {
         && record.state === 'open'
         && record.pendingSignals.length > 0
         && record.dueAt !== undefined
+        && this.isRecordRepoEligible(record)
         && !this.isTurnBreakerTripped(key, record.repo)
       ) {
         const remainingMs = Math.max(0, record.dueAt - currentNow)
@@ -214,6 +237,9 @@ export class MrSupervisor implements MrToolsRuntime {
     await this.sweepRetention().catch((error: unknown) => {
       this.deps.logger?.warn?.('logalyze: MR 留存清理失败：%s', messageOf(error))
     })
+    await this.suspendIneligibleDeadlines().catch((error: unknown) => {
+      this.deps.logger?.warn?.('logalyze: 清理未启用仓库 MR 截止时间失败：%s', messageOf(error))
+    })
     await this.resumeDormantPending()
     this.scheduleNextPoll(0)
   }
@@ -221,18 +247,26 @@ export class MrSupervisor implements MrToolsRuntime {
   /** Notify supervisor when `mr-review` repository list or settings changed. */
   notifyConfigOrReposChanged(): void {
     if (this.closed || !this.started) return
+    this.pruneRemovedRepoWatermarks()
     const settings = this.deps.getSettings()
     this.deps.mrPool.setConcurrency(settings.maxConcurrentSessions)
     if (!settings.enabled) {
       this.debouncer.cancelAll()
-      void this.suspendPendingDeadlines().catch((error: unknown) => {
+      const suspendPromise = this.suspendPendingDeadlines().catch((error: unknown) => {
         this.deps.logger?.warn?.('logalyze: 清理暂停 MR 截止时间失败：%s', messageOf(error))
       })
+      this.trackFlushPromise(suspendPromise)
       return
     }
-    void this.resumeDormantPending().catch((error: unknown) => {
+    for (const [mrKey, rec] of this.deps.table.entries()) {
+      if (!this.isRecordRepoEligible(rec)) {
+        this.debouncer.cancel(mrKey)
+      }
+    }
+    const reconcilePromise = this.reconcilePendingEligibility().catch((error: unknown) => {
       this.deps.logger?.warn?.('logalyze: MR 恢复待办失败：%s', messageOf(error))
     })
+    this.trackFlushPromise(reconcilePromise)
     this.scheduleNextPoll(0)
   }
 
@@ -393,13 +427,13 @@ export class MrSupervisor implements MrToolsRuntime {
         const matches = (scope === 'mr' && mrKey === key)
           || (scope === 'mr-fix' && mrKey === key)
           || (scope === 'mr-repo' && rec.repo === key)
-        if (matches && !this.isTurnBreakerTripped(mrKey, rec.repo)) {
+        if (matches && !this.isTurnBreakerTripped(mrKey, rec.repo) && this.isRecordRepoEligible(rec)) {
           const updated = await this.updateRecord(rec.repo, rec.mrNumber, cur => ({
             ...cur,
             dueAt: currentNow,
             updatedAt: currentNow,
           }))
-          if (!this.closed && this.deps.getSettings().enabled) {
+          if (!this.closed && this.deps.getSettings().enabled && this.isRecordRepoEligible(updated)) {
             for (const sig of updated.pendingSignals) {
               this.debouncer.push(mrKey, sig, { windowMs: 0 })
             }
@@ -560,6 +594,29 @@ export class MrSupervisor implements MrToolsRuntime {
     this.pollTimer = timer
   }
 
+  private findEligibleMrRepo(repoUrl: string): MrRepoStatusWire | undefined {
+    return this.deps.getMrRepos().find(repo => repo.url === repoUrl)
+  }
+
+  private isRecordRepoEligible(record: Pick<SupervisedMrRecord, 'repo' | 'targetBranch'>): boolean {
+    const mrRepo = this.findEligibleMrRepo(record.repo)
+    if (mrRepo === undefined) return false
+    if (mrRepo.targetBranch !== undefined && record.targetBranch !== undefined && record.targetBranch !== mrRepo.targetBranch) {
+      return false
+    }
+    return true
+  }
+
+  private pruneRemovedRepoWatermarks(): void {
+    const activeUrls = new Set(this.deps.getMrRepos().map(repo => repo.url))
+    for (const url of [...this.repoCursors.keys()]) {
+      if (!activeUrls.has(url)) this.repoCursors.delete(url)
+    }
+    for (const url of [...this.repoBackfill.keys()]) {
+      if (!activeUrls.has(url)) this.repoBackfill.delete(url)
+    }
+  }
+
   private isTurnBreakerTripped(mrKey: string, repo: string): boolean {
     return (
       this.deps.breakers.inspect(`mr:${mrKey}`).tripped
@@ -582,6 +639,28 @@ export class MrSupervisor implements MrToolsRuntime {
     }
   }
 
+  private async suspendIneligibleDeadlines(): Promise<void> {
+    if (this.closed) return
+    const currentNow = this.now()
+    for (const [mrKey, rec] of this.deps.table.entries()) {
+      if (this.closed) break
+      if (rec.state !== 'open' || rec.dueAt === undefined || this.runningKeys.has(mrKey)) continue
+      if (this.isRecordRepoEligible(rec)) continue
+      this.debouncer.cancel(mrKey)
+      await this.updateRecord(rec.repo, rec.mrNumber, (cur) => {
+        if (this.runningKeys.has(mrKey) || cur.state !== 'open' || cur.dueAt === undefined || this.isRecordRepoEligible(cur)) {
+          return cur
+        }
+        return { ...cur, dueAt: undefined, updatedAt: currentNow }
+      }).catch(() => undefined)
+    }
+  }
+
+  private async reconcilePendingEligibility(): Promise<void> {
+    await this.suspendIneligibleDeadlines()
+    await this.resumeDormantPending()
+  }
+
   private async resumeDormantPending(): Promise<void> {
     if (this.closed) return
     const settings = this.deps.getSettings()
@@ -592,6 +671,7 @@ export class MrSupervisor implements MrToolsRuntime {
     for (const [mrKey, rec] of this.deps.table.entries()) {
       if (this.closed) break
       if (rec.state !== 'open' || rec.pendingSignals.length === 0) continue
+      if (!this.isRecordRepoEligible(rec)) continue
       if (this.runningKeys.has(mrKey) || this.debouncer.peek(mrKey) !== undefined) continue
       if (this.isTurnBreakerTripped(mrKey, rec.repo)) continue
       if (rec.pendingSignals.every(s => s.kind === 'ci-failed') && this.deps.breakers.inspect(`mr-fix:${mrKey}`).tripped) {
@@ -600,12 +680,20 @@ export class MrSupervisor implements MrToolsRuntime {
 
       let resumedRecord: SupervisedMrRecord | undefined
       await this.updateRecord(rec.repo, rec.mrNumber, (cur) => {
-        if (!this.deps.getSettings().enabled || cur.state !== 'open' || cur.pendingSignals.length === 0) return cur
+        if (!this.deps.getSettings().enabled || !this.isRecordRepoEligible(cur) || cur.state !== 'open' || cur.pendingSignals.length === 0) {
+          return cur
+        }
         const effectiveDue = cur.dueAt !== undefined && cur.dueAt > currentNow ? cur.dueAt : currentNow
         resumedRecord = { ...cur, dueAt: effectiveDue, updatedAt: currentNow }
         return resumedRecord
       })
-      if (resumedRecord !== undefined && !this.closed && !this.runningKeys.has(mrKey) && this.debouncer.peek(mrKey) === undefined) {
+      if (
+        resumedRecord !== undefined
+        && !this.closed
+        && !this.runningKeys.has(mrKey)
+        && this.isRecordRepoEligible(resumedRecord)
+        && this.debouncer.peek(mrKey) === undefined
+      ) {
         const windowMs = Math.max(0, (resumedRecord.dueAt ?? currentNow) - currentNow)
         for (const sig of resumedRecord.pendingSignals) {
           this.debouncer.push(mrKey, sig, { windowMs })
@@ -617,9 +705,11 @@ export class MrSupervisor implements MrToolsRuntime {
   private async doPoll(signal?: AbortSignal): Promise<void> {
     const settings = this.deps.getSettings()
     this.deps.mrPool.setConcurrency(settings.maxConcurrentSessions)
+    this.pruneRemovedRepoWatermarks()
     if (!settings.enabled) return
     const lookup = this.deps.repos.lookupV8()
     if (lookup.availability !== 'ready') return
+    await this.suspendIneligibleDeadlines()
     await this.resumeDormantPending()
     const mrRepos = this.deps.getMrRepos()
     if (mrRepos.length === 0) return
@@ -652,32 +742,52 @@ export class MrSupervisor implements MrToolsRuntime {
     // Self-trigger iron law: skip evaluating discussions if bot identity cannot be resolved.
     const bot = await repos.currentBotUser({ repo: mrRepo.url, signal })
     const cursor = this.repoCursors.get(mrRepo.url)
+    const savedBackfill = this.repoBackfill.get(mrRepo.url)
+    const inProgress = savedBackfill !== undefined && savedBackfill.targetBranch === mrRepo.targetBranch
+      ? savedBackfill
+      : undefined
+    if (savedBackfill !== undefined && inProgress === undefined) {
+      this.repoBackfill.delete(mrRepo.url)
+    }
+
+    const startPage = inProgress?.nextPage ?? 1
+    const queryState = inProgress?.state ?? (cursor === undefined ? 'open' : 'all')
+    const queryUpdatedAfter = inProgress !== undefined
+      ? inProgress.updatedAfter
+      : (cursor === undefined ? undefined : new Date(Math.max(0, cursor - 2000)).toISOString())
+
     const listed = await listRepoMrs(repos, {
       repo: mrRepo.url,
-      state: cursor === undefined ? 'open' : 'all',
+      state: queryState,
       ...(mrRepo.targetBranch === undefined ? {} : { targetBranch: mrRepo.targetBranch }),
-      ...(cursor === undefined ? {} : { updatedAfter: new Date(Math.max(0, cursor - 2000)).toISOString() }),
+      ...(queryUpdatedAfter === undefined ? {} : { updatedAfter: queryUpdatedAfter }),
+      startPage,
+      maxPages: this.maxListPagesPerPoll,
     }, signal)
 
-    let nextCursor = cursor
-    for (const item of listed) {
-      const parsedMs = Date.parse(item.updatedAt)
-      if (!Number.isNaN(parsedMs) && (nextCursor === undefined || parsedMs > nextCursor)) {
-        nextCursor = parsedMs
+    let watermarkMs: number | undefined = inProgress?.watermarkMs ?? cursor
+    if (inProgress === undefined || inProgress.watermarkMs === undefined) {
+      for (const item of listed.items) {
+        const parsedMs = Date.parse(item.updatedAt)
+        if (!Number.isNaN(parsedMs) && (watermarkMs === undefined || parsedMs > watermarkMs)) {
+          watermarkMs = parsedMs
+        }
       }
     }
 
-    const byNumber = new Map<number, MrInfo>(listed.map(item => [item.number, item]))
+    const byNumber = new Map<number, MrInfo>(listed.items.map(item => [item.number, item]))
 
     // Ensure tracked open MRs missing from incremental window (e.g. merged offline or CI check change) are still checked.
-    for (const record of this.deps.table.values()) {
-      if (record.repo !== mrRepo.url) continue
-      if (record.state !== 'open' && record.state !== 'draft_skipped') continue
-      if (byNumber.has(record.mrNumber)) continue
-      const isSelf = record.origin === 'self-fix' || record.origin === 'self-skill'
-      if (cursor === undefined || isSelf) {
-        const detail = await repos.mrGet({ repo: mrRepo.url, number: record.mrNumber, signal })
-        byNumber.set(record.mrNumber, detail)
+    if (startPage === 1) {
+      for (const record of this.deps.table.values()) {
+        if (record.repo !== mrRepo.url) continue
+        if (record.state !== 'open' && record.state !== 'draft_skipped') continue
+        if (byNumber.has(record.mrNumber)) continue
+        const isSelf = record.origin === 'self-fix' || record.origin === 'self-skill'
+        if (cursor === undefined || isSelf) {
+          const detail = await repos.mrGet({ repo: mrRepo.url, number: record.mrNumber, signal })
+          byNumber.set(record.mrNumber, detail)
+        }
       }
     }
 
@@ -690,8 +800,21 @@ export class MrSupervisor implements MrToolsRuntime {
       await this.processPolledMr(repos, mrRepo, mr, bot, settings, signal)
     }
 
-    if (completedAll && nextCursor !== undefined) {
-      this.repoCursors.set(mrRepo.url, nextCursor)
+    if (completedAll) {
+      if (listed.nextPage !== undefined) {
+        this.repoBackfill.set(mrRepo.url, {
+          nextPage: listed.nextPage,
+          state: queryState,
+          targetBranch: mrRepo.targetBranch,
+          updatedAfter: queryUpdatedAfter,
+          watermarkMs,
+        })
+      } else {
+        this.repoBackfill.delete(mrRepo.url)
+        if (watermarkMs !== undefined) {
+          this.repoCursors.set(mrRepo.url, watermarkMs)
+        }
+      }
     }
   }
 
@@ -913,7 +1036,9 @@ export class MrSupervisor implements MrToolsRuntime {
       const currentNow = this.now()
       const shouldFollowUp = outcome === 'ran'
         && !this.closed
+        && this.deps.getSettings().enabled
         && latest?.state === 'open'
+        && this.isRecordRepoEligible(latest)
         && latest.pendingSignals.length > 0
         && latest.dueAt !== undefined
         && (latest.dueAt <= currentNow || (rerunRequested && this.debouncer.peek(key) === undefined))
@@ -941,7 +1066,12 @@ export class MrSupervisor implements MrToolsRuntime {
 
     const repos = this.deps.repos.lookupV8()
     const settings = this.deps.getSettings()
-    if (!settings.enabled || repos.availability !== 'ready' || this.isTurnBreakerTripped(key, initial.repo)) {
+    if (
+      !settings.enabled
+      || repos.availability !== 'ready'
+      || !this.isRecordRepoEligible(initial)
+      || this.isTurnBreakerTripped(key, initial.repo)
+    ) {
       this.debouncer.cancel(key)
       if (initial.dueAt !== undefined) {
         await this.updateRecord(initial.repo, initial.mrNumber, cur => ({
@@ -960,6 +1090,21 @@ export class MrSupervisor implements MrToolsRuntime {
     if (mr.state === 'merged' || mr.state === 'closed') {
       await this.handleTerminalMr(initial, mr, this.now())
       return 'noop'
+    }
+    const latestEligibleRepo = this.findEligibleMrRepo(initial.repo)
+    if (
+      !this.deps.getSettings().enabled
+      || latestEligibleRepo === undefined
+      || (latestEligibleRepo.targetBranch !== undefined && mr.targetBranch !== latestEligibleRepo.targetBranch)
+    ) {
+      this.debouncer.cancel(key)
+      await this.updateRecord(initial.repo, initial.mrNumber, cur => ({
+        ...cur,
+        targetBranch: mr.targetBranch,
+        dueAt: undefined,
+        updatedAt: this.now(),
+      }))
+      return 'blocked'
     }
 
     const capturedBatch = [...initial.pendingSignals]
