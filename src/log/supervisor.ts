@@ -181,12 +181,16 @@ export class LogSupervisor {
   private readonly batchTimers = new Map<string, ScheduledBatchTimer>()
   private readonly batchLocks = new Map<string, Promise<unknown>>()
   private readonly taskLocks = new Map<string, Promise<unknown>>()
+  private readonly toolOpLocks = new Map<string, Promise<unknown>>()
+  private readonly watermarkLocks = new Map<string, Promise<unknown>>()
   private readonly backgroundWork = new Set<Promise<unknown>>()
   private readonly activeTaskIds = new Set<string>()
   private readonly sessionToTaskIds = new Map<string, string[]>()
   private readonly launchKeyToTaskId = new Map<string, string>()
   private readonly liveTopicWaiters = new Map<string, Set<() => void>>()
   private readonly topicDeliveryLocks = new Map<string, Promise<unknown>>()
+
+  private watermarkEpoch = 0
 
   private lastConcurrency: number
   private booted = false
@@ -341,7 +345,13 @@ export class LogSupervisor {
     let tracked: Promise<void> | undefined
     tracked = (async (): Promise<void> => {
       try {
-        await this.runPollCycle()
+        while (!this.closed) {
+          const expectedEpoch = this.watermarkEpoch
+          await this.runPollCycle(expectedEpoch)
+          if (this.closed || this.watermarkEpoch === expectedEpoch) break
+          const wm = this.readWatermark()
+          if (wm.paused || !this.deps.getSettings().enabled) break
+        }
       } finally {
         if (this.pollInFlight === tracked) {
           this.pollInFlight = undefined
@@ -438,39 +448,49 @@ export class LogSupervisor {
     if (!parsed.success) {
       throw new Error(parsed.error.issues[0]?.message ?? '水位线操作参数不合法')
     }
-    const current = this.readWatermark()
-    const now = this.now()
-    if (parsed.data.action === 'pause') {
+    let rewindIso: string | undefined
+    if (parsed.data.action === 'rewind') {
+      const parsedMs = Date.parse(parsed.data.cursorTime)
+      if (!Number.isFinite(parsedMs)) {
+        throw new Error(`回拨时间不是有效的 ISO 时间戳：${parsed.data.cursorTime}`)
+      }
+      rewindIso = new Date(parsedMs).toISOString()
+    }
+
+    const nextPaused = await this.withWatermarkLock(async () => {
+      this.watermarkEpoch += 1
+      const current = this.readWatermark()
+      if (parsed.data.action === 'pause') {
+        await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
+          ...current,
+          paused: true,
+        })
+        return true
+      }
+      if (parsed.data.action === 'resume') {
+        await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
+          ...current,
+          paused: false,
+          consecutiveFailures: 0,
+          lastError: undefined,
+        })
+        return false
+      }
       await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
-        ...current,
-        paused: true,
+        cursorTime: rewindIso!,
+        paused: current.paused,
+        lastPollAt: current.lastPollAt,
+        consecutiveFailures: 0,
+        ...(current.paused ? {} : { lastError: undefined }),
       })
+      return current.paused
+    })
+
+    if (parsed.data.action === 'pause') {
       this.clearPollTimer()
       return
     }
-    if (parsed.data.action === 'resume') {
-      await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
-        ...current,
-        paused: false,
-        consecutiveFailures: 0,
-        lastError: undefined,
-      })
-      if (this.autoPollTimer) this.scheduleNextPoll(0)
-      return
-    }
-    const parsedMs = Date.parse(parsed.data.cursorTime)
-    if (!Number.isFinite(parsedMs)) {
-      throw new Error(`回拨时间不是有效的 ISO 时间戳：${parsed.data.cursorTime}`)
-    }
-    const iso = new Date(parsedMs).toISOString()
-    await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
-      cursorTime: iso,
-      paused: current.paused,
-      lastPollAt: current.lastPollAt,
-      consecutiveFailures: 0,
-      ...(current.paused ? {} : { lastError: undefined }),
-    })
-    if (this.autoPollTimer && !current.paused && now >= 0) {
+    if (!nextPaused && this.autoPollTimer) {
       this.scheduleNextPoll(0)
     }
   }
@@ -617,6 +637,7 @@ export class LogSupervisor {
       resolveTaskForSession: (sessionId, taskId) => this.resolveTaskForSession(sessionId, taskId),
       createFeishuTask: input => this.createFeishuTask(input),
       updateTask: (taskId, updater) => this.updateTask(taskId, updater),
+      withTaskOperation: (taskId, fn) => this.withTaskOperation(taskId, fn),
       onRevisionSubmitted: params => this.onRevisionSubmitted(params),
       ...(this.deps.registerSelfMr === undefined ? {} : { registerSelfMr: this.deps.registerSelfMr }),
       logWorkspacesRoot: () => this.deps.workspacesRoot,
@@ -696,18 +717,21 @@ export class LogSupervisor {
     this.pollTimer = timer
   }
 
-  private async runPollCycle(): Promise<void> {
-    if (this.closed) return
+  private async runPollCycle(expectedEpoch: number): Promise<void> {
+    const isEpochCurrent = (): boolean => !this.closed && this.watermarkEpoch === expectedEpoch
+    if (!isEpochCurrent()) return
     const settings = this.deps.getSettings()
     if (!settings.enabled) return
     await this.reconcilePendingTopics().catch((error: unknown) => {
       this.deps.logger?.warn?.('logalyze: 轮询前补发静默摘要卡片失败：%s', messageOf(error))
     })
+    if (!isEpochCurrent()) return
     const wm = this.readWatermark()
     if (wm.paused) return
     await this.reconcilePendingBatches().catch((error: unknown) => {
       this.deps.logger?.warn?.('logalyze: 轮询前复查待发批次失败：%s', messageOf(error))
     })
+    if (!isEpochCurrent()) return
     if (platformProblem(this.deps.getPlatformSettings()) !== undefined) return
 
     const currentNow = this.now()
@@ -720,10 +744,14 @@ export class LogSupervisor {
     const fromMs = Date.parse(fromIso)
     const toMs = Date.parse(toIso)
     if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs >= toMs) {
-      await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
-        ...wm,
-        lastPollAt: currentNow,
-        lastError: undefined,
+      await this.withWatermarkLock(async () => {
+        if (!isEpochCurrent()) return
+        const latestWm = this.readWatermark()
+        await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
+          ...latestWm,
+          lastPollAt: currentNow,
+          lastError: undefined,
+        })
       })
       return
     }
@@ -731,7 +759,7 @@ export class LogSupervisor {
     let cursor = resumingBackfill ? wm.backfillCursor : undefined
     try {
       for (let pageIndex = 0; pageIndex < MAX_POLL_PAGES; pageIndex += 1) {
-        if (this.closed) return
+        if (!isEpochCurrent()) return
         const page = await this.deps.platform.listLogsPage({
           archivedFrom: fromIso,
           archivedTo: toIso,
@@ -739,6 +767,7 @@ export class LogSupervisor {
           limit: 100,
           ...(cursor === undefined ? {} : { cursor }),
         })
+        if (!isEpochCurrent()) return
 
         const eligible = page.items.filter(
           item => item.storage_type === 'fds' && item.status === 'completed',
@@ -746,45 +775,62 @@ export class LogSupervisor {
         if (eligible.length > 0) {
           await this.ingestPolledLogs(eligible)
         }
+        if (!isEpochCurrent()) return
 
-        const latestWm = this.readWatermark()
         const pageTime = this.now()
         if (page.nextCursor !== undefined && page.nextCursor !== '') {
           // Persist multi-page cursor before querying the next page so crashes never lose progress.
-          await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
-            ...latestWm,
-            backfillFrom: fromIso,
-            backfillTo: toIso,
-            backfillCursor: page.nextCursor,
-            lastPollAt: pageTime,
-            consecutiveFailures: 0,
-            lastError: undefined,
+          const committed = await this.withWatermarkLock(async () => {
+            if (!isEpochCurrent()) return false
+            const latestWm = this.readWatermark()
+            await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
+              ...latestWm,
+              backfillFrom: fromIso,
+              backfillTo: toIso,
+              backfillCursor: page.nextCursor!,
+              lastPollAt: pageTime,
+              consecutiveFailures: 0,
+              lastError: undefined,
+            })
+            return true
           })
+          if (!committed) return
           cursor = page.nextCursor
         } else {
-          await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
-            cursorTime: toIso,
-            ...(latestWm.cursorId === undefined ? {} : { cursorId: latestWm.cursorId }),
-            paused: latestWm.paused,
-            lastPollAt: pageTime,
-            consecutiveFailures: 0,
+          await this.withWatermarkLock(async () => {
+            if (!isEpochCurrent()) return
+            const latestWm = this.readWatermark()
+            await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
+              cursorTime: toIso,
+              ...(latestWm.cursorId === undefined ? {} : { cursorId: latestWm.cursorId }),
+              paused: latestWm.paused,
+              lastPollAt: pageTime,
+              consecutiveFailures: 0,
+            })
           })
           return
         }
       }
       this.deps.logger?.warn?.('logalyze: 单轮日志拉取达到页数上限 %d，将在下周期继续回填', MAX_POLL_PAGES)
     } catch (error) {
-      if (this.closed) return
-      const latestWm = this.readWatermark()
-      const failures = latestWm.consecutiveFailures + 1
+      if (!isEpochCurrent()) return
       const errMsg = messageOf(error)
-      await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
-        ...latestWm,
-        lastPollAt: this.now(),
-        consecutiveFailures: failures,
-        lastError: errMsg,
+      let failures = 0
+      const committed = await this.withWatermarkLock(async () => {
+        if (!isEpochCurrent()) return false
+        const latestWm = this.readWatermark()
+        failures = latestWm.consecutiveFailures + 1
+        await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
+          ...latestWm,
+          lastPollAt: this.now(),
+          consecutiveFailures: failures,
+          lastError: errMsg,
+        })
+        return true
       })
-      this.deps.logger?.warn?.('logalyze: 增量拉取平台日志失败（第 %d 次）：%s', failures, errMsg)
+      if (committed) {
+        this.deps.logger?.warn?.('logalyze: 增量拉取平台日志失败（第 %d 次）：%s', failures, errMsg)
+      }
     }
   }
 
@@ -825,6 +871,7 @@ export class LogSupervisor {
     }
     for (const [, task] of this.deps.logTasks.entries()) {
       if (task.source !== 'platform') continue
+      if (task.status !== 'running' && task.status !== 'completed' && task.revisions.length === 0) continue
       for (const input of task.inputs) {
         if (input.logId !== undefined) seen.add(input.logId.toLowerCase())
       }
@@ -1155,23 +1202,40 @@ export class LogSupervisor {
     const topics = this.deps.getTopics()
     const chatId = task.feishuChatId ?? this.deps.getSettings().feishuChatId
 
-    if (task.feishuLaunchKey !== undefined) {
-      if (topics === undefined) {
-        await this.waitForTopicTerminal(taskId, task.feishuLaunchKey, signal)
-        return
+    try {
+      if (task.feishuLaunchKey !== undefined) {
+        if (topics === undefined) {
+          await this.waitForTopicTerminal(taskId, task.feishuLaunchKey, signal)
+          return
+        }
+        if (chatId !== undefined) {
+          await this.runLiveTopicBatch(taskId, task, chatId, topics, signal)
+          return
+        }
       }
-      if (chatId !== undefined) {
+
+      if (mode === 'topic-on-start' && topics !== undefined && chatId !== undefined) {
         await this.runLiveTopicBatch(taskId, task, chatId, topics, signal)
         return
       }
-    }
 
-    if (mode === 'topic-on-start' && topics !== undefined && chatId !== undefined) {
-      await this.runLiveTopicBatch(taskId, task, chatId, topics, signal)
-      return
+      await this.runHeadlessBatch(taskId, signal)
+    } catch (error) {
+      if (!this.closed && !signal.aborted && this.deps.logTasks.get(taskId)?.status === 'running') {
+        const errMsg = messageOf(error)
+        await this.updateTask(taskId, cur => (
+          cur.status === 'running'
+            ? {
+              ...cur,
+              status: cur.revisions.length > 0 ? 'completed' : 'failed',
+              lastError: cur.revisions.length > 0 ? undefined : errMsg,
+              updatedAt: this.now(),
+            }
+            : cur
+        )).catch(() => undefined)
+      }
+      throw error
     }
-
-    await this.runHeadlessBatch(taskId, signal)
   }
 
   private async runLiveTopicBatch(
@@ -1312,75 +1376,67 @@ export class LogSupervisor {
       headless: true,
     })
 
-    const turnResult = await this.deps.sessionDriver.runTurn({
-      taskId,
-      appId: initial.appId,
-      existingSessionId: initial.sessionId,
-      workDir,
-      prompt,
-      signal,
-      onSessionBound: async (sid) => {
-        this.indexSessionTask(sid, taskId)
-        await this.updateTask(taskId, cur => ({
-          ...cur,
-          sessionId: cur.sessionId ?? sid,
-          updatedAt: this.now(),
-        }))
-      },
-    })
+    let boundSessionId: string | undefined = initial.sessionId
+    let turnResult: { readonly sessionId?: string; readonly error?: string }
+    try {
+      turnResult = await this.deps.sessionDriver.runTurn({
+        taskId,
+        appId: initial.appId,
+        existingSessionId: initial.sessionId,
+        workDir,
+        prompt,
+        signal,
+        onSessionBound: async (sid) => {
+          boundSessionId = sid
+          this.indexSessionTask(sid, taskId)
+          await this.updateTask(taskId, cur => ({
+            ...cur,
+            sessionId: cur.sessionId ?? sid,
+            updatedAt: this.now(),
+          }))
+        },
+      })
+    } catch (error) {
+      turnResult = {
+        ...(boundSessionId === undefined ? {} : { sessionId: boundSessionId }),
+        error: messageOf(error),
+      }
+    }
 
-    this.indexSessionTask(turnResult.sessionId, taskId)
+    if (turnResult.sessionId !== undefined) {
+      this.indexSessionTask(turnResult.sessionId, taskId)
+    }
 
     const latest = await this.updateTask(taskId, (cur) => {
-      if (turnResult.error !== undefined) {
-        if (signal.aborted || this.closed) {
-          if (cur.revisions.length > 0) {
-            const quietNeedsCard = (cur.deliveryMode ?? mode) === 'quiet-until-done'
-              && cur.feishuLaunchKey === undefined
-              && (cur.feishuChatId ?? this.deps.getSettings().feishuChatId) !== undefined
-            return {
-              ...cur,
-              sessionId: cur.sessionId ?? turnResult.sessionId,
-              status: 'completed',
-              lastError: undefined,
-              ...(quietNeedsCard ? { pendingTopicDelivery: true } : {}),
-              updatedAt: this.now(),
-            }
-          }
-          return {
-            ...cur,
-            sessionId: cur.sessionId ?? turnResult.sessionId,
-            status: 'running',
-            lastError: turnResult.error,
-            updatedAt: this.now(),
-          }
-        }
+      const nextSessionId = cur.sessionId ?? turnResult.sessionId
+      const quietNeedsCard = (cur.deliveryMode ?? mode) === 'quiet-until-done'
+        && cur.feishuLaunchKey === undefined
+        && (cur.feishuChatId ?? this.deps.getSettings().feishuChatId) !== undefined
+
+      if (cur.revisions.length > 0) {
         return {
           ...cur,
-          sessionId: cur.sessionId ?? turnResult.sessionId,
-          status: 'failed',
+          ...(nextSessionId === undefined ? {} : { sessionId: nextSessionId }),
+          status: 'completed',
+          lastError: undefined,
+          ...(quietNeedsCard ? { pendingTopicDelivery: true } : {}),
+          updatedAt: this.now(),
+        }
+      }
+      if (turnResult.error !== undefined) {
+        return {
+          ...cur,
+          ...(nextSessionId === undefined ? {} : { sessionId: nextSessionId }),
+          status: (signal.aborted || this.closed) ? 'running' : 'failed',
           lastError: turnResult.error,
           updatedAt: this.now(),
         }
       }
-      if (cur.revisions.length === 0) {
-        return {
-          ...cur,
-          sessionId: cur.sessionId ?? turnResult.sessionId,
-          status: 'failed',
-          lastError: '无头诊断回合完成但未调用 supervisor_log_submit 提交结论',
-          updatedAt: this.now(),
-        }
-      }
-      const quietNeedsCard = (cur.deliveryMode ?? mode) === 'quiet-until-done'
-        && cur.feishuLaunchKey === undefined
-        && (cur.feishuChatId ?? this.deps.getSettings().feishuChatId) !== undefined
       return {
         ...cur,
-        sessionId: cur.sessionId ?? turnResult.sessionId,
-        status: 'completed',
-        lastError: undefined,
-        ...(quietNeedsCard ? { pendingTopicDelivery: true } : {}),
+        ...(nextSessionId === undefined ? {} : { sessionId: nextSessionId }),
+        status: 'failed',
+        lastError: '无头诊断回合完成但未调用 supervisor_log_submit 提交结论',
         updatedAt: this.now(),
       }
     })
@@ -1722,7 +1778,7 @@ export class LogSupervisor {
     if (task === undefined) {
       throw permanentOutboxError(`任务 ${record.taskId} 不存在`)
     }
-    const revision = task.revisions.find(r => r.revision === record.revision)
+    const revision = [...task.revisions].reverse().find(r => r.revision === record.revision)
     if (revision === undefined) {
       throw permanentOutboxError(`任务 ${record.taskId} 不存在修订 rev ${record.revision}`)
     }
@@ -2049,6 +2105,14 @@ export class LogSupervisor {
 
   private withTaskLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
     return this.serializeKeyedLock(this.taskLocks, key, fn)
+  }
+
+  private withTaskOperation<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    return this.serializeKeyedLock(this.toolOpLocks, key, fn)
+  }
+
+  private withWatermarkLock<T>(fn: () => Promise<T>): Promise<T> {
+    return this.serializeKeyedLock(this.watermarkLocks, LOG_WATERMARK_KEY, fn)
   }
 
   private withTopicDeliveryLock<T>(key: string, fn: () => Promise<T>): Promise<T> {

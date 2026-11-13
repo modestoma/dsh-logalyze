@@ -97,6 +97,7 @@ export interface LogToolsRuntime {
     readonly inputs: readonly LogTaskInput[]
   }): Promise<{ readonly taskId: string; readonly task: LogTaskRecord }>
   updateTask(taskId: string, updater: (current: LogTaskRecord) => LogTaskRecord): Promise<LogTaskRecord>
+  withTaskOperation<T>(taskId: string, fn: () => Promise<T>): Promise<T>
   onRevisionSubmitted(params: {
     readonly taskId: string
     readonly task: LogTaskRecord
@@ -549,78 +550,86 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
         bound = await runtime.createFeishuTask({ sessionId, workDir, app, inputs })
       }
 
-      const workDir = workspaceRootOf(exec, runtime, bound.task.workDir)
-      await mkdir(join(workDir, 'repos'), { recursive: true })
-      await mkdir(join(workDir, 'scratch'), { recursive: true })
-
-      const preparedLogs = await prepareLogDirectory({
-        runtime,
-        workDir,
-        taskId: bound.taskId,
-        task: bound.task,
-        app,
-        signal: exec.signal,
-      })
-
-      const slug = appSlugOf(app.app.id)
-      const repoDir = join(workDir, 'repos', args.workspace === 'knowledge' ? `${slug}-knowledge` : slug)
-      await ensureAppWorkspace({
-        repos: runtime.requireRepos(),
-        repoDir,
-        app,
-        taskId: bound.taskId,
-        mode: args.workspace,
-        exec,
-      })
-
-      await runtime.updateTask(bound.taskId, cur => ({
-        ...cur,
-        sessionId: cur.sessionId ?? sessionId,
-        workDir: resolve(cur.workDir ?? '') === workDir ? cur.workDir : workDir,
-        inputs: preparedLogs.inputs,
-        updatedAt: runtime.now(),
-      }))
-
-      const repoSkills = await scanRepoSkills(repoDir)
-      const query = defaultSearchQuery(bound.task, app)
-      const matched = runtime.issueMemory().search({ appId: app.app.id, query, limit: 8 })
-      const seenIds = new Set(matched.map(c => c.issueId))
-      const candidates: SearchedIssue[] = [...matched]
-      if (candidates.length < 8) {
-        const extra = runtime
-          .issueMemory()
-          .table.listByApp(app.app.id)
-          .filter(([issueId]) => !seenIds.has(issueId))
-          .sort(([, a], [, b]) => {
-            const aHuman = a.humanConclusion !== undefined ? 1 : 0
-            const bHuman = b.humanConclusion !== undefined ? 1 : 0
-            if (aHuman !== bHuman) return bHuman - aHuman
-            return b.lastSeenAt - a.lastSeenAt
-          })
-        for (const [issueId, record] of extra) {
-          if (candidates.length >= 8) break
-          candidates.push({ issueId, ...record, score: 0 })
+      const initialTaskId = bound.taskId
+      return await runtime.withTaskOperation(initialTaskId, async () => {
+        const currentBound = runtime.resolveTaskForSession(sessionId, initialTaskId)
+        if (currentBound === undefined) {
+          throw new Error(`找不到日志监管任务 "${initialTaskId}"`)
         }
-      }
+        const currentApp = runtime.readyApp(currentBound.task.appId)
+        const workDir = workspaceRootOf(exec, runtime, currentBound.task.workDir)
+        await mkdir(join(workDir, 'repos'), { recursive: true })
+        await mkdir(join(workDir, 'scratch'), { recursive: true })
 
-      return {
-        taskId: bound.taskId,
-        source: bound.task.source,
-        appId: app.app.id,
-        appName: app.app.name,
-        writable: app.writable,
-        baseCommit: app.commit,
-        workDir,
-        logsDir: join(workDir, 'logs'),
-        manifestPath: join(workDir, 'logs', 'manifest.json'),
-        repoDir,
-        scratchDir: join(workDir, 'scratch'),
-        workspaceKind: args.workspace,
-        reused: preparedLogs.reused,
-        slots: preparedLogs.manifest.slots,
-        repoSkills,
-        candidateIssues: formatIssueCandidates(candidates),
-      }
+        const preparedLogs = await prepareLogDirectory({
+          runtime,
+          workDir,
+          taskId: currentBound.taskId,
+          task: currentBound.task,
+          app: currentApp,
+          signal: exec.signal,
+        })
+
+        const slug = appSlugOf(currentApp.app.id)
+        const repoDir = join(workDir, 'repos', args.workspace === 'knowledge' ? `${slug}-knowledge` : slug)
+        await ensureAppWorkspace({
+          repos: runtime.requireRepos(),
+          repoDir,
+          app: currentApp,
+          taskId: currentBound.taskId,
+          mode: args.workspace,
+          exec,
+        })
+
+        await runtime.updateTask(currentBound.taskId, cur => ({
+          ...cur,
+          sessionId: cur.sessionId ?? sessionId,
+          workDir: resolve(cur.workDir ?? '') === workDir ? cur.workDir : workDir,
+          inputs: preparedLogs.inputs,
+          updatedAt: runtime.now(),
+        }))
+
+        const repoSkills = await scanRepoSkills(repoDir)
+        const query = defaultSearchQuery(currentBound.task, currentApp)
+        const matched = runtime.issueMemory().search({ appId: currentApp.app.id, query, limit: 8 })
+        const seenIds = new Set(matched.map(c => c.issueId))
+        const candidates: SearchedIssue[] = [...matched]
+        if (candidates.length < 8) {
+          const extra = runtime
+            .issueMemory()
+            .table.listByApp(currentApp.app.id)
+            .filter(([issueId]) => !seenIds.has(issueId))
+            .sort(([, a], [, b]) => {
+              const aHuman = a.humanConclusion !== undefined ? 1 : 0
+              const bHuman = b.humanConclusion !== undefined ? 1 : 0
+              if (aHuman !== bHuman) return bHuman - aHuman
+              return b.lastSeenAt - a.lastSeenAt
+            })
+          for (const [issueId, record] of extra) {
+            if (candidates.length >= 8) break
+            candidates.push({ issueId, ...record, score: 0 })
+          }
+        }
+
+        return {
+          taskId: currentBound.taskId,
+          source: currentBound.task.source,
+          appId: currentApp.app.id,
+          appName: currentApp.app.name,
+          writable: currentApp.writable,
+          baseCommit: currentApp.commit,
+          workDir,
+          logsDir: join(workDir, 'logs'),
+          manifestPath: join(workDir, 'logs', 'manifest.json'),
+          repoDir,
+          scratchDir: join(workDir, 'scratch'),
+          workspaceKind: args.workspace,
+          reused: preparedLogs.reused,
+          slots: preparedLogs.manifest.slots,
+          repoSkills,
+          candidateIssues: formatIssueCandidates(candidates),
+        }
+      })
     },
   }
 
@@ -749,214 +758,221 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
       }
       const args = parsed.data
       const sessionId = sessionIdOf(exec)
-      const bound = runtime.resolveTaskForSession(sessionId, args.taskId)
-      if (bound === undefined) {
+      const initialBound = runtime.resolveTaskForSession(sessionId, args.taskId)
+      if (initialBound === undefined) {
         throw new Error('当前会话尚未绑定任何日志监管任务，请先调用 supervisor_log_prepare')
       }
-      const { taskId, task } = bound
-      const workDir = task.workDir ?? workspaceRootOf(exec, runtime)
-      const app = runtime.readyApp(task.appId)
-      const slug = appSlugOf(app.app.id)
 
-      // 1. Validate 1:1 ref alignment
-      const expectedRefs = task.inputs.map(i => i.ref)
-      const seenRefs = new Set<string>()
-      for (const item of args.items) {
-        if (!expectedRefs.includes(item.ref)) {
-          throw new Error(`提交包含未知的日志槽位 "${item.ref}"（本任务有效槽位：${expectedRefs.join('、')}）`)
+      return await runtime.withTaskOperation(initialBound.taskId, async () => {
+        const bound = runtime.resolveTaskForSession(sessionId, initialBound.taskId)
+        if (bound === undefined) {
+          throw new Error(`找不到日志监管任务 "${initialBound.taskId}"`)
         }
-        if (seenRefs.has(item.ref)) {
-          throw new Error(`日志槽位 "${item.ref}" 重复提交；每个槽位只能提交一条结论`)
-        }
-        seenRefs.add(item.ref)
-      }
-      const missingRefs = expectedRefs.filter(ref => !seenRefs.has(ref))
-      if (missingRefs.length > 0) {
-        throw new Error(`提交缺少以下日志槽位结论（禁止漏项）：${missingRefs.join('、')}`)
-      }
+        const { taskId, task } = bound
+        const workDir = task.workDir ?? workspaceRootOf(exec, runtime)
+        const app = runtime.readyApp(task.appId)
+        const slug = appSlugOf(app.app.id)
 
-      // 2. Validate evidence presence & real file existence inside <workDir>
-      const reposDir = join(workDir, 'repos')
-      for (const item of args.items) {
-        if (item.status === 'diagnosed' && item.evidences.length === 0) {
-          throw new Error(`槽位 ${item.ref} 标记为 diagnosed，必须提供至少一条可追溯的 evidences`)
-        }
-        let hasRepoEvidence = false
-        for (const ev of item.evidences) {
-          const resolved = await resolveExistingEvidencePath(workDir, slug, ev.source)
-          if (resolved === undefined) {
-            throw new Error(`槽位 ${item.ref} 的证据路径 "${ev.source}" 在工作区 "${workDir}" 中不存在或非普通文件；请填写真实可读的文件路径`)
+        // 1. Validate 1:1 ref alignment
+        const expectedRefs = task.inputs.map(i => i.ref)
+        const seenRefs = new Set<string>()
+        for (const item of args.items) {
+          if (!expectedRefs.includes(item.ref)) {
+            throw new Error(`提交包含未知的日志槽位 "${item.ref}"（本任务有效槽位：${expectedRefs.join('、')}）`)
           }
-          if (isInside(resolved, reposDir)) {
-            hasRepoEvidence = true
+          if (seenRefs.has(item.ref)) {
+            throw new Error(`日志槽位 "${item.ref}" 重复提交；每个槽位只能提交一条结论`)
           }
+          seenRefs.add(item.ref)
         }
-        if (item.status === 'diagnosed' && item.rootCauseCategory === 'code_defect' && !hasRepoEvidence) {
-          throw new Error(`槽位 ${item.ref} 归因为 code_defect，必须包含至少一条指向 repos/ 代码仓库文件的证据`)
+        const missingRefs = expectedRefs.filter(ref => !seenRefs.has(ref))
+        if (missingRefs.length > 0) {
+          throw new Error(`提交缺少以下日志槽位结论（禁止漏项）：${missingRefs.join('、')}`)
         }
-      }
 
-      // 3. Validate & snapshot attachments into report/revisions/rev-N/
-      const nextRevNumber = (task.revisions.reduce((max, r) => Math.max(max, r.revision), 0)) + 1
-      const revDir = join(workDir, REPORT_DIR, 'revisions', `rev-${nextRevNumber}`)
-      await rm(revDir, { recursive: true, force: true })
-      await mkdir(revDir, { recursive: true })
-
-      const savedAttachments: string[] = []
-      const skippedAttachments: string[] = []
-      for (const relRaw of args.attachments ?? []) {
-        const cleanRel = relRaw.replace(/\\/gu, '/').replace(/^\.\//u, '').replace(/^scratch\//u, '')
-        const problem = pathProblem(cleanRel)
-        if (problem !== undefined) {
-          throw new Error(`附件 "${relRaw}" 不符合日志平台命名限制：${problem}`)
-        }
-        const candidates = [
-          resolve(workDir, relRaw),
-          resolve(workDir, 'scratch', cleanRel),
-        ]
-        let srcPath: string | undefined
-        for (const candidate of candidates) {
-          if (!isInside(candidate, workDir)) continue
-          const info = await lstat(candidate).catch(() => undefined)
-          if (info?.isFile() && !info.isSymbolicLink()) {
-            srcPath = candidate
-            break
+        // 2. Validate evidence presence & real file existence inside <workDir>
+        const reposDir = join(workDir, 'repos')
+        for (const item of args.items) {
+          if (item.status === 'diagnosed' && item.evidences.length === 0) {
+            throw new Error(`槽位 ${item.ref} 标记为 diagnosed，必须提供至少一条可追溯的 evidences`)
+          }
+          let hasRepoEvidence = false
+          for (const ev of item.evidences) {
+            const resolved = await resolveExistingEvidencePath(workDir, slug, ev.source)
+            if (resolved === undefined) {
+              throw new Error(`槽位 ${item.ref} 的证据路径 "${ev.source}" 在工作区 "${workDir}" 中不存在或非普通文件；请填写真实可读的文件路径`)
+            }
+            if (isInside(resolved, reposDir)) {
+              hasRepoEvidence = true
+            }
+          }
+          if (item.status === 'diagnosed' && item.rootCauseCategory === 'code_defect' && !hasRepoEvidence) {
+            throw new Error(`槽位 ${item.ref} 归因为 code_defect，必须包含至少一条指向 repos/ 代码仓库文件的证据`)
           }
         }
-        if (srcPath === undefined) {
-          throw new Error(`附件 "${relRaw}" 在工作区 scratch/ 中不存在或非普通文件`)
-        }
-        const info = await stat(srcPath)
-        if (info.size === 0 || info.size > MAX_ATTACHMENT_BYTES) {
-          skippedAttachments.push(`${cleanRel}：大小不合法 (${info.size} B)`)
-          continue
-        }
-        const destPath = resolve(revDir, cleanRel)
-        if (!isInside(destPath, revDir)) {
-          throw new Error(`附件路径越界：${relRaw}`)
-        }
-        await mkdir(resolve(destPath, '..'), { recursive: true })
-        const fh = await open(srcPath, constants.O_RDONLY | constants.O_NOFOLLOW)
-        try {
-          const bytes = await fh.readFile()
-          await writeFile(destPath, bytes)
-        } finally {
-          await fh.close()
-        }
-        savedAttachments.push(cleanRel)
-      }
 
-      // 4. Upsert IssueMemory entries (preserving humanConclusion / humanStatus / assignee)
-      const now = runtime.now()
-      const issueMem = runtime.issueMemory()
-      const itemIssueIds = new Map<string, string>()
-      const createdOrUsedIssues = new Set<string>()
+        // 3. Validate & snapshot attachments into report/revisions/rev-N/
+        const nextRevNumber = (task.revisions.reduce((max, r) => Math.max(max, r.revision), 0)) + 1
+        const revDir = join(workDir, REPORT_DIR, 'revisions', `rev-${nextRevNumber}`)
+        await rm(revDir, { recursive: true, force: true })
+        await mkdir(revDir, { recursive: true })
 
-      for (const item of args.items) {
-        if (item.issueLink === undefined) continue
-        if (item.issueLink.mode === 'existing') {
-          const existing = issueMem.table.get(item.issueLink.issueId)
-          if (existing === undefined) {
-            throw new Error(`槽位 ${item.ref} 引用的已知问题 "${item.issueLink.issueId}" 不存在`)
+        const savedAttachments: string[] = []
+        const skippedAttachments: string[] = []
+        for (const relRaw of args.attachments ?? []) {
+          const cleanRel = relRaw.replace(/\\/gu, '/').replace(/^\.\//u, '').replace(/^scratch\//u, '')
+          const problem = pathProblem(cleanRel)
+          if (problem !== undefined) {
+            throw new Error(`附件 "${relRaw}" 不符合日志平台命名限制：${problem}`)
           }
-          if (existing.appId !== app.app.id) {
-            throw new Error(`已知问题 "${item.issueLink.issueId}" 属于应用 ${existing.appId}，与当前应用 ${app.app.id} 不匹配`)
+          const candidates = [
+            resolve(workDir, relRaw),
+            resolve(workDir, 'scratch', cleanRel),
+          ]
+          let srcPath: string | undefined
+          for (const candidate of candidates) {
+            if (!isInside(candidate, workDir)) continue
+            const info = await lstat(candidate).catch(() => undefined)
+            if (info?.isFile() && !info.isSymbolicLink()) {
+              srcPath = candidate
+              break
+            }
           }
-          await issueMem.touchExisting({
-            issueId: item.issueLink.issueId,
-            appId: app.app.id,
-            title: existing.title,
-            matchCriteria: existing.matchCriteria,
-            ...(existing.exclusionCriteria === undefined ? {} : { exclusionCriteria: existing.exclusionCriteria }),
-            aiDiagnosis: item.conclusion,
-            aiStatus: existing.aiStatus === 'fixed' ? 'fixed' : 'located',
-            resolutionAdvice: existing.resolutionAdvice,
-            seenAt: now,
-          })
-          itemIssueIds.set(item.ref, item.issueLink.issueId)
-          createdOrUsedIssues.add(item.issueLink.issueId)
-        } else {
-          const res = await issueMem.upsertNewOrReuseByTitle({
-            appId: app.app.id,
-            title: item.issueLink.title,
-            matchCriteria: item.issueLink.matchCriteria,
-            ...(item.issueLink.exclusionCriteria === undefined ? {} : { exclusionCriteria: item.issueLink.exclusionCriteria }),
-            aiDiagnosis: item.conclusion,
-            aiStatus: 'located',
-            resolutionAdvice: item.issueLink.resolutionAdvice,
-            seenAt: now,
-          })
-          itemIssueIds.set(item.ref, res.issueId)
-          createdOrUsedIssues.add(res.issueId)
+          if (srcPath === undefined) {
+            throw new Error(`附件 "${relRaw}" 在工作区 scratch/ 中不存在或非普通文件`)
+          }
+          const info = await stat(srcPath)
+          if (info.size === 0 || info.size > MAX_ATTACHMENT_BYTES) {
+            skippedAttachments.push(`${cleanRel}：大小不合法 (${info.size} B)`)
+            continue
+          }
+          const destPath = resolve(revDir, cleanRel)
+          if (!isInside(destPath, revDir)) {
+            throw new Error(`附件路径越界：${relRaw}`)
+          }
+          await mkdir(resolve(destPath, '..'), { recursive: true })
+          const fh = await open(srcPath, constants.O_RDONLY | constants.O_NOFOLLOW)
+          try {
+            const bytes = await fh.readFile()
+            await writeFile(destPath, bytes)
+          } finally {
+            await fh.close()
+          }
+          savedAttachments.push(cleanRel)
         }
-      }
 
-      const normalizedItems: LogRevisionItem[] = args.items.map((item) => {
-        const linkedIssue = itemIssueIds.get(item.ref)
-        const evidences: LogEvidence[] = item.evidences.map(ev => ({
-          source: ev.source,
-          locator: ev.locator,
-          excerpt: ev.excerpt,
+        // 4. Upsert IssueMemory entries (preserving humanConclusion / humanStatus / assignee)
+        const now = runtime.now()
+        const issueMem = runtime.issueMemory()
+        const itemIssueIds = new Map<string, string>()
+        const createdOrUsedIssues = new Set<string>()
+
+        for (const item of args.items) {
+          if (item.issueLink === undefined) continue
+          if (item.issueLink.mode === 'existing') {
+            const existing = issueMem.table.get(item.issueLink.issueId)
+            if (existing === undefined) {
+              throw new Error(`槽位 ${item.ref} 引用的已知问题 "${item.issueLink.issueId}" 不存在`)
+            }
+            if (existing.appId !== app.app.id) {
+              throw new Error(`已知问题 "${item.issueLink.issueId}" 属于应用 ${existing.appId}，与当前应用 ${app.app.id} 不匹配`)
+            }
+            await issueMem.touchExisting({
+              issueId: item.issueLink.issueId,
+              appId: app.app.id,
+              title: existing.title,
+              matchCriteria: existing.matchCriteria,
+              ...(existing.exclusionCriteria === undefined ? {} : { exclusionCriteria: existing.exclusionCriteria }),
+              aiDiagnosis: item.conclusion,
+              aiStatus: existing.aiStatus === 'fixed' ? 'fixed' : 'located',
+              resolutionAdvice: existing.resolutionAdvice,
+              seenAt: now,
+            })
+            itemIssueIds.set(item.ref, item.issueLink.issueId)
+            createdOrUsedIssues.add(item.issueLink.issueId)
+          } else {
+            const res = await issueMem.upsertNewOrReuseByTitle({
+              appId: app.app.id,
+              title: item.issueLink.title,
+              matchCriteria: item.issueLink.matchCriteria,
+              ...(item.issueLink.exclusionCriteria === undefined ? {} : { exclusionCriteria: item.issueLink.exclusionCriteria }),
+              aiDiagnosis: item.conclusion,
+              aiStatus: 'located',
+              resolutionAdvice: item.issueLink.resolutionAdvice,
+              seenAt: now,
+            })
+            itemIssueIds.set(item.ref, res.issueId)
+            createdOrUsedIssues.add(res.issueId)
+          }
+        }
+
+        const normalizedItems: LogRevisionItem[] = args.items.map((item) => {
+          const linkedIssue = itemIssueIds.get(item.ref)
+          const evidences: LogEvidence[] = item.evidences.map(ev => ({
+            source: ev.source,
+            locator: ev.locator,
+            excerpt: ev.excerpt,
+          }))
+          return {
+            ref: item.ref,
+            status: item.status,
+            rootCauseCategory: item.rootCauseCategory,
+            conclusion: item.conclusion,
+            evidences,
+            ...(linkedIssue === undefined ? {} : { issueId: linkedIssue }),
+          }
+        })
+
+        const primaryIssueId = normalizedItems.find(i => i.issueId !== undefined)?.issueId
+        const flatEvidence = normalizedItems.flatMap(i => i.evidences.map(e => `${i.ref}:${e.source}:${e.locator}`))
+        const revision: LogTaskRevision = {
+          revision: nextRevNumber,
+          summary: args.summary,
+          ...(primaryIssueId === undefined ? {} : { issueId: primaryIssueId }),
+          ...(flatEvidence.length === 0 ? {} : { evidence: flatEvidence }),
+          items: normalizedItems,
+          ...(savedAttachments.length === 0 ? {} : { attachments: savedAttachments }),
+          reportDir: revDir,
+          createdAt: now,
+        }
+
+        // Persist the revision before marking completed; onRevisionSubmitted() enqueues durable
+        // outbox rows first and atomically commits status='completed' (plus pendingTopicDelivery).
+        const taskWithRevision = await runtime.updateTask(taskId, cur => ({
+          ...cur,
+          revisions: [...cur.revisions, revision],
+          updatedAt: now,
         }))
+
+        const postSubmit = await runtime.onRevisionSubmitted({
+          taskId,
+          task: taskWithRevision,
+          revision,
+          app,
+        })
+
+        const suggestedActions = buildDefaultActionsForRevision({
+          taskId,
+          appId: app.app.id,
+          appName: app.app.name,
+          repoUrl: app.url,
+          baseCommit: app.commit,
+          writable: app.writable,
+          revision,
+        }).map(a => ({ id: a.id, label: a.label }))
+
         return {
-          ref: item.ref,
-          status: item.status,
-          rootCauseCategory: item.rootCauseCategory,
-          conclusion: item.conclusion,
-          evidences,
-          ...(linkedIssue === undefined ? {} : { issueId: linkedIssue }),
+          taskId,
+          revision: revision.revision,
+          appId: app.app.id,
+          writable: app.writable,
+          issueIds: [...createdOrUsedIssues],
+          outboxEnqueued: postSubmit.enqueuedOutboxKeys,
+          detailUrlBackfilled: postSubmit.detailUrlBackfilled,
+          skippedAttachments,
+          suggestedActions,
         }
       })
-
-      const primaryIssueId = normalizedItems.find(i => i.issueId !== undefined)?.issueId
-      const flatEvidence = normalizedItems.flatMap(i => i.evidences.map(e => `${i.ref}:${e.source}:${e.locator}`))
-      const revision: LogTaskRevision = {
-        revision: nextRevNumber,
-        summary: args.summary,
-        ...(primaryIssueId === undefined ? {} : { issueId: primaryIssueId }),
-        ...(flatEvidence.length === 0 ? {} : { evidence: flatEvidence }),
-        items: normalizedItems,
-        ...(savedAttachments.length === 0 ? {} : { attachments: savedAttachments }),
-        reportDir: revDir,
-        createdAt: now,
-      }
-
-      // Persist the revision before marking completed; onRevisionSubmitted() enqueues durable
-      // outbox rows first and atomically commits status='completed' (plus pendingTopicDelivery).
-      const taskWithRevision = await runtime.updateTask(taskId, cur => ({
-        ...cur,
-        revisions: [...cur.revisions, revision],
-        updatedAt: now,
-      }))
-
-      const postSubmit = await runtime.onRevisionSubmitted({
-        taskId,
-        task: taskWithRevision,
-        revision,
-        app,
-      })
-
-      const suggestedActions = buildDefaultActionsForRevision({
-        taskId,
-        appId: app.app.id,
-        appName: app.app.name,
-        repoUrl: app.url,
-        baseCommit: app.commit,
-        writable: app.writable,
-        revision,
-      }).map(a => ({ id: a.id, label: a.label }))
-
-      return {
-        taskId,
-        revision: revision.revision,
-        appId: app.app.id,
-        writable: app.writable,
-        issueIds: [...createdOrUsedIssues],
-        outboxEnqueued: postSubmit.enqueuedOutboxKeys,
-        detailUrlBackfilled: postSubmit.detailUrlBackfilled,
-        skippedAttachments,
-        suggestedActions,
-      }
     },
   }
 
@@ -998,94 +1014,105 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
         throw new Error(`supervisor_log_push_mr 参数无效：${parsed.error.issues[0]?.message ?? parsed.error.message}`)
       }
       const args = parsed.data
-      if (exec.agent === undefined) {
+      const agent = exec.agent
+      if (agent === undefined) {
         throw new Error('supervisor_log_push_mr 必须由携带身份的 Agent 会话调用，以确保触发 dsh-repo 写权限审批与作者归属')
       }
       const sessionId = sessionIdOf(exec)
-      const bound = runtime.resolveTaskForSession(sessionId, args.taskId)
-      if (bound === undefined) {
+      const initialBound = runtime.resolveTaskForSession(sessionId, args.taskId)
+      if (initialBound === undefined) {
         throw new Error('当前会话尚未绑定任何日志监管任务，无法确定目标应用仓库')
       }
-      const { taskId, task } = bound
-      const app = runtime.readyApp(task.appId)
-      if (!app.writable) {
-        throw new Error(`应用 ${app.app.id} 的代码仓库为只读权限，禁止推送代码修复或 SKILL 改进`)
-      }
 
-      const workDir = task.workDir ?? workspaceRootOf(exec, runtime)
-      const slug = appSlugOf(app.app.id)
-      const expectedRepoDir = join(workDir, 'repos', args.kind === 'improve_skill' ? `${slug}-knowledge` : slug)
-      const workspacePath = args.workspaceDir !== undefined ? resolve(workDir, args.workspaceDir) : expectedRepoDir
-      if (!isInside(workspacePath, workDir)) {
-        throw new Error(`工作区路径 ${workspacePath} 必须位于当前会话目录 ${workDir} 之内`)
-      }
-      if (!(await pathExists(join(workspacePath, '.git')))) {
-        throw new Error(`工作区 ${workspacePath} 尚未初始化；请先调用 supervisor_log_prepare（workspace: "${args.kind === 'improve_skill' ? 'knowledge' : 'diagnosis'}"）`)
-      }
+      return await runtime.withTaskOperation(initialBound.taskId, async () => {
+        const bound = runtime.resolveTaskForSession(sessionId, initialBound.taskId)
+        if (bound === undefined) {
+          throw new Error(`找不到日志监管任务 "${initialBound.taskId}"`)
+        }
+        const { taskId, task } = bound
+        const app = runtime.readyApp(task.appId)
+        if (!app.writable) {
+          throw new Error(`应用 ${app.app.id} 的代码仓库为只读权限，禁止推送代码修复或 SKILL 改进`)
+        }
 
-      const repos = runtime.requireRepos()
-      const status = await repos.workspaceStatus({ path: workspacePath, signal: exec.signal })
-      if (status.files.length === 0) {
-        throw new Error(`工作区 ${workspacePath} 相对于基准提交没有改动，无需推送`)
-      }
+        const workDir = task.workDir ?? workspaceRootOf(exec, runtime)
+        const slug = appSlugOf(app.app.id)
+        const expectedRepoDir = join(workDir, 'repos', args.kind === 'improve_skill' ? `${slug}-knowledge` : slug)
+        const workspacePath = args.workspaceDir !== undefined ? resolve(workDir, args.workspaceDir) : expectedRepoDir
+        if (!isInside(workspacePath, workDir)) {
+          throw new Error(`工作区路径 ${workspacePath} 必须位于当前会话目录 ${workDir} 之内`)
+        }
+        if (!(await pathExists(join(workspacePath, '.git')))) {
+          throw new Error(`工作区 ${workspacePath} 尚未初始化；请先调用 supervisor_log_prepare（workspace: "${args.kind === 'improve_skill' ? 'knowledge' : 'diagnosis'}"）`)
+        }
 
-      const latestRevision = task.revisions.at(-1)
-      const resolvedIssueId = args.issueId
-        ?? latestRevision?.items?.find(i => i.issueId !== undefined)?.issueId
-        ?? latestRevision?.issueId
-      const footerLines = [
-        `- Log Supervision Task: \`${taskId}\``,
-        resolvedIssueId === undefined ? undefined : `- Issue Memory: \`${resolvedIssueId}\``,
-        latestRevision?.summary === undefined ? undefined : `- Summary: ${latestRevision.summary}`,
-      ].filter(Boolean)
-      const mrBody = [args.mrBody?.trim(), footerLines.join('\n')].filter(Boolean).join('\n\n')
+        const repos = runtime.requireRepos()
+        const status = await repos.workspaceStatus({ path: workspacePath, signal: exec.signal })
+        if (status.files.length === 0) {
+          throw new Error(`工作区 ${workspacePath} 相对于基准提交没有改动，无需推送`)
+        }
 
-      const pushed = await repos.workspacePush({
-        path: workspacePath,
-        message: args.commitMessage,
-        mr: { title: args.mrTitle, ...(mrBody === '' ? {} : { body: mrBody }) },
-        agent: exec.agent,
-        ...(exec.callId === undefined ? {} : { callId: exec.callId }),
-        signal: exec.signal,
-      })
+        const latestRevision = task.revisions.at(-1)
+        const resolvedIssueId = args.issueId
+          ?? latestRevision?.items?.find(i => i.issueId !== undefined)?.issueId
+          ?? latestRevision?.issueId
+        const footerLines = [
+          `- Log Supervision Task: \`${taskId}\``,
+          resolvedIssueId === undefined ? undefined : `- Issue Memory: \`${resolvedIssueId}\``,
+          latestRevision?.summary === undefined ? undefined : `- Summary: ${latestRevision.summary}`,
+        ].filter(Boolean)
+        const mrBody = [args.mrBody?.trim(), footerLines.join('\n')].filter(Boolean).join('\n\n')
 
-      const mr = pushed.createdMr ?? pushed.openMrs[0]
-      let fixMrLinkedIssueId: string | undefined
-      if (args.kind === 'fix_code' && mr?.webUrl !== undefined && resolvedIssueId !== undefined) {
-        await runtime.issueMemory().table.attachUrlsByAi(resolvedIssueId, { fixMrUrl: mr.webUrl })
-        fixMrLinkedIssueId = resolvedIssueId
-      }
-
-      let mrSupervisionRegistered = false
-      if (mr !== undefined && runtime.registerSelfMr !== undefined) {
-        await runtime.registerSelfMr({
-          repo: app.url,
-          mrNumber: mr.number,
-          origin: args.kind === 'fix_code' ? 'self-fix' : 'self-skill',
-          headSha: pushed.commit,
-          sessionId,
-          workDir: workspacePath,
-          ...(task.feishuLaunchKey === undefined ? {} : { feishuLaunchKey: task.feishuLaunchKey }),
-          ...(resolvedIssueId === undefined ? {} : { issueId: resolvedIssueId }),
-          title: args.mrTitle,
-          url: mr.webUrl,
-          sourceBranch: pushed.branch,
-          ...(app.branch === undefined ? {} : { targetBranch: app.branch }),
+        const pushed = await repos.workspacePush({
+          path: workspacePath,
+          message: args.commitMessage,
+          mr: { title: args.mrTitle, ...(mrBody === '' ? {} : { body: mrBody }) },
+          agent,
+          ...(exec.callId === undefined ? {} : { callId: exec.callId }),
+          signal: exec.signal,
         })
-        mrSupervisionRegistered = true
-      }
 
-      return {
-        kind: args.kind,
-        repo: app.url,
-        workspacePath,
-        branch: pushed.branch,
-        commit: pushed.commit,
-        ...(mr === undefined ? {} : { mrNumber: mr.number, mrUrl: mr.webUrl }),
-        ...(pushed.mrError === undefined ? {} : { mrError: pushed.mrError }),
-        ...(fixMrLinkedIssueId === undefined ? {} : { fixMrLinkedIssueId }),
-        mrSupervisionRegistered,
-      }
+        const mr = pushed.createdMr ?? pushed.openMrs[0]
+        let fixMrLinkedIssueId: string | undefined
+        if (args.kind === 'fix_code' && mr?.webUrl !== undefined && resolvedIssueId !== undefined) {
+          const existingIssue = runtime.issueMemory().table.get(resolvedIssueId)
+          if (existingIssue?.appId === app.app.id) {
+            await runtime.issueMemory().table.attachUrlsByAi(resolvedIssueId, { fixMrUrl: mr.webUrl })
+            fixMrLinkedIssueId = resolvedIssueId
+          }
+        }
+
+        let mrSupervisionRegistered = false
+        if (mr !== undefined && runtime.registerSelfMr !== undefined) {
+          await runtime.registerSelfMr({
+            repo: app.url,
+            mrNumber: mr.number,
+            origin: args.kind === 'fix_code' ? 'self-fix' : 'self-skill',
+            headSha: pushed.commit,
+            sessionId,
+            workDir: workspacePath,
+            ...(task.feishuLaunchKey === undefined ? {} : { feishuLaunchKey: task.feishuLaunchKey }),
+            ...(resolvedIssueId === undefined ? {} : { issueId: resolvedIssueId }),
+            title: args.mrTitle,
+            url: mr.webUrl,
+            sourceBranch: pushed.branch,
+            ...(app.branch === undefined ? {} : { targetBranch: app.branch }),
+          })
+          mrSupervisionRegistered = true
+        }
+
+        return {
+          kind: args.kind,
+          repo: app.url,
+          workspacePath,
+          branch: pushed.branch,
+          commit: pushed.commit,
+          ...(mr === undefined ? {} : { mrNumber: mr.number, mrUrl: mr.webUrl }),
+          ...(pushed.mrError === undefined ? {} : { mrError: pushed.mrError }),
+          ...(fixMrLinkedIssueId === undefined ? {} : { fixMrLinkedIssueId }),
+          mrSupervisionRegistered,
+        }
+      })
     },
   }
 

@@ -561,6 +561,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     readonly supervisorDir?: string
     readonly withPlatform?: boolean
     readonly setupPlatform?: (platform: FakePlatform) => void
+    readonly fetch?: typeof fetch
     readonly onLogTurn?: (req: LogSessionTurnRequest, tools: readonly ToolDefinition<unknown>[]) => Promise<void>
     readonly onMrTurn?: (req: { repo: string; mrNumber: number; origin: string; prompt: string }) => Promise<void>
   } = {}) {
@@ -693,6 +694,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
       logSessionDriver,
       autoMrPollTimer: false,
       autoLogPollTimer: false,
+      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
       now: () => currentNow,
     })
 
@@ -1504,5 +1506,154 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     await waitFor(() => h.fakeTopics.launched.length === 1)
     expect(domainAfter.logTasks.get('log-crashed-1')?.pendingTopicDelivery).toBeUndefined()
     expect(domainAfter.logTasks.get('log-crashed-1')?.feishuLaunchKey).toBe('log-task:log-crashed-1')
+  }, 20_000)
+
+  it('serializes concurrent task submissions, preserves mid-poll watermark rewinds, and fails thrown turns cleanly for rewind recovery', async () => {
+    let logsCallStarted = false
+    let logsFetchGate: (() => void) | undefined
+    let throwFirstTurn = false
+
+    const interceptedFetch: typeof fetch = async (input, init) => {
+      const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (!logsCallStarted && urlStr.includes('/open-api/v1/logs?')) {
+        logsCallStarted = true
+        await new Promise<void>((resolve) => {
+          logsFetchGate = resolve
+        })
+      }
+      return await fetch(input, init)
+    }
+
+    const h = await createFullHarness({
+      batchSizeThreshold: 1,
+      fetch: interceptedFetch,
+      onLogTurn: async (req) => {
+        if (throwFirstTurn) {
+          throwFirstTurn = false
+          throw new Error('sessionController prompt rejected')
+        }
+        const prepare = h.toolNamed('supervisor_log_prepare')
+        const submit = h.toolNamed('supervisor_log_submit')
+        const prepared = await prepare.execute({ taskId: req.taskId }, h.toolExecCtx(req.existingSessionId!, req.workDir)) as {
+          readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+        }
+        await submit.execute({
+          taskId: req.taskId,
+          summary: '诊断恢复完成',
+          items: prepared.slots.map(s => ({
+            ref: s.ref,
+            status: 'diagnosed',
+            rootCauseCategory: 'config_or_env',
+            conclusion: 'recovered after rewind or retry',
+            evidences: [{ source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'error' }],
+          })),
+        }, h.toolExecCtx(req.existingSessionId!, req.workDir))
+      },
+    })
+
+    // Scenario A (4566335176): Two overlapping supervisor_log_submit calls on the same task allocate distinct revisions [1, 2] without clobbering attachments!
+    const concurrentSess = 'feishu-concurrent-submit'
+    const concurrentWs = join(h.dir, 'concurrent-ws')
+    await mkdir(join(concurrentWs, 'scratch'), { recursive: true })
+    const concurrentZip = join(h.dir, 'concurrent.zip')
+    await writeFile(concurrentZip, buildZipBuffer([{ name: 'app.log', content: 'concurrent submit log\n' }]))
+
+    const prepare = h.toolNamed('supervisor_log_prepare')
+    const submit = h.toolNamed('supervisor_log_submit')
+    const prepConcurrent = await prepare.execute({
+      app: 'order-service',
+      logs: [{ path: concurrentZip }],
+    }, h.toolExecCtx(concurrentSess, concurrentWs, 'c-prep-conc')) as {
+      readonly taskId: string
+      readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+    }
+    await writeFile(join(concurrentWs, 'scratch', 'att-a.txt'), 'attachment A\n')
+    await writeFile(join(concurrentWs, 'scratch', 'att-b.txt'), 'attachment B\n')
+
+    const makeSubmitPayload = (attachment: string, summary: string) => ({
+      taskId: prepConcurrent.taskId,
+      summary,
+      items: prepConcurrent.slots.map(s => ({
+        ref: s.ref,
+        status: 'diagnosed',
+        rootCauseCategory: 'config_or_env',
+        conclusion: summary,
+        evidences: [{ source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'concurrent submit' }],
+      })),
+      attachments: [attachment],
+    })
+    const [resA, resB] = await Promise.all([
+      submit.execute(makeSubmitPayload('scratch/att-a.txt', 'submission A'), h.toolExecCtx(concurrentSess, concurrentWs, 'c-sub-a')),
+      submit.execute(makeSubmitPayload('scratch/att-b.txt', 'submission B'), h.toolExecCtx(concurrentSess, concurrentWs, 'c-sub-b')),
+    ]) as [
+      { readonly revision: number },
+      { readonly revision: number },
+    ]
+    expect([resA.revision, resB.revision].sort((a, b) => a - b)).toEqual([1, 2])
+    const revDir1 = join(concurrentWs, 'report', 'revisions', 'rev-1')
+    const revDir2 = join(concurrentWs, 'report', 'revisions', 'rev-2')
+    const attFile1 = resA.revision === 1 ? 'att-a.txt' : 'att-b.txt'
+    const attFile2 = resA.revision === 2 ? 'att-a.txt' : 'att-b.txt'
+    expect((await stat(join(revDir1, attFile1))).isFile()).toBe(true)
+    expect((await stat(join(revDir2, attFile2))).isFile()).toBe(true)
+
+    // Scenario B (4566335182): Mid-poll watermark rewind is preserved and backfills the rewound interval!
+    const sup = h.service.logSupervisorInstance()!
+    const inFlightPoll = sup.pollNow()
+    await waitFor(() => logsFetchGate !== undefined)
+
+    h.fakePlatform.addLog({
+      log_id: 'rewind-midpoll-1',
+      product_code: 'P1',
+      component_code: 'order-service',
+      error_code: 'E_REWIND',
+      file_name: 'rewind-midpoll.log',
+      storage_type: 'fds',
+      status: 'completed',
+      archived_at: '2026-11-12T09:30:00.000Z',
+    }, 'mid-poll rewind error\n')
+    await h.service.controlLogWatermark({ action: 'rewind', cursorTime: '2026-11-12T09:25:00.000Z' })
+    logsFetchGate!()
+    await inFlightPoll
+
+    await waitFor(() => h.logTurns.length === 1)
+    const domain = await h.service.supervisorDomain()
+    await waitFor(() => {
+      const midPollTask = domain.logTasks.entries().find(([, t]) => t.inputs.some(i => i.logId === 'rewind-midpoll-1'))
+      return midPollTask?.[1].status === 'completed'
+    })
+
+    // Scenario C (4566335190): Non-shutdown exception from sessionDriver.runTurn transitions task to 'failed' (never stuck 'running'), and rewind recovers it!
+    throwFirstTurn = true
+    h.advanceNow(10_000)
+    h.fakePlatform.addLog({
+      log_id: 'thrown-turn-1',
+      product_code: 'P1',
+      component_code: 'order-service',
+      error_code: 'E_THROW',
+      file_name: 'thrown-turn.log',
+      storage_type: 'fds',
+      status: 'completed',
+      archived_at: new Date(h.getNow() - 500).toISOString(),
+    }, 'thrown turn log\n')
+    await sup.pollNow()
+
+    await waitFor(() => {
+      const failedEntry = domain.logTasks.entries().find(([, t]) => t.inputs.some(i => i.logId === 'thrown-turn-1'))
+      return failedEntry?.[1].status === 'failed'
+    })
+    const failedTask = domain.logTasks.entries().find(([, t]) => t.inputs.some(i => i.logId === 'thrown-turn-1'))![1]
+    expect(failedTask.lastError).toContain('sessionController prompt rejected')
+    expect((await h.service.state()).logSupervision?.running).toBe(0)
+
+    // Rewinding watermark across thrown-turn-1's archived_at re-ingests and recovers it cleanly.
+    await h.service.controlLogWatermark({
+      action: 'rewind',
+      cursorTime: new Date(h.getNow() - 2_000).toISOString(),
+    })
+    await sup.pollNow()
+    await waitFor(() => domain.logTasks.entries().some(
+      ([, t]) => t.inputs.some(i => i.logId === 'thrown-turn-1') && t.status === 'completed',
+    ))
   }, 20_000)
 })

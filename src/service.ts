@@ -693,6 +693,7 @@ export class LogalyzeService {
         requireSup().resolveTaskForSession(sessionId, taskId),
       createFeishuTask: input => requireSup().createFeishuTask(input),
       updateTask: (taskId, updater) => requireSup().updateTask(taskId, updater),
+      withTaskOperation: (taskId, fn) => requireSup().withTaskOperation(taskId, fn),
       onRevisionSubmitted: params => requireSup().onRevisionSubmitted(params),
       registerSelfMr: async (input) => { await requireSup().registerSelfMr?.(input) },
       logWorkspacesRoot: () => this.logWorkspacesDir,
