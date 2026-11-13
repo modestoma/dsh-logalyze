@@ -122,6 +122,19 @@ interface FallbackPersistHook {
   (snapshot: Record<string, Record<string, unknown>>): Promise<void>
 }
 
+function createNullProtoRecord<V>(): Record<string, V> {
+  return Object.create(null) as Record<string, V>
+}
+
+function setOwnProperty<V>(target: Record<string, V>, key: string, value: V): void {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  })
+}
+
 function buildLocalDomainHandle(
   spec: DomainSpec,
   initial: Record<string, Record<string, unknown>>,
@@ -130,9 +143,11 @@ function buildLocalDomainHandle(
   const stores = new Map<string, Map<string, unknown>>()
   for (const [tableName, tableSpec] of Object.entries(spec.tables)) {
     const rows = new Map<string, unknown>()
-    const rawRows = initial[tableName] ?? {}
-    for (const [key, rawValue] of Object.entries(rawRows)) {
-      rows.set(key, cloneValue(tableSpec.valueSchema.parse(rawValue)))
+    const rawRows = Object.hasOwn(initial, tableName) ? initial[tableName] : undefined
+    if (rawRows !== undefined && typeof rawRows === 'object' && rawRows !== null && !Array.isArray(rawRows)) {
+      for (const [key, rawValue] of Object.entries(rawRows)) {
+        rows.set(key, cloneValue(tableSpec.valueSchema.parse(rawValue)))
+      }
     }
     stores.set(tableName, rows)
   }
@@ -141,13 +156,13 @@ function buildLocalDomainHandle(
   let queue: Promise<void> = Promise.resolve()
 
   const snapshotAll = (): Record<string, Record<string, unknown>> => {
-    const out: Record<string, Record<string, unknown>> = {}
+    const out = createNullProtoRecord<Record<string, unknown>>()
     for (const [tableName, rows] of stores.entries()) {
-      const tableObj: Record<string, unknown> = {}
+      const tableObj = createNullProtoRecord<unknown>()
       for (const [key, value] of rows.entries()) {
-        tableObj[key] = cloneValue(value)
+        setOwnProperty(tableObj, key, cloneValue(value))
       }
-      out[tableName] = tableObj
+      setOwnProperty(out, tableName, tableObj)
     }
     return out
   }
@@ -248,13 +263,13 @@ export function createMemoryStorageFacility(): { open(spec: DomainSpec): Promise
   return {
     open(spec: DomainSpec): Promise<RawDomainHandle> {
       validateSpec(spec)
-      const initial = domains.get(spec.name) ?? {}
+      const initial = domains.get(spec.name) ?? createNullProtoRecord<Record<string, unknown>>()
       const handle = buildLocalDomainHandle(spec, initial, (snapshot) => {
         domains.set(spec.name, snapshot)
         return Promise.resolve()
       })
       if (!domains.has(spec.name)) {
-        domains.set(spec.name, {})
+        domains.set(spec.name, createNullProtoRecord<Record<string, unknown>>())
       }
       return Promise.resolve(handle)
     },
@@ -276,11 +291,18 @@ export function createFileStorageFacility(dir: string): { open(spec: DomainSpec)
     async open(spec: DomainSpec): Promise<RawDomainHandle> {
       validateSpec(spec)
       const filePath = join(dir, `${spec.name}.json`)
-      let initial: Record<string, Record<string, unknown>> = {}
+      let initial = createNullProtoRecord<Record<string, unknown>>()
       try {
         const rawText = await readFile(filePath, 'utf8')
         const parsed = JSON.parse(rawText) as Partial<PersistedDomainDocument>
-        if (typeof parsed !== 'object' || parsed === null || typeof parsed.tables !== 'object' || parsed.tables === null) {
+        if (
+          typeof parsed !== 'object'
+          || parsed === null
+          || Array.isArray(parsed)
+          || typeof parsed.tables !== 'object'
+          || parsed.tables === null
+          || Array.isArray(parsed.tables)
+        ) {
           throw new StorageDomainError('corrupt-store', `${filePath} 结构不合法`)
         }
         initial = parsed.tables

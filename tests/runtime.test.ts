@@ -189,13 +189,47 @@ describe('runtime storage & dsh_supervisor domain', () => {
     await domain.close()
     await expect(domain.watermarks.put('after-close', { paused: false, consecutiveFailures: 0 })).rejects.toMatchObject({ code: 'closed' })
 
-    // Drains mutations already admitted before close() while rejecting post-close calls
+    // Drains mutations already admitted before close() (including IssuesTable per-key queue) while rejecting post-close calls,
+    // and preserves prototype-named keys (`__proto__`, `constructor`) across both file and memory reopen!
     const drainDomain = await openSupervisorDomain({ fallbackDir: dir })
     const admittedPut = drainDomain.watermarks.put('admitted-before-close', { paused: false, consecutiveFailures: 7 })
     const admittedUpdate = drainDomain.watermarks.update('admitted-before-close', cur => ({ ...cur, consecutiveFailures: cur.consecutiveFailures + 1 }))
+    const admittedProtoPut = drainDomain.watermarks.put('__proto__', { paused: true, consecutiveFailures: 9 })
+    const admittedCtorPut = drainDomain.watermarks.put('constructor', { paused: false, consecutiveFailures: 4 })
+    const admittedIssueUpsert = drainDomain.issues.upsertByAi({
+      issueId: 'issue-admitted-before-close',
+      appId: 'order-service',
+      title: '关闭前已准入的问题写入',
+      matchCriteria: 'TimeoutException at OrderClient',
+      aiDiagnosis: '下游超时未熔断',
+      aiStatus: 'located',
+      resolutionAdvice: '补充超时熔断配置',
+    })
+    const admittedIssueSync = drainDomain.issues.syncHumanFields('issue-admitted-before-close', {
+      humanStatus: 'confirmed',
+      assignee: 'u_bob',
+    })
     const closePromise = drainDomain.close()
     await expect(drainDomain.watermarks.put('rejected-during-close', { paused: false, consecutiveFailures: 0 })).rejects.toMatchObject({ code: 'closed' })
-    await Promise.all([admittedPut, admittedUpdate, closePromise])
+    await expect(drainDomain.issues.upsertByAi({
+      issueId: 'issue-rejected-during-close',
+      appId: 'order-service',
+      title: '关闭后拒绝的问题写入',
+      matchCriteria: 'RejectedError',
+      aiDiagnosis: '不应写入',
+      aiStatus: 'pending',
+      resolutionAdvice: '无',
+    })).rejects.toMatchObject({ code: 'closed' })
+    await Promise.all([admittedPut, admittedUpdate, admittedProtoPut, admittedCtorPut, admittedIssueUpsert, admittedIssueSync, closePromise])
+
+    // Also verify prototype-named keys survive reopen on `createMemoryStorageFacility()`
+    const memFacility = createMemoryStorageFacility()
+    const memD1 = await openSupervisorDomain({ facility: memFacility })
+    await memD1.watermarks.put('__proto__', { paused: true, consecutiveFailures: 5 })
+    await memD1.close()
+    const memD2 = await openSupervisorDomain({ facility: memFacility })
+    expect(memD2.watermarks.get('__proto__')).toEqual({ paused: true, consecutiveFailures: 5 })
+    await memD2.close()
 
     // Reopen from disk and verify durable state across all 7 tables
     const persistedPath = join(dir, 'dsh_supervisor.json')
@@ -203,6 +237,14 @@ describe('runtime storage & dsh_supervisor domain', () => {
 
     const reopened = await openSupervisorDomain({ fallbackDir: dir })
     expect(reopened.watermarks.get('admitted-before-close')?.consecutiveFailures).toBe(8)
+    expect(reopened.watermarks.get('__proto__')).toEqual({ paused: true, consecutiveFailures: 9 })
+    expect(reopened.watermarks.get('constructor')).toEqual({ paused: false, consecutiveFailures: 4 })
+    expect(reopened.issues.get('issue-admitted-before-close')).toMatchObject({
+      title: '关闭前已准入的问题写入',
+      humanStatus: 'confirmed',
+      assignee: 'u_bob',
+    })
+    expect(reopened.issues.get('issue-rejected-during-close')).toBeUndefined()
     expect(reopened.watermarks.get('platform')?.consecutiveFailures).toBe(1)
     expect(reopened.pendingBatches.get('P1:order:E1001')?.logIds).toEqual(['log-1', 'log-2'])
     expect(reopened.logTasks.get('task-1')?.revisions[0]?.issueId).toBe('issue-1')

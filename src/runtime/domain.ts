@@ -214,6 +214,7 @@ function resolveHumanField(patchValue: string | null | undefined, existingValue:
 export class IssuesTable {
   private readonly locks = new Map<string, Promise<unknown>>()
   private readonly now: () => number
+  private closed = false
 
   constructor(
     private readonly table: DomainTable<IssueRecord>,
@@ -222,7 +223,14 @@ export class IssuesTable {
     this.now = now
   }
 
+  private rejectClosed(): Promise<never> {
+    return Promise.reject(new StorageDomainError('closed', `存储域 "${SUPERVISOR_STORAGE_DOMAIN}" 已关闭`))
+  }
+
   private withKeyLock<T>(issueId: string, fn: () => Promise<T>): Promise<T> {
+    if (this.closed) {
+      return this.rejectClosed()
+    }
     const previous = this.locks.get(issueId) ?? Promise.resolve()
     const next = previous.then(fn, fn)
     const tracked = next.then(() => undefined, () => undefined).finally(() => {
@@ -232,6 +240,14 @@ export class IssuesTable {
     })
     this.locks.set(issueId, tracked)
     return next
+  }
+
+  /** Reject subsequent mutations and wait for already-admitted per-key operations to settle. */
+  async drainAndClose(): Promise<void> {
+    this.closed = true
+    while (this.locks.size > 0) {
+      await Promise.allSettled([...this.locks.values()])
+    }
   }
 
   get size(): number {
@@ -276,6 +292,9 @@ export class IssuesTable {
    * `humanConclusion`, `humanStatus`, and `assignee` are never overwritten or cleared.
    */
   upsertByAi(input: AiIssueUpsertInput): Promise<IssueRecord> {
+    if (this.closed) {
+      return this.rejectClosed()
+    }
     const issueId = input.issueId.trim()
     if (issueId === '') {
       return Promise.reject(new TypeError('issues.upsertByAi: issueId 不能为空'))
@@ -327,6 +346,9 @@ export class IssuesTable {
    * and external `bitableRecordId` on an existing issue without touching AI fields.
    */
   syncHumanFields(issueId: string, patch: HumanIssueSyncPatch): Promise<IssueRecord> {
+    if (this.closed) {
+      return this.rejectClosed()
+    }
     const key = issueId.trim()
     if (key === '') {
       return Promise.reject(new TypeError('issues.syncHumanFields: issueId 不能为空'))
@@ -476,21 +498,52 @@ export interface OpenSupervisorDomainOptions extends OpenStorageDomainOptions {
   readonly now?: () => number
 }
 
+function closableTable<V>(table: DomainTable<V>, isClosed: () => boolean): DomainTable<V> {
+  const rejectClosed = (): Promise<never> =>
+    Promise.reject(new StorageDomainError('closed', `存储域 "${SUPERVISOR_STORAGE_DOMAIN}" 已关闭`))
+  return {
+    get size() { return table.size },
+    has: key => table.has(key),
+    get: key => table.get(key),
+    entries: () => table.entries(),
+    values: () => table.values(),
+    keys: () => table.keys(),
+    put: (key, value) => (isClosed() ? rejectClosed() : table.put(key, value)),
+    update: (key, fn) => (isClosed() ? rejectClosed() : table.update(key, fn)),
+    delete: key => (isClosed() ? rejectClosed() : table.delete(key)),
+  }
+}
+
 /**
  * Open the `'dsh_supervisor'` storage domain (using host `ctx.storageDomain` when
  * present, else local file or in-memory fallback) and return typed table handles.
  */
 export async function openSupervisorDomain(options: OpenSupervisorDomainOptions = {}): Promise<SupervisorDomain> {
   const raw = await openStorageDomain(supervisorDomainSpec, options)
+  const issues = new IssuesTable(typedTable<IssueRecord>(raw.table('issues')), options.now)
+  let domainClosed = false
+  let closing: Promise<void> | undefined
+  const isClosed = (): boolean => domainClosed
+  const closeDomain = (): Promise<void> => {
+    domainClosed = true
+    closing ??= (async () => {
+      await issues.drainAndClose()
+      await raw.close()
+    })()
+    return closing
+  }
   return {
-    raw,
-    watermarks: typedTable<WatermarkRecord>(raw.table('watermarks')),
-    pendingBatches: typedTable<PendingBatchRecord>(raw.table('pending_batches')),
-    logTasks: typedTable<LogTaskRecord>(raw.table('log_tasks')),
-    outboxPlatform: typedTable<OutboxPlatformRecord>(raw.table('outbox_platform')),
-    issues: new IssuesTable(typedTable<IssueRecord>(raw.table('issues')), options.now),
-    supervisedMrs: typedTable<SupervisedMrRecord>(raw.table('supervised_mrs')),
-    circuitBreakers: typedTable<CircuitBreakerRecord>(raw.table('circuit_breakers')),
-    close: () => raw.close(),
+    raw: {
+      table: name => raw.table(name),
+      close: closeDomain,
+    },
+    watermarks: closableTable(typedTable<WatermarkRecord>(raw.table('watermarks')), isClosed),
+    pendingBatches: closableTable(typedTable<PendingBatchRecord>(raw.table('pending_batches')), isClosed),
+    logTasks: closableTable(typedTable<LogTaskRecord>(raw.table('log_tasks')), isClosed),
+    outboxPlatform: closableTable(typedTable<OutboxPlatformRecord>(raw.table('outbox_platform')), isClosed),
+    issues,
+    supervisedMrs: closableTable(typedTable<SupervisedMrRecord>(raw.table('supervised_mrs')), isClosed),
+    circuitBreakers: closableTable(typedTable<CircuitBreakerRecord>(raw.table('circuit_breakers')), isClosed),
+    close: closeDomain,
   }
 }
