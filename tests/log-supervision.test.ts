@@ -776,6 +776,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
       origin,
       secondOrigin,
       service,
+      services,
       fakeRepos,
       fakePlatform,
       fakeTopics,
@@ -1873,5 +1874,104 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     expect(await readFile(join(followupWs, 'scratch', 'phase1-trace.txt'), 'utf8')).toBe('phase1 root cause notes\n')
     expect((await stat(join(followupWs, 'logs', 'manifest.json'))).isFile()).toBe(true)
     expect(domain.logTasks.get(phase1TaskId)?.workDir).toBe(followupWs)
+  }, 20_000)
+
+  it('preserves Feishu summary + action proposal delivery when topic-on-start falls back to headless while feishuTopics is unavailable or transiently fails', async () => {
+    const h = await createFullHarness({
+      deliveryMode: 'topic-on-start',
+      batchSizeThreshold: 1,
+      onLogTurn: async (req) => {
+        const prepare = h.toolNamed('supervisor_log_prepare')
+        const submit = h.toolNamed('supervisor_log_submit')
+        const prep = await prepare.execute({ taskId: req.taskId }, h.toolExecCtx(req.existingSessionId!, req.workDir)) as {
+          readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+        }
+        await submit.execute({
+          taskId: req.taskId,
+          summary: `降级无头诊断完成（${req.taskId}）`,
+          items: prep.slots.map(s => ({
+            ref: s.ref,
+            status: 'diagnosed',
+            rootCauseCategory: 'code_defect',
+            conclusion: 'handleOrder 返回 null 导致空指针',
+            evidences: [
+              { source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'NullPointerException' },
+              { source: 'repos/order-service/src/handler.ts', locator: 'L1', excerpt: 'return null' },
+            ],
+          })),
+        }, h.toolExecCtx(req.existingSessionId!, req.workDir))
+      },
+    })
+
+    // 1. Temporarily remove feishuTopics under topic-on-start -> falls back to headless diagnosis
+    // and persists pendingTopicDelivery so topicsAvailable() still delivers the summary card + actions.
+    h.services.delete('feishuTopics')
+    await h.service.controlLogWatermark({ action: 'rewind', cursorTime: '2026-11-12T09:50:00.000Z' })
+    h.fakePlatform.addLog({
+      log_id: 'fallback-unavail-1',
+      product_code: 'P1',
+      component_code: 'order-service',
+      error_code: 'E_FALLBACK_UNAVAIL',
+      file_name: 'fallback-unavail-1.log',
+      storage_type: 'fds',
+      status: 'completed',
+      archived_at: '2026-11-12T09:55:00.000Z',
+    }, 'NullPointerException at handleOrder\n')
+
+    const sup = h.service.logSupervisorInstance()!
+    await sup.pollNow()
+    await waitFor(async () => h.logTurns.length === 1 && (await h.service.state()).logSupervision?.running === 0)
+
+    const domain = await h.service.supervisorDomain()
+    const task1Entry = [...domain.logTasks.entries()][0]!
+    expect(task1Entry[1].status).toBe('completed')
+    expect(task1Entry[1].pendingTopicDelivery).toBe(true)
+    expect(task1Entry[1].feishuLaunchKey).toBeUndefined()
+    expect(task1Entry[1].feishuChatId).toBe('oc_ops_group')
+    expect(h.fakePlatform.revisions.some(r => r.completed)).toBe(true)
+    expect(h.fakeTopics.launched.length).toBe(0)
+
+    h.services.set('feishuTopics', h.fakeTopics)
+    await h.service.topicsAvailable()
+    expect(h.fakeTopics.launched.length).toBe(1)
+    const afterRecoverTask1 = domain.logTasks.get(task1Entry[0])!
+    expect(afterRecoverTask1.pendingTopicDelivery).toBeUndefined()
+    expect(afterRecoverTask1.feishuLaunchKey).toBe(h.fakeTopics.launched[0]!.key)
+
+    const summarySess1 = 'fallback-summary-sess-1'
+    h.fakeTopics.emitState({ key: h.fakeTopics.launched[0]!.key, status: 'running', sessionId: summarySess1 })
+    h.fakeTopics.emitState({ key: h.fakeTopics.launched[0]!.key, status: 'done', sessionId: summarySess1 })
+    await waitFor(() => h.fakeActions.proposals.length === 1)
+    expect(h.fakeActions.proposals[0]!.actions.map(a => a.id)).toEqual(['fix_code', 'improve_skill'])
+
+    // 2. Transient live launch failure ('not-connected') under topic-on-start also falls back to headless
+    // instead of permanently failing the batch, then delivers the summary card & actions.
+    h.fakeTopics.failNextLaunch = { code: 'not-connected', message: 'bot offline' }
+    h.fakePlatform.addLog({
+      log_id: 'fallback-transient-2',
+      product_code: 'P1',
+      component_code: 'order-service',
+      error_code: 'E_FALLBACK_TRANSIENT',
+      file_name: 'fallback-transient-2.log',
+      storage_type: 'fds',
+      status: 'completed',
+      archived_at: '2026-11-12T10:00:30.000Z',
+    }, 'NullPointerException at handleOrder\n')
+    h.advanceNow(60_000)
+    await sup.pollNow()
+    await waitFor(async () => h.logTurns.length === 2 && (await h.service.state()).logSupervision?.running === 0)
+
+    expect(h.fakeTopics.failedLaunches).toBe(1)
+    expect(h.fakeTopics.launched.length).toBe(2)
+    const task2Entry = [...domain.logTasks.entries()].find(([id]) => id !== task1Entry[0])!
+    expect(task2Entry[1].status).toBe('completed')
+    expect(task2Entry[1].pendingTopicDelivery).toBeUndefined()
+    expect(task2Entry[1].feishuLaunchKey).toBe(h.fakeTopics.launched[1]!.key)
+
+    const summarySess2 = 'fallback-summary-sess-2'
+    h.fakeTopics.emitState({ key: h.fakeTopics.launched[1]!.key, status: 'running', sessionId: summarySess2 })
+    h.fakeTopics.emitState({ key: h.fakeTopics.launched[1]!.key, status: 'done', sessionId: summarySess2 })
+    await waitFor(() => h.fakeActions.proposals.length === 2)
+    expect(h.fakeActions.proposals[1]!.actions.map(a => a.id)).toEqual(['fix_code', 'improve_skill'])
   }, 20_000)
 })

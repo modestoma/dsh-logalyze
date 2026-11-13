@@ -268,16 +268,15 @@ export class LogSupervisor {
 
       if (task.source === 'platform') {
         if (task.feishuLaunchKey === undefined && task.revisions.length > 0) {
-          const deliveryMode = task.deliveryMode ?? this.deps.getSettings().deliveryMode
-          const needsQuietSummary = deliveryMode === 'quiet-until-done'
-            && (task.feishuChatId ?? this.deps.getSettings().feishuChatId) !== undefined
+          const chatId = task.feishuChatId ?? this.deps.getSettings().feishuChatId
+          const needsSummaryCard = chatId !== undefined
           await this.updateTask(taskId, cur => (
             cur.status === 'running'
               ? {
                 ...cur,
                 status: 'completed',
                 lastError: undefined,
-                ...(needsQuietSummary ? { pendingTopicDelivery: true } : {}),
+                ...(needsSummaryCard ? { feishuChatId: cur.feishuChatId ?? chatId, pendingTopicDelivery: true } : {}),
                 updatedAt: this.now(),
               }
               : cur
@@ -1271,10 +1270,11 @@ export class LogSupervisor {
     topics: FeishuTopicService,
     signal: AbortSignal,
   ): Promise<void> {
+    const hadPriorLaunchKey = task.feishuLaunchKey !== undefined
     const launchKey = task.feishuLaunchKey ?? logTopicKey(taskId)
     this.launchKeyToTaskId.set(launchKey, taskId)
 
-    if (task.feishuLaunchKey !== undefined) {
+    if (hadPriorLaunchKey) {
       const existingState = topics.state(launchKey)
       if (existingState !== undefined) {
         await this.applyTopicState(taskId, existingState)
@@ -1317,6 +1317,18 @@ export class LogSupervisor {
     try {
       res = await topics.launch(spec)
     } catch (error) {
+      if (!hadPriorLaunchKey) {
+        this.launchKeyToTaskId.delete(launchKey)
+        await this.updateTask(taskId, cur => ({
+          ...cur,
+          feishuLaunchKey: undefined,
+          feishuChatId: cur.feishuChatId ?? chatId,
+          updatedAt: this.now(),
+        }))
+        this.deps.logger?.warn?.('logalyze: 发起直播飞书话题异常，降级为无头后台诊断（%s）：%s', taskId, messageOf(error))
+        await this.runHeadlessBatch(taskId, signal)
+        return
+      }
       await this.updateTask(taskId, cur => ({
         ...cur,
         status: 'failed',
@@ -1328,8 +1340,29 @@ export class LogSupervisor {
     }
 
     if (!res.ok) {
+      if (!hadPriorLaunchKey && (res.code === 'not-connected' || res.code === 'send-failed')) {
+        this.launchKeyToTaskId.delete(launchKey)
+        await this.updateTask(taskId, cur => ({
+          ...cur,
+          feishuLaunchKey: undefined,
+          feishuChatId: cur.feishuChatId ?? chatId,
+          updatedAt: this.now(),
+        }))
+        this.deps.logger?.warn?.(
+          'logalyze: 发起直播飞书话题暂不可用（%s），降级为无头后台诊断（%s）：%s',
+          res.code,
+          taskId,
+          res.message,
+        )
+        await this.runHeadlessBatch(taskId, signal)
+        return
+      }
+      if (!hadPriorLaunchKey) {
+        this.launchKeyToTaskId.delete(launchKey)
+      }
       await this.updateTask(taskId, cur => ({
         ...cur,
+        ...(hadPriorLaunchKey ? {} : { feishuLaunchKey: undefined }),
         status: 'failed',
         lastError: `发起飞书话题失败（${res.code}）：${res.message}`,
         updatedAt: this.now(),
@@ -1435,9 +1468,8 @@ export class LogSupervisor {
 
     const latest = await this.updateTask(taskId, (cur) => {
       const nextSessionId = cur.sessionId ?? turnResult.sessionId
-      const quietNeedsCard = (cur.deliveryMode ?? mode) === 'quiet-until-done'
-        && cur.feishuLaunchKey === undefined
-        && (cur.feishuChatId ?? this.deps.getSettings().feishuChatId) !== undefined
+      const resolvedChatId = cur.feishuChatId ?? this.deps.getSettings().feishuChatId
+      const needsSummaryCard = cur.feishuLaunchKey === undefined && resolvedChatId !== undefined
 
       if (cur.revisions.length > 0) {
         return {
@@ -1445,7 +1477,7 @@ export class LogSupervisor {
           ...(nextSessionId === undefined ? {} : { sessionId: nextSessionId }),
           status: 'completed',
           lastError: undefined,
-          ...(quietNeedsCard ? { pendingTopicDelivery: true } : {}),
+          ...(needsSummaryCard ? { feishuChatId: cur.feishuChatId ?? resolvedChatId, pendingTopicDelivery: true } : {}),
           updatedAt: this.now(),
         }
       }
@@ -1476,9 +1508,8 @@ export class LogSupervisor {
     await this.outboxRunner.processDue().catch(() => undefined)
     const reportUrls = this.collectRevisionReportUrls(taskId, latestRev.revision)
 
-    const deliveryMode = latest.deliveryMode ?? mode
     const chatId = latest.feishuChatId ?? this.deps.getSettings().feishuChatId
-    if (deliveryMode === 'quiet-until-done' && chatId !== undefined) {
+    if ((latest.feishuLaunchKey === undefined || latest.pendingTopicDelivery === true) && chatId !== undefined) {
       await this.deliverQuietDoneSummaryTopic(taskId, latestRev, reportUrls)
     }
   }
@@ -1777,20 +1808,18 @@ export class LogSupervisor {
       }
     }
 
-    // Mark task completed (and arm pendingTopicDelivery if quiet-until-done still needs a summary
-    // card) AFTER durable outbox enqueue so a crash before completion is recovered cleanly.
+    // Mark task completed (and arm pendingTopicDelivery if no live Feishu topic owns this batch
+    // yet, including topic-on-start headless fallbacks) AFTER durable outbox enqueue.
     const completedTask = await this.updateTask(params.taskId, (cur) => {
-      const mode = cur.deliveryMode ?? this.deps.getSettings().deliveryMode
       const chatId = cur.feishuChatId ?? this.deps.getSettings().feishuChatId
-      const needsQuietSummary = cur.source === 'platform'
-        && mode === 'quiet-until-done'
+      const needsSummaryCard = cur.source === 'platform'
         && cur.feishuLaunchKey === undefined
         && chatId !== undefined
       return {
         ...cur,
         status: 'completed',
         lastError: undefined,
-        ...(needsQuietSummary ? { feishuChatId: chatId, pendingTopicDelivery: true } : {}),
+        ...(needsSummaryCard ? { feishuChatId: cur.feishuChatId ?? chatId, pendingTopicDelivery: true } : {}),
         updatedAt: this.now(),
       }
     })
