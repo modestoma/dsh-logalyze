@@ -341,9 +341,9 @@ async function flushMicrotasks(): Promise<void> {
   }
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 12_000): Promise<void> {
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 12_000): Promise<void> {
   const start = Date.now()
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() - start > timeoutMs) {
       throw new Error(`waitFor timed out after ${timeoutMs}ms`)
     }
@@ -1622,6 +1622,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
       const midPollTask = domain.logTasks.entries().find(([, t]) => t.inputs.some(i => i.logId === 'rewind-midpoll-1'))
       return midPollTask?.[1].status === 'completed'
     })
+    await waitFor(async () => h.fakeTopics.launched.length >= 1 && (await h.service.state()).logSupervision?.running === 0)
 
     // Scenario C (4566335190): Non-shutdown exception from sessionDriver.runTurn transitions task to 'failed' (never stuck 'running'), and rewind recovers it!
     throwFirstTurn = true
@@ -1644,6 +1645,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     })
     const failedTask = domain.logTasks.entries().find(([, t]) => t.inputs.some(i => i.logId === 'thrown-turn-1'))![1]
     expect(failedTask.lastError).toContain('sessionController prompt rejected')
+    await waitFor(async () => (await h.service.state()).logSupervision?.running === 0)
     expect((await h.service.state()).logSupervision?.running).toBe(0)
 
     // Rewinding watermark across thrown-turn-1's archived_at re-ingests and recovers it cleanly.
@@ -1655,5 +1657,88 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     await waitFor(() => domain.logTasks.entries().some(
       ([, t]) => t.inputs.some(i => i.logId === 'thrown-turn-1') && t.status === 'completed',
     ))
+    await waitFor(async () => h.fakeTopics.launched.length >= 2 && (await h.service.state()).logSupervision?.running === 0)
+  }, 20_000)
+
+  it('persists initial polling boundary before first request and transfers Phase-1 workspace to quiet-done follow-up topic', async () => {
+    let phase1TaskId = ''
+    let phase1WorkDir = ''
+
+    const h = await createFullHarness({
+      batchSizeThreshold: 1,
+      deliveryMode: 'quiet-until-done',
+      onLogTurn: async (req) => {
+        phase1TaskId = req.taskId
+        phase1WorkDir = req.workDir
+        const prepare = h.toolNamed('supervisor_log_prepare')
+        const submit = h.toolNamed('supervisor_log_submit')
+        const prepared = await prepare.execute({ taskId: req.taskId }, h.toolExecCtx(req.existingSessionId!, req.workDir)) as {
+          readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+        }
+        await writeFile(join(req.workDir, 'scratch', 'phase1-trace.txt'), 'phase1 root cause notes\n')
+        await submit.execute({
+          taskId: req.taskId,
+          summary: '静默诊断结论完成',
+          items: prepared.slots.map(s => ({
+            ref: s.ref,
+            status: 'diagnosed',
+            rootCauseCategory: 'config_or_env',
+            conclusion: 'phase 1 root cause confirmed',
+            evidences: [{ source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'initial boundary error' }],
+          })),
+        }, h.toolExecCtx(req.existingSessionId!, req.workDir))
+      },
+    })
+
+    // 4566478093: Initial poll fails on first request -> lower boundary 09:59:00Z is already persisted,
+    // so retrying minutes later still captures archived logs inside [09:59:00Z, 10:00:00Z) without skipping.
+    h.fakePlatform.addLog({
+      log_id: 'first-boundary-1',
+      product_code: 'P1',
+      component_code: 'order-service',
+      error_code: 'E_INIT_POLL',
+      file_name: 'first-boundary.log',
+      storage_type: 'fds',
+      status: 'completed',
+      archived_at: '2026-11-12T09:59:30.000Z',
+    }, 'initial boundary error\n')
+
+    const sup = h.service.logSupervisorInstance()!
+    h.fakePlatform.fail('logs', 502)
+    await sup.pollNow()
+
+    const failedWmState = await h.service.state()
+    expect(failedWmState.logSupervision?.watermark?.cursorTime).toBe('2026-11-12T09:59:00.000Z')
+    expect(failedWmState.logSupervision?.watermark?.consecutiveFailures).toBe(1)
+
+    h.advanceNow(180_000)
+    await sup.pollNow()
+    await waitFor(async () => h.fakeTopics.launched.length === 1 && (await h.service.state()).logSupervision?.running === 0)
+    expect(phase1TaskId).not.toBe('')
+
+    // 4566478102: Quiet-done Feishu topic runs in a new directory -> Phase-1 workDir stays preserved until
+    // supervisor_log_prepare transfers logs/ and scratch/ to followupWs without re-downloading.
+    const launch = h.fakeTopics.launched[0]!
+    const followupSess = 'feishu-quiet-followup-1'
+    const followupWs = join(h.dir, 'feishu-quiet-followup-ws')
+    await mkdir(followupWs, { recursive: true })
+
+    h.fakeTopics.emitState({ key: launch.key, status: 'running', sessionId: followupSess, workDir: followupWs })
+    h.fakeTopics.emitState({ key: launch.key, status: 'done', sessionId: followupSess, workDir: followupWs })
+    await flushMicrotasks()
+
+    const domain = await h.service.supervisorDomain()
+    expect(domain.logTasks.get(phase1TaskId)?.workDir).toBe(phase1WorkDir)
+
+    h.fakePlatform.fail('download', 404)
+    const followupPrep = await h.toolNamed('supervisor_log_prepare').execute({}, h.toolExecCtx(followupSess, followupWs)) as {
+      readonly reused: boolean
+      readonly workDir: string
+    }
+    expect(followupPrep.reused).toBe(true)
+    expect(followupPrep.workDir).toBe(followupWs)
+    expect(await readFile(join(followupWs, 'scratch', 'phase1-trace.txt'), 'utf8')).toBe('phase1 root cause notes\n')
+    expect((await stat(join(followupWs, 'logs', 'manifest.json'))).isFile()).toBe(true)
+    expect(domain.logTasks.get(phase1TaskId)?.workDir).toBe(followupWs)
   }, 20_000)
 })

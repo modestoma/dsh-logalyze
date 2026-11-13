@@ -9,8 +9,8 @@
  */
 
 import { randomBytes } from 'node:crypto'
-import { mkdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, readdir, stat } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 import { z } from 'zod'
 import type { ReadyApp, RepoRegistry } from '../apps/registry.ts'
 import type { FeishuActionsService } from '../deps/actions-contract.ts'
@@ -754,6 +754,23 @@ export class LogSupervisor {
         })
       })
       return
+    }
+
+    if (wm.cursorTime === undefined) {
+      // Persist the initial lower polling boundary before requesting logs so first-poll errors
+      // or process restarts retry from the original interval instead of skipping forward.
+      const anchored = await this.withWatermarkLock(async () => {
+        if (!isEpochCurrent()) return false
+        const latestWm = this.readWatermark()
+        if (latestWm.cursorTime === undefined) {
+          await this.deps.watermarks.put(LOG_WATERMARK_KEY, {
+            ...latestWm,
+            cursorTime: fromIso,
+          })
+        }
+        return true
+      })
+      if (!anchored) return
     }
 
     let cursor = resumingBackfill ? wm.backfillCursor : undefined
@@ -1550,45 +1567,73 @@ export class LogSupervisor {
     })
   }
 
-  private async applyTopicState(taskId: string, state: TopicLaunchState): Promise<void> {
-    const task = this.deps.logTasks.get(taskId)
-    if (task === undefined) return
+  private async resolveNextTopicWorkDir(
+    currentWorkDir: string | undefined,
+    incomingWorkDir: string | undefined,
+  ): Promise<string | undefined> {
+    if (incomingWorkDir === undefined || incomingWorkDir === '') return currentWorkDir
+    if (currentWorkDir === undefined || currentWorkDir === '') return incomingWorkDir
+    if (resolve(currentWorkDir) === resolve(incomingWorkDir)) return incomingWorkDir
 
-    if (state.sessionId !== undefined) {
-      this.indexSessionTask(state.sessionId, taskId)
+    if (await pathExists(join(incomingWorkDir, 'logs', 'manifest.json'))) {
+      return incomingWorkDir
     }
+    if (await pathExists(join(currentWorkDir, 'logs', 'manifest.json'))) {
+      return currentWorkDir
+    }
+    const scratchEntries = await readdir(join(currentWorkDir, 'scratch')).catch(() => [] as string[])
+    if (scratchEntries.length > 0) {
+      return currentWorkDir
+    }
+    return incomingWorkDir
+  }
 
-    const updated = await this.updateTask(taskId, (cur) => {
-      const nextSessionId = state.sessionId ?? cur.sessionId
-      const nextWorkDir = state.workDir ?? cur.workDir
-      let nextStatus = cur.status
-      let nextError = cur.lastError
-      if (cur.status === 'running') {
-        if (state.status === 'done') {
-          if (cur.revisions.length > 0) {
-            nextStatus = 'completed'
-            nextError = undefined
-          } else {
+  private async applyTopicState(taskId: string, state: TopicLaunchState): Promise<void> {
+    const updated = await this.withTaskOperation(taskId, async () => {
+      const task = this.deps.logTasks.get(taskId)
+      if (task === undefined) return undefined
+
+      if (state.sessionId !== undefined) {
+        this.indexSessionTask(state.sessionId, taskId)
+      }
+
+      const resolvedWorkDir = await this.resolveNextTopicWorkDir(task.workDir, state.workDir)
+
+      return await this.updateTask(taskId, (cur) => {
+        const nextSessionId = state.sessionId ?? cur.sessionId
+        const nextWorkDir = cur.workDir === task.workDir
+          ? resolvedWorkDir
+          : (cur.workDir ?? state.workDir)
+        let nextStatus = cur.status
+        let nextError = cur.lastError
+        if (cur.status === 'running') {
+          if (state.status === 'done') {
+            if (cur.revisions.length > 0) {
+              nextStatus = 'completed'
+              nextError = undefined
+            } else {
+              nextStatus = 'failed'
+              nextError = '飞书诊断话题结束但未提交结论'
+            }
+          } else if (state.status === 'failed' || state.status === 'error') {
             nextStatus = 'failed'
-            nextError = '飞书诊断话题结束但未提交结论'
+            nextError = state.reason ?? `飞书话题状态：${state.status}`
+          } else if (state.status === 'stopped' || state.status === 'interrupted') {
+            nextStatus = 'interrupted'
+            nextError = `飞书话题状态：${state.status}`
           }
-        } else if (state.status === 'failed' || state.status === 'error') {
-          nextStatus = 'failed'
-          nextError = state.reason ?? `飞书话题状态：${state.status}`
-        } else if (state.status === 'stopped' || state.status === 'interrupted') {
-          nextStatus = 'interrupted'
-          nextError = `飞书话题状态：${state.status}`
         }
-      }
-      return {
-        ...cur,
-        ...(nextSessionId === undefined ? {} : { sessionId: nextSessionId }),
-        ...(nextWorkDir === undefined ? {} : { workDir: nextWorkDir }),
-        status: nextStatus,
-        ...(nextError === undefined ? { lastError: undefined } : { lastError: nextError }),
-        updatedAt: this.now(),
-      }
+        return {
+          ...cur,
+          ...(nextSessionId === undefined ? {} : { sessionId: nextSessionId }),
+          ...(nextWorkDir === undefined ? {} : { workDir: nextWorkDir }),
+          status: nextStatus,
+          ...(nextError === undefined ? { lastError: undefined } : { lastError: nextError }),
+          updatedAt: this.now(),
+        }
+      })
     })
+    if (updated === undefined) return
 
     if (state.status === 'done' && state.sessionId !== undefined) {
       const latestRev = updated.revisions.at(-1)
@@ -2118,6 +2163,10 @@ export class LogSupervisor {
   private withTopicDeliveryLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
     return this.serializeKeyedLock(this.topicDeliveryLocks, key, fn)
   }
+}
+
+async function pathExists(target: string): Promise<boolean> {
+  return await stat(target).then(() => true, () => false)
 }
 
 export { UNLABELED_ERROR_CODE }

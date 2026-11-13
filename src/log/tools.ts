@@ -325,15 +325,15 @@ async function prepareLogDirectory(params: {
   await mkdir(scratchDir, { recursive: true })
 
   // If this session transitioned from headless Phase 1 to a new Feishu topic workDir, reuse prepared files!
-  if (
-    task.workDir !== undefined
-    && resolve(task.workDir) !== resolve(workDir)
-    && !(await pathExists(manifestPath))
-    && (await pathExists(join(task.workDir, 'logs', 'manifest.json')))
-  ) {
-    await cp(join(task.workDir, 'logs'), logsDir, { recursive: true })
+  if (task.workDir !== undefined && resolve(task.workDir) !== resolve(workDir)) {
+    if (
+      !(await pathExists(manifestPath))
+      && (await pathExists(join(task.workDir, 'logs', 'manifest.json')))
+    ) {
+      await cp(join(task.workDir, 'logs'), logsDir, { recursive: true })
+    }
     if (await pathExists(join(task.workDir, 'scratch'))) {
-      await cp(join(task.workDir, 'scratch'), scratchDir, { recursive: true })
+      await cp(join(task.workDir, 'scratch'), scratchDir, { recursive: true, force: false })
     }
   }
 
@@ -583,7 +583,7 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
 
         await runtime.updateTask(currentBound.taskId, cur => ({
           ...cur,
-          sessionId: cur.sessionId ?? sessionId,
+          sessionId,
           workDir: resolve(cur.workDir ?? '') === workDir ? cur.workDir : workDir,
           inputs: preparedLogs.inputs,
           updatedAt: runtime.now(),
