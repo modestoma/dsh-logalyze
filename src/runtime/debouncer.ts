@@ -215,14 +215,14 @@ export class KeyedDebouncer<T, K extends string = string> {
         dueEntries.push([key, bucket])
       }
     }
-    await Promise.all(dueEntries.map(([key, bucket]) => this.dispatchBucket(key, bucket, at, 'timer', true)))
+    await settleAllFlushes(dueEntries.map(([key, bucket]) => this.dispatchBucket(key, bucket, at, 'timer', true)))
     return dueEntries.length
   }
 
   /** Immediately flush all buffered keys. */
   async flushAll(): Promise<void> {
     const entries = [...this.buckets.entries()]
-    await Promise.all(entries.map(([key, bucket]) => this.dispatchBucket(key, bucket, this.now(), 'manual', true)))
+    await settleAllFlushes(entries.map(([key, bucket]) => this.dispatchBucket(key, bucket, this.now(), 'manual', true)))
   }
 
   /** Cancel and discard buffered items for `key` without invoking `onFlush`. */
@@ -250,16 +250,26 @@ export class KeyedDebouncer<T, K extends string = string> {
 
   /**
    * Close the debouncer, either flushing or cancelling remaining buffered windows,
-   * and wait for all in-flight `onFlush` callbacks to settle.
+   * and wait for all in-flight `onFlush` callbacks to settle even if one fails.
    */
   async drainAndClose(options: { readonly flushPending?: boolean } = {}): Promise<void> {
     this.closed = true
+    let flushError: unknown
+    let hasFlushError = false
     if (options.flushPending === true) {
-      await this.flushAll()
+      try {
+        await this.flushAll()
+      } catch (error) {
+        flushError = error
+        hasFlushError = true
+      }
     } else {
       this.cancelAll()
     }
-    await Promise.allSettled([...this.inflight])
+    while (this.inflight.size > 0) {
+      await Promise.allSettled([...this.inflight])
+    }
+    if (hasFlushError) throw flushError
   }
 
   private scheduleTimer(key: K, bucket: InternalBucket<T>, currentNow: number): void {
@@ -318,4 +328,13 @@ export class KeyedDebouncer<T, K extends string = string> {
     this.inflight.add(tracked)
     return tracked
   }
+}
+
+async function settleAllFlushes(promises: readonly Promise<void>[]): Promise<void> {
+  const results = await Promise.allSettled(promises)
+  const errors = results
+    .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+    .map(result => result.reason)
+  if (errors.length === 1) throw errors[0]
+  if (errors.length > 1) throw new AggregateError(errors, `${errors.length} 个防抖批次刷新失败`)
 }

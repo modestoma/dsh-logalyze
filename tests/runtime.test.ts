@@ -189,11 +189,20 @@ describe('runtime storage & dsh_supervisor domain', () => {
     await domain.close()
     await expect(domain.watermarks.put('after-close', { paused: false, consecutiveFailures: 0 })).rejects.toMatchObject({ code: 'closed' })
 
+    // Drains mutations already admitted before close() while rejecting post-close calls
+    const drainDomain = await openSupervisorDomain({ fallbackDir: dir })
+    const admittedPut = drainDomain.watermarks.put('admitted-before-close', { paused: false, consecutiveFailures: 7 })
+    const admittedUpdate = drainDomain.watermarks.update('admitted-before-close', cur => ({ ...cur, consecutiveFailures: cur.consecutiveFailures + 1 }))
+    const closePromise = drainDomain.close()
+    await expect(drainDomain.watermarks.put('rejected-during-close', { paused: false, consecutiveFailures: 0 })).rejects.toMatchObject({ code: 'closed' })
+    await Promise.all([admittedPut, admittedUpdate, closePromise])
+
     // Reopen from disk and verify durable state across all 7 tables
     const persistedPath = join(dir, 'dsh_supervisor.json')
     expect(JSON.parse(await readFile(persistedPath, 'utf8'))).toMatchObject({ version: 1 })
 
     const reopened = await openSupervisorDomain({ fallbackDir: dir })
+    expect(reopened.watermarks.get('admitted-before-close')?.consecutiveFailures).toBe(8)
     expect(reopened.watermarks.get('platform')?.consecutiveFailures).toBe(1)
     expect(reopened.pendingBatches.get('P1:order:E1001')?.logIds).toEqual(['log-1', 'log-2'])
     expect(reopened.logTasks.get('task-1')?.revisions[0]?.issueId).toBe('issue-1')
@@ -574,6 +583,41 @@ describe('KeyedDebouncer', () => {
     debouncer.push('k', 2)
     expect(await flushed.promise).toEqual([1, 2])
     await debouncer.drainAndClose()
+  })
+
+  it('waits for all remaining flushes and inflight callbacks when a shutdown flush rejects', async () => {
+    const slowGate = Promise.withResolvers<void>()
+    let slowFinished = false
+    const debouncer = new KeyedDebouncer<string>({
+      windowMs: 5_000,
+      mode: 'fixed',
+      autoTimer: false,
+      onFlush: async (key) => {
+        if (key === 'failing-key') {
+          throw new Error('flush-boom')
+        }
+        await slowGate.promise
+        slowFinished = true
+      },
+    })
+    debouncer.push('failing-key', 'a')
+    debouncer.push('slow-key', 'b')
+
+    let settled = false
+    const closing = debouncer.drainAndClose({ flushPending: true }).finally(() => { settled = true })
+    // Attach rejection handler immediately to avoid unhandled rejection warning while awaiting slowGate
+    const outcome = closing.then(() => 'ok', (err: unknown) => err)
+
+    await new Promise(resolve => setTimeout(resolve, 15))
+    expect(settled).toBe(false)
+    expect(slowFinished).toBe(false)
+
+    slowGate.resolve()
+    const err = await outcome
+    expect(settled).toBe(true)
+    expect(slowFinished).toBe(true)
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toBe('flush-boom')
   })
 })
 

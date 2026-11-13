@@ -157,9 +157,6 @@ function buildLocalDomainHandle(
       return Promise.reject(new StorageDomainError('closed', `存储域 "${spec.name}" 已关闭`))
     }
     const run = queue.then(async () => {
-      if (closed) {
-        throw new StorageDomainError('closed', `存储域 "${spec.name}" 已关闭`)
-      }
       const previous = persist === undefined ? undefined : snapshotAll()
       const result = mutate()
       if (persist !== undefined) {
@@ -199,6 +196,7 @@ function buildLocalDomainHandle(
         return [...getRows().keys()]
       },
       async put(key: string, value: unknown): Promise<void> {
+        if (closed) throw new StorageDomainError('closed', `存储域 "${spec.name}" 已关闭`)
         if (key === '') throw new TypeError(`表 "${tableName}" 的主键不能为空字符串`)
         const parsed = cloneValue(tableSpec.valueSchema.parse(value))
         await enqueueMutation(() => {
@@ -206,6 +204,7 @@ function buildLocalDomainHandle(
         })
       },
       async update(key: string, fn: (current: unknown) => unknown): Promise<unknown> {
+        if (closed) throw new StorageDomainError('closed', `存储域 "${spec.name}" 已关闭`)
         if (key === '') throw new TypeError(`表 "${tableName}" 的主键不能为空字符串`)
         return await enqueueMutation(() => {
           const rows = getRows()
@@ -219,6 +218,7 @@ function buildLocalDomainHandle(
         })
       },
       async delete(key: string): Promise<boolean> {
+        if (closed) throw new StorageDomainError('closed', `存储域 "${spec.name}" 已关闭`)
         return await enqueueMutation(() => getRows().delete(key))
       },
     })
@@ -233,9 +233,8 @@ function buildLocalDomainHandle(
       return table
     },
     async close(): Promise<void> {
-      const inflight = queue
       closed = true
-      await inflight
+      await queue
     },
   }
 }
