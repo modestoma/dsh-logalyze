@@ -18,6 +18,8 @@ import { DSH_REPOS_SERVICE, ReposClient } from '../src/deps/repos.ts'
 import type { HostContext, ToolActivationContext, ToolDefinition } from '../src/host.ts'
 import { MrSupervisor, createHostMrSessionDriver } from '../src/mr/index.ts'
 import {
+  MAX_SEEN_NOTE_IDS,
+  advanceHumanNoteWatermark,
   classifyMrPollUpdate,
   isSameBotUser,
   normalizeBotHandle,
@@ -1658,5 +1660,333 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
       sessionId: 'sess-shared',
       error: '排队的 MR 评审消息已被取消',
     })
+  })
+
+  it('restores uncheckpointed signals when shutdown aborts an active turn and resumes on reboot', async () => {
+    const { dir, cleanup } = await tempDir('mr-shutdown-restore-')
+    cleanups.push(cleanup)
+
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    const origin = 'https://git.example/org/app.git'
+    fakeV8.base.setCatalog([{ url: origin, base: 'main' }], ['mr-review'])
+    fakeV8.upsertMr(origin, 1, { headSha: 'sha-mr-1-v1', updatedAt: '2026-11-01T10:00:00Z' })
+
+    const nowMs = Date.parse('2026-11-01T10:00:00Z')
+    let abortedTurns = 0
+    let turnStartedResolve: (() => void) | undefined
+    const turnStarted = new Promise<void>(resolve => { turnStartedResolve = resolve })
+
+    const h1 = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 0 },
+      clock: () => nowMs,
+      driver: {
+        async runTurn(req) {
+          abortedTurns += 1
+          await req.onSessionBound?.('sess-abort-1')
+          turnStartedResolve?.()
+          await new Promise<void>((_resolve, reject) => {
+            if (req.signal.aborted) {
+              reject(new Error('aborted by shutdown'))
+              return
+            }
+            req.signal.addEventListener('abort', () => reject(new Error('aborted by shutdown')), { once: true })
+          })
+          return { sessionId: 'sess-abort-1' }
+        },
+      },
+    })
+
+    const sup1 = h1.service.mrSupervisorInstance()!
+    await sup1.pollNow()
+    await turnStarted
+
+    // Shutdown aborts the in-flight initial review before checkpointing -> must restore signal & not re-run.
+    await h1.dispose()
+    expect(abortedTurns).toBe(1)
+
+    // Reboot on the same persistent domain directory: interrupted review automatically resumes and completes,
+    // and shutting down during a subsequent push-only review also restores cleanly.
+    const resumedHeadShas: string[] = []
+    let abortOnPush = false
+    let pushTurnStartedResolve: (() => void) | undefined
+    const pushTurnStarted = new Promise<void>(resolve => { pushTurnStartedResolve = resolve })
+    let h2!: Awaited<ReturnType<typeof createServiceHarness>>
+    h2 = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 0 },
+      clock: () => nowMs + 1_000,
+      driver: {
+        async runTurn(req) {
+          const sid = req.existingSessionId ?? 'sess-resume-1'
+          await req.onSessionBound?.(sid)
+          if (abortOnPush) {
+            abortedTurns += 1
+            pushTurnStartedResolve?.()
+            await new Promise<void>((_resolve, reject) => {
+              if (req.signal.aborted) {
+                reject(new Error('aborted push by shutdown'))
+                return
+              }
+              req.signal.addEventListener('abort', () => reject(new Error('aborted push by shutdown')), { once: true })
+            })
+          }
+          const mr = fakeV8.mrs.get(req.repo)!.get(req.mrNumber)!.info
+          resumedHeadShas.push(mr.headSha)
+          await h2.callTool(MR_PUBLISH_REVIEW_TOOL_NAME, {
+            headSha: mr.headSha,
+            verdict: 'comment',
+            body: `Reviewed ${mr.headSha}`,
+          }, sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+
+    const sup2 = h2.service.mrSupervisorInstance()!
+    const domain2 = await h2.service.supervisorDomain()
+    const key1 = supervisedMrKey(origin, 1)
+
+    await vi.waitFor(() => {
+      expect(resumedHeadShas).toEqual(['sha-mr-1-v1'])
+    })
+    await sup2.waitForIdle()
+    expect(domain2.supervisedMrs.get(key1)?.lastReviewedSha).toBe('sha-mr-1-v1')
+    expect(domain2.supervisedMrs.get(key1)?.pendingSignals).toEqual([])
+
+    // Now trigger a push-only turn and abort it via shutdown as well.
+    abortOnPush = true
+    fakeV8.upsertMr(origin, 1, { headSha: 'sha-mr-1-v2', updatedAt: '2026-11-01T10:01:00Z' })
+    await sup2.pollNow()
+    await pushTurnStarted
+    await h2.dispose()
+    expect(abortedTurns).toBe(2)
+
+    let h3!: Awaited<ReturnType<typeof createServiceHarness>>
+    h3 = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 0 },
+      clock: () => nowMs + 2_000,
+      driver: {
+        async runTurn(req) {
+          const sid = req.existingSessionId ?? 'sess-resume-1'
+          await req.onSessionBound?.(sid)
+          const mr = fakeV8.mrs.get(req.repo)!.get(req.mrNumber)!.info
+          resumedHeadShas.push(mr.headSha)
+          await h3.callTool(MR_PUBLISH_REVIEW_TOOL_NAME, {
+            headSha: mr.headSha,
+            verdict: 'comment',
+            body: `Reviewed ${mr.headSha}`,
+          }, sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(() => h3.dispose())
+
+    const sup3 = h3.service.mrSupervisorInstance()!
+    const domain3 = await h3.service.supervisorDomain()
+    await vi.waitFor(() => {
+      expect(resumedHeadShas).toEqual(['sha-mr-1-v1', 'sha-mr-1-v2'])
+    })
+    await sup3.waitForIdle()
+    expect(domain3.supervisedMrs.get(key1)?.lastReviewedSha).toBe('sha-mr-1-v2')
+    expect(domain3.supervisedMrs.get(key1)?.pendingSignals).toEqual([])
+  })
+
+  it('reapplies draft and ignoreLabels filters before admitting queued turns and on intervening polls', async () => {
+    const { dir, cleanup } = await tempDir('mr-filter-reapply-')
+    cleanups.push(cleanup)
+
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    const origin = 'https://git.example/org/app.git'
+    fakeV8.base.setCatalog([{ url: origin, base: 'main' }], ['mr-review'])
+    fakeV8.upsertMr(origin, 1, { headSha: 'sha-1-v1', updatedAt: '2026-11-01T11:00:00Z' })
+    fakeV8.upsertMr(origin, 2, { headSha: 'sha-2-v1', updatedAt: '2026-11-01T11:00:00Z' })
+    fakeV8.upsertMr(origin, 3, { headSha: 'sha-3-v1', updatedAt: '2026-11-01T11:00:00Z' })
+
+    let nowMs = Date.parse('2026-11-01T11:00:00Z')
+    const executedMrs: string[] = []
+    let h!: Awaited<ReturnType<typeof createServiceHarness>>
+    h = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 5_000, skipDraft: true, ignoreLabels: ['wip'] },
+      clock: () => nowMs,
+      driver: {
+        async runTurn(req) {
+          const sid = req.existingSessionId ?? `sess-filter-${req.mrNumber}`
+          await req.onSessionBound?.(sid)
+          const mr = fakeV8.mrs.get(req.repo)!.get(req.mrNumber)!.info
+          executedMrs.push(`#${req.mrNumber}@${mr.headSha}`)
+          await h.callTool(MR_PUBLISH_REVIEW_TOOL_NAME, {
+            headSha: mr.headSha,
+            verdict: 'approve',
+            body: 'LGTM',
+          }, sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(() => h.dispose())
+
+    const supervisor = h.service.mrSupervisorInstance()!
+    const domain = await h.service.supervisorDomain()
+    const key1 = supervisedMrKey(origin, 1)
+    const key2 = supervisedMrKey(origin, 2)
+    const key3 = supervisedMrKey(origin, 3)
+
+    await supervisor.pollNow()
+    expect(domain.supervisedMrs.get(key1)?.pendingSignals.map(s => s.kind)).toEqual(['opened'])
+    expect(domain.supervisedMrs.get(key2)?.pendingSignals.map(s => s.kind)).toEqual(['opened'])
+    expect(domain.supervisedMrs.get(key3)?.pendingSignals.map(s => s.kind)).toEqual(['opened'])
+
+    // Mutate MR #1 (draft) and MR #2 (ignored label) AFTER debounce queued, WITHOUT polling first.
+    fakeV8.upsertMr(origin, 1, { draft: true, updatedAt: '2026-11-01T11:00:02Z' })
+    fakeV8.upsertMr(origin, 2, { labels: ['WIP'], updatedAt: '2026-11-01T11:00:02Z' })
+
+    nowMs += 6_000
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+
+    // Only MR #3 ran; #1 transitioned to draft_skipped, #2 cleared pending signals & restored headSha=undefined.
+    expect(executedMrs).toEqual(['#3@sha-3-v1'])
+    expect(domain.supervisedMrs.get(key1)?.state).toBe('draft_skipped')
+    expect(domain.supervisedMrs.get(key1)?.pendingSignals).toEqual([])
+    expect(domain.supervisedMrs.get(key2)?.pendingSignals).toEqual([])
+    expect(domain.supervisedMrs.get(key2)?.dueAt).toBeUndefined()
+
+    // Push a new commit to MR #3 so it enters debounce, then add ignored label `wip` and poll BEFORE debounce expires.
+    nowMs += 1_000
+    fakeV8.upsertMr(origin, 3, { headSha: 'sha-3-v2', updatedAt: '2026-11-01T11:00:07Z' })
+    await supervisor.pollNow()
+    expect(domain.supervisedMrs.get(key3)?.pendingSignals.map(s => s.kind)).toEqual(['push'])
+
+    fakeV8.upsertMr(origin, 3, { labels: ['wip'], updatedAt: '2026-11-01T11:00:08Z' })
+    await supervisor.pollNow()
+    expect(domain.supervisedMrs.get(key3)?.pendingSignals).toEqual([])
+    expect(domain.supervisedMrs.get(key3)?.dueAt).toBeUndefined()
+
+    nowMs += 6_000
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+    expect(executedMrs).toEqual(['#3@sha-3-v1'])
+
+    // Un-draft #1 and remove `wip` from #2 and #3 -> all three resume cleanly!
+    fakeV8.upsertMr(origin, 1, { draft: false, updatedAt: '2026-11-01T11:00:15Z' })
+    fakeV8.upsertMr(origin, 2, { labels: [], updatedAt: '2026-11-01T11:00:15Z' })
+    fakeV8.upsertMr(origin, 3, { labels: [], updatedAt: '2026-11-01T11:00:15Z' })
+    await supervisor.pollNow()
+
+    nowMs += 6_000
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+    expect(executedMrs.sort()).toEqual(['#1@sha-1-v1', '#2@sha-2-v1', '#3@sha-3-v1', '#3@sha-3-v2'].sort())
+  })
+
+  it('never lets bot publication timestamps suppress unseen mid-turn human feedback when seenNoteIds hits cap', async () => {
+    const { dir, cleanup } = await tempDir('mr-note-watermark-')
+    cleanups.push(cleanup)
+
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    const origin = 'https://git.example/org/app.git'
+    fakeV8.base.setCatalog([{ url: origin, base: 'main' }], ['mr-review'])
+
+    // Unit check for `advanceHumanNoteWatermark`: bot comments must not advance cursor past unseen human feedback.
+    const unitCursor = advanceHumanNoteWatermark({
+      detail: {
+        comments: [
+          { id: 'h-1', author: { username: 'alice' }, body: 'Seen old comment', createdAt: '2026-11-01T00:01:00Z' },
+          { id: 'h-mid', author: { username: 'bob' }, body: 'Unseen mid-turn', createdAt: '2026-11-01T00:02:00Z' },
+          { id: 'bot-1', author: { username: 'dsh-bot' }, body: 'Bot review', createdAt: '2026-11-01T00:05:00Z' },
+        ],
+      },
+      discussions: [],
+      bot: { username: 'dsh-bot' },
+      previousSeenNoteIds: ['c:h-1'],
+      nextSeenNoteIds: ['c:h-1', 'c:bot-1'],
+      pendingSignals: [],
+      deliveredNoteIds: undefined,
+      previousCursor: undefined,
+    })
+    expect(unitCursor).toBe('2026-11-01T00:01:00Z')
+
+    // End-to-end check: seenNoteIds reaches 500 cap, human comment arrives mid-turn at 00:02:00Z before bot mrReview at 00:05:XXZ.
+    fakeV8.upsertMr(origin, 1, { headSha: 'sha-v1', updatedAt: '2026-11-01T00:00:10Z' })
+
+    const deliveredBatches: Array<{ readonly headSha: string; readonly kinds: readonly string[] }> = []
+    let turnCount = 0
+    let h!: Awaited<ReturnType<typeof createServiceHarness>>
+    h = await createServiceHarness({
+      fakeV8,
+      dir,
+      mrConfig: { debounceMs: 0 },
+      driver: {
+        async runTurn(req) {
+          turnCount += 1
+          const sid = req.existingSessionId ?? 'sess-cap-1'
+          await req.onSessionBound?.(sid)
+          const stored = fakeV8.mrs.get(req.repo)!.get(req.mrNumber)!
+          deliveredBatches.push({
+            headSha: stored.info.headSha,
+            kinds: (await h.service.supervisorDomain()).supervisedMrs.get(supervisedMrKey(req.repo, req.mrNumber))?.deliveredNoteIds ?? [],
+          })
+          if (turnCount === 2) {
+            // Simulate a human comment posted mid-turn at 00:02:00Z (earlier than FakeReposV8.mrReview's 00:05:XXZ).
+            stored.comments.push({
+              id: 'human-mid-1',
+              author: { username: 'carol' },
+              body: 'Mid-turn edge case concern',
+              createdAt: '2026-11-01T00:02:00Z',
+            })
+            stored.info = { ...stored.info, updatedAt: '2026-11-01T00:06:00Z' }
+          }
+          await h.callTool(MR_PUBLISH_REVIEW_TOOL_NAME, {
+            headSha: stored.info.headSha,
+            verdict: 'comment',
+            body: `Review #${turnCount}`,
+          }, sid)
+          return { sessionId: sid }
+        },
+      },
+    })
+    cleanups.push(() => h.dispose())
+
+    const supervisor = h.service.mrSupervisorInstance()!
+    const domain = await h.service.supervisorDomain()
+    const key1 = supervisedMrKey(origin, 1)
+
+    // Turn 1: initial review of sha-v1.
+    await supervisor.pollNow()
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+    expect(domain.supervisedMrs.get(key1)?.lastReviewedSha).toBe('sha-v1')
+
+    // Fill seenNoteIds to the 500-entry cap so the next poll must consult `lastNoteCursor` for unknown IDs.
+    const existingRec = domain.supervisedMrs.get(key1)!
+    const cappedSeen = Array.from({ length: MAX_SEEN_NOTE_IDS }, (_, i) => `c:old-${i}`)
+    await domain.supervisedMrs.put(key1, { ...existingRec, seenNoteIds: cappedSeen })
+
+    // Push sha-v2 -> Turn 2 sees mid-turn human comment at 00:02:00Z before bot publishes at 00:05:XXZ.
+    fakeV8.upsertMr(origin, 1, { headSha: 'sha-v2', updatedAt: '2026-11-01T00:01:30Z' })
+    await supervisor.pollNow()
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+
+    const afterTurn2 = domain.supervisedMrs.get(key1)!
+    expect(afterTurn2.seenNoteIds?.length).toBe(MAX_SEEN_NOTE_IDS)
+    expect(afterTurn2.lastNoteCursor === undefined || afterTurn2.lastNoteCursor < '2026-11-01T00:02:00Z').toBe(true)
+
+    // Next poll must NOT discard `human-mid-1` even though seenNoteIds is at 500 and bot review has a later timestamp!
+    await supervisor.pollNow()
+    expect(domain.supervisedMrs.get(key1)?.pendingSignals.map(s => s.noteId)).toEqual(['human-mid-1'])
+
+    await supervisor.flushDebouncedDue()
+    await supervisor.waitForIdle()
+    expect(turnCount).toBe(3)
+    expect(domain.supervisedMrs.get(key1)?.seenNoteIds).toContain('c:human-mid-1')
   })
 })

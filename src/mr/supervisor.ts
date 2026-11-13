@@ -36,6 +36,8 @@ import type { MrSessionDriver } from './session-driver.ts'
 import {
   MAX_OWN_PUSHED_SHAS,
   MAX_SEEN_NOTE_IDS,
+  type MrIgnoreReason,
+  advanceHumanNoteWatermark,
   appendBoundedUnique,
   canonicalCommentKey,
   canonicalDiscussionNoteKey,
@@ -185,6 +187,7 @@ export class MrSupervisor implements MrToolsRuntime {
   private pollInFlight: Promise<void> | undefined
   private lastPollAt: number | undefined
   private lastError: string | undefined
+  private lastFilterSignature: string | undefined
   private closed = false
   private started = false
 
@@ -214,7 +217,9 @@ export class MrSupervisor implements MrToolsRuntime {
   async boot(): Promise<void> {
     if (this.closed) return
     const currentNow = this.now()
-    const enabled = this.deps.getSettings().enabled
+    const settings = this.deps.getSettings()
+    const enabled = settings.enabled
+    this.lastFilterSignature = this.computeFilterSignature(settings)
     for (const [key, record] of this.deps.table.entries()) {
       if (record.sessionId !== undefined) {
         this.sessionToKey.set(record.sessionId, key)
@@ -249,6 +254,12 @@ export class MrSupervisor implements MrToolsRuntime {
     if (this.closed || !this.started) return
     this.pruneRemovedRepoWatermarks()
     const settings = this.deps.getSettings()
+    const nextFilterSig = this.computeFilterSignature(settings)
+    if (this.lastFilterSignature !== nextFilterSig) {
+      this.lastFilterSignature = nextFilterSig
+      this.repoCursors.clear()
+      this.repoBackfill.clear()
+    }
     this.deps.mrPool.setConcurrency(settings.maxConcurrentSessions)
     if (!settings.enabled) {
       this.debouncer.cancelAll()
@@ -594,17 +605,80 @@ export class MrSupervisor implements MrToolsRuntime {
     this.pollTimer = timer
   }
 
+  private computeFilterSignature(settings: Pick<MrReviewSettings, 'skipDraft' | 'ignoreLabels'>): string {
+    const normalizedLabels = [...new Set(settings.ignoreLabels.map(l => l.trim().toLowerCase()).filter(Boolean))].sort()
+    const reposPart = this.deps.getMrRepos()
+      .map(r => `${r.url}=>${r.targetBranch ?? '*'}`)
+      .sort()
+    return JSON.stringify({ skipDraft: settings.skipDraft, ignoreLabels: normalizedLabels, repos: reposPart })
+  }
+
   private findEligibleMrRepo(repoUrl: string): MrRepoStatusWire | undefined {
     return this.deps.getMrRepos().find(repo => repo.url === repoUrl)
   }
 
-  private isRecordRepoEligible(record: Pick<SupervisedMrRecord, 'repo' | 'targetBranch'>): boolean {
+  private isRecordRepoEligible(record: Pick<SupervisedMrRecord, 'repo' | 'targetBranch' | 'isDraft'>): boolean {
     const mrRepo = this.findEligibleMrRepo(record.repo)
     if (mrRepo === undefined) return false
     if (mrRepo.targetBranch !== undefined && record.targetBranch !== undefined && record.targetBranch !== mrRepo.targetBranch) {
       return false
     }
+    if (this.deps.getSettings().skipDraft && record.isDraft === true) {
+      return false
+    }
     return true
+  }
+
+  private applySkippedFilterToRecord(
+    cur: SupervisedMrRecord,
+    mr: MrInfo,
+    reason: MrIgnoreReason,
+    nowMs: number,
+  ): SupervisedMrRecord {
+    const clearPendingConflict = cur.pendingSignals.some(s => s.kind === 'conflict')
+    const nextNotifiedConflictSha = clearPendingConflict ? undefined : cur.notifiedConflictSha
+    if (reason === 'draft') {
+      return {
+        ...cur,
+        title: mr.title || cur.title,
+        url: mr.webUrl || cur.url,
+        sourceBranch: mr.sourceBranch || cur.sourceBranch,
+        targetBranch: mr.targetBranch || cur.targetBranch,
+        author: mr.author.username || cur.author,
+        headSha: mr.headSha,
+        isDraft: true,
+        state: 'draft_skipped',
+        notifiedConflictSha: nextNotifiedConflictSha,
+        pendingSignals: [],
+        deliveredNoteIds: undefined,
+        dueAt: undefined,
+        updatedAt: nowMs,
+      }
+    }
+    if (reason === 'ignored-label') {
+      return {
+        ...cur,
+        title: mr.title || cur.title,
+        url: mr.webUrl || cur.url,
+        sourceBranch: mr.sourceBranch || cur.sourceBranch,
+        targetBranch: mr.targetBranch || cur.targetBranch,
+        author: mr.author.username || cur.author,
+        headSha: cur.lastReviewedSha,
+        isDraft: mr.draft,
+        notifiedConflictSha: nextNotifiedConflictSha,
+        pendingSignals: [],
+        deliveredNoteIds: undefined,
+        dueAt: undefined,
+        updatedAt: nowMs,
+      }
+    }
+    return {
+      ...cur,
+      targetBranch: mr.targetBranch || cur.targetBranch,
+      isDraft: mr.draft,
+      dueAt: undefined,
+      updatedAt: nowMs,
+    }
   }
 
   private pruneRemovedRepoWatermarks(): void {
@@ -838,28 +912,36 @@ export class MrSupervisor implements MrToolsRuntime {
 
     const filter = evaluateMrFilter(mr, mrRepo, settings)
     const existingPre = this.deps.table.get(key)
-    if (filter.skip && filter.reason !== 'draft') return
-    if (filter.skip && filter.reason === 'draft' && existingPre === undefined) {
-      await this.withKeyLock(key, async () => {
-        const rec: SupervisedMrRecord = {
-          repo: mrRepo.url,
-          mrNumber: mr.number,
-          origin: 'external',
-          title: mr.title || undefined,
-          url: mr.webUrl || undefined,
-          sourceBranch: mr.sourceBranch || undefined,
-          targetBranch: mr.targetBranch || undefined,
-          author: mr.author.username || undefined,
-          headSha: mr.headSha,
-          isDraft: true,
-          state: 'draft_skipped',
-          ownPushedShas: [],
-          autoFixAttempts: 0,
-          pendingSignals: [],
-          updatedAt: currentNow,
-        }
-        await this.deps.table.put(key, rec)
-      })
+    if (filter.skip) {
+      this.debouncer.cancel(key)
+      if (filter.reason === 'draft' && existingPre === undefined) {
+        await this.withKeyLock(key, async () => {
+          const rec: SupervisedMrRecord = {
+            repo: mrRepo.url,
+            mrNumber: mr.number,
+            origin: 'external',
+            title: mr.title || undefined,
+            url: mr.webUrl || undefined,
+            sourceBranch: mr.sourceBranch || undefined,
+            targetBranch: mr.targetBranch || undefined,
+            author: mr.author.username || undefined,
+            headSha: mr.headSha,
+            isDraft: true,
+            state: 'draft_skipped',
+            ownPushedShas: [],
+            autoFixAttempts: 0,
+            pendingSignals: [],
+            updatedAt: currentNow,
+          }
+          await this.deps.table.put(key, rec)
+        })
+        return
+      }
+      if (existingPre !== undefined) {
+        await this.updateRecord(mrRepo.url, mr.number, cur =>
+          this.applySkippedFilterToRecord(cur, mr, filter.reason, currentNow),
+        )
+      }
       return
     }
 
@@ -891,31 +973,41 @@ export class MrSupervisor implements MrToolsRuntime {
         return
       }
 
-      if (classification.nextState === 'draft_skipped') {
+      if (classification.clearPending === true) {
+        const detailFilter = evaluateMrFilter(detail, mrRepo, settings)
         this.debouncer.cancel(key)
-        const base: SupervisedMrRecord = existing ?? {
-          repo: mrRepo.url,
-          mrNumber: mr.number,
-          origin: 'external',
-          state: 'draft_skipped',
-          ownPushedShas: [],
-          autoFixAttempts: 0,
-          pendingSignals: [],
+        if (existing !== undefined && detailFilter.skip) {
+          await this.deps.table.put(
+            key,
+            this.applySkippedFilterToRecord(existing, detail, detailFilter.reason, currentNow),
+          )
+          return
         }
-        await this.deps.table.put(key, {
-          ...base,
-          title: detail.title || base.title,
-          url: detail.webUrl || base.url,
-          sourceBranch: detail.sourceBranch || base.sourceBranch,
-          targetBranch: detail.targetBranch || base.targetBranch,
-          author: detail.author.username || base.author,
-          headSha: detail.headSha,
-          isDraft: true,
-          state: 'draft_skipped',
-          pendingSignals: [],
-          dueAt: undefined,
-          updatedAt: currentNow,
-        })
+        if (classification.nextState === 'draft_skipped') {
+          const base: SupervisedMrRecord = existing ?? {
+            repo: mrRepo.url,
+            mrNumber: mr.number,
+            origin: 'external',
+            state: 'draft_skipped',
+            ownPushedShas: [],
+            autoFixAttempts: 0,
+            pendingSignals: [],
+          }
+          await this.deps.table.put(key, {
+            ...base,
+            title: detail.title || base.title,
+            url: detail.webUrl || base.url,
+            sourceBranch: detail.sourceBranch || base.sourceBranch,
+            targetBranch: detail.targetBranch || base.targetBranch,
+            author: detail.author.username || base.author,
+            headSha: detail.headSha,
+            isDraft: true,
+            state: 'draft_skipped',
+            pendingSignals: [],
+            dueAt: undefined,
+            updatedAt: currentNow,
+          })
+        }
         return
       }
 
@@ -931,6 +1023,19 @@ export class MrSupervisor implements MrToolsRuntime {
         dueAt = Math.min(currentNow + Math.max(0, settings.debounceMs), firstAt + DEBOUNCE_MAX_WAIT_MS)
         signalsToEnqueue = classification.signals
       }
+
+      const nextNoteCursor = existing !== undefined && existing.state !== 'draft_skipped'
+        ? advanceHumanNoteWatermark({
+            detail,
+            discussions,
+            bot,
+            previousSeenNoteIds: existing.seenNoteIds,
+            nextSeenNoteIds: existing.seenNoteIds,
+            pendingSignals: nextPending,
+            deliveredNoteIds: existing.deliveredNoteIds,
+            previousCursor: existing.lastNoteCursor,
+          })
+        : existing?.lastNoteCursor
 
       const nextRecord: SupervisedMrRecord = {
         repo: mrRepo.url,
@@ -950,7 +1055,7 @@ export class MrSupervisor implements MrToolsRuntime {
         state: 'open',
         ...(existing?.lastReviewedSha === undefined ? {} : { lastReviewedSha: existing.lastReviewedSha }),
         ...(existing?.reviewedHeadSha === undefined ? {} : { reviewedHeadSha: existing.reviewedHeadSha }),
-        ...(existing?.lastNoteCursor === undefined ? {} : { lastNoteCursor: existing.lastNoteCursor }),
+        ...(nextNoteCursor === undefined ? {} : { lastNoteCursor: nextNoteCursor }),
         ...(classification.notifiedConflictSha !== undefined
           ? { notifiedConflictSha: classification.notifiedConflictSha }
           : existing?.notifiedConflictSha === undefined ? {} : { notifiedConflictSha: existing.notifiedConflictSha }),
@@ -1091,19 +1196,25 @@ export class MrSupervisor implements MrToolsRuntime {
       await this.handleTerminalMr(initial, mr, this.now())
       return 'noop'
     }
+    const latestSettings = this.deps.getSettings()
     const latestEligibleRepo = this.findEligibleMrRepo(initial.repo)
-    if (
-      !this.deps.getSettings().enabled
-      || latestEligibleRepo === undefined
-      || (latestEligibleRepo.targetBranch !== undefined && mr.targetBranch !== latestEligibleRepo.targetBranch)
-    ) {
+    if (!latestSettings.enabled || latestEligibleRepo === undefined) {
       this.debouncer.cancel(key)
       await this.updateRecord(initial.repo, initial.mrNumber, cur => ({
         ...cur,
         targetBranch: mr.targetBranch,
+        isDraft: mr.draft,
         dueAt: undefined,
         updatedAt: this.now(),
       }))
+      return 'blocked'
+    }
+    const filter = evaluateMrFilter(mr, latestEligibleRepo, latestSettings)
+    if (filter.skip) {
+      this.debouncer.cancel(key)
+      await this.updateRecord(initial.repo, initial.mrNumber, cur =>
+        this.applySkippedFilterToRecord(cur, mr, filter.reason, this.now()),
+      )
       return 'blocked'
     }
 
@@ -1112,18 +1223,18 @@ export class MrSupervisor implements MrToolsRuntime {
     const isSelf = initial.origin === 'self-fix' || initial.origin === 'self-skill'
     const hasCiFailed = signalsToRun.some(s => s.kind === 'ci-failed')
 
-    if (isSelf && hasCiFailed && initial.autoFixAttempts >= settings.maxAutoFixAttempts) {
+    if (isSelf && hasCiFailed && initial.autoFixAttempts >= latestSettings.maxAutoFixAttempts) {
       const strippedCiSignals = signalsToRun.filter(s => s.kind === 'ci-failed')
       await this.deps.breakers.trip(
         `mr-fix:${key}`,
-        `MR ${key} 自动修复 CI 已达上限（${initial.autoFixAttempts}/${settings.maxAutoFixAttempts} 次），请人工处理`,
+        `MR ${key} 自动修复 CI 已达上限（${initial.autoFixAttempts}/${latestSettings.maxAutoFixAttempts} 次），请人工处理`,
         DAY_MS,
       )
       await this.notifyBreakerOrHuman({
         repo: initial.repo,
         mrNumber: initial.mrNumber,
         feishuLaunchKey: initial.feishuLaunchKey,
-        text: `@人工处理：MR ${initial.repo}#${initial.mrNumber} 自动修复 CI 已达到上限（${settings.maxAutoFixAttempts} 次），已停止继续自修。\n链接：${mr.webUrl}`,
+        text: `@人工处理：MR ${initial.repo}#${initial.mrNumber} 自动修复 CI 已达到上限（${latestSettings.maxAutoFixAttempts} 次），已停止继续自修。\n链接：${mr.webUrl}`,
       })
       signalsToRun = signalsToRun.filter(s => s.kind !== 'ci-failed')
       if (signalsToRun.length === 0) {
@@ -1142,9 +1253,9 @@ export class MrSupervisor implements MrToolsRuntime {
 
     const mrBreaker = await this.deps.breakers.record(`mr:${key}`, {
       windowMs: DAY_MS,
-      limit: settings.dailyMrTurnLimit,
+      limit: latestSettings.dailyMrTurnLimit,
       cooldownMs: DAY_MS,
-      reason: `单 MR 24h 内唤醒次数超过上限（>${settings.dailyMrTurnLimit} 次）`,
+      reason: `单 MR 24h 内唤醒次数超过上限（>${latestSettings.dailyMrTurnLimit} 次）`,
     })
     if (!mrBreaker.allowed) {
       this.debouncer.cancel(key)
@@ -1162,9 +1273,9 @@ export class MrSupervisor implements MrToolsRuntime {
 
     const repoBreaker = await this.deps.breakers.record(`mr-repo:${initial.repo}`, {
       windowMs: HOUR_MS,
-      limit: settings.repoHourlyTurnLimit,
+      limit: latestSettings.repoHourlyTurnLimit,
       cooldownMs: HOUR_MS,
-      reason: `仓库 ${initial.repo} 1h 内 MR 唤醒次数超过上限（>${settings.repoHourlyTurnLimit} 次）`,
+      reason: `仓库 ${initial.repo} 1h 内 MR 唤醒次数超过上限（>${latestSettings.repoHourlyTurnLimit} 次）`,
     })
     if (!repoBreaker.allowed) {
       this.debouncer.cancel(key)
@@ -1211,15 +1322,15 @@ export class MrSupervisor implements MrToolsRuntime {
       return next
     })
 
-    const prompt = buildMrWakePrompt({
-      record: preparedRecord,
-      mr,
-      status,
-      signals: signalsToRun,
-      maxAutoFixAttempts: settings.maxAutoFixAttempts,
-    })
-
     try {
+      const prompt = buildMrWakePrompt({
+        record: preparedRecord,
+        mr,
+        status,
+        signals: signalsToRun,
+        maxAutoFixAttempts: latestSettings.maxAutoFixAttempts,
+      })
+
       const result = await this.deps.sessionDriver.runTurn({
         repo: preparedRecord.repo,
         mrNumber: preparedRecord.mrNumber,
@@ -1266,19 +1377,21 @@ export class MrSupervisor implements MrToolsRuntime {
       }
       return 'ran'
     } catch (error) {
-      if (!signal.aborted && !this.closed) {
+      const abortedOrClosing = signal.aborted || this.closed
+      if (!abortedOrClosing) {
         this.lastError = `MR ${key} 会话唤醒失败：${messageOf(error)}`
         this.deps.logger?.error?.('logalyze: %s', this.lastError)
-        await this.rollbackFailedTurnBatch({
-          repo: initial.repo,
-          mrNumber: initial.mrNumber,
-          signalsToRun,
-          deliveredNotes,
-          preTurnReviewedSha,
-          preTurnOwnPushedCount,
-          willAttemptCiFix,
-        })
       }
+      await this.rollbackFailedTurnBatch({
+        repo: initial.repo,
+        mrNumber: initial.mrNumber,
+        signalsToRun,
+        deliveredNotes,
+        preTurnReviewedSha,
+        preTurnOwnPushedCount,
+        willAttemptCiFix,
+        clearDueAt: abortedOrClosing,
+      })
       throw error
     }
   }
@@ -1291,6 +1404,7 @@ export class MrSupervisor implements MrToolsRuntime {
     readonly preTurnReviewedSha: string | undefined
     readonly preTurnOwnPushedCount: number
     readonly willAttemptCiFix: boolean
+    readonly clearDueAt?: boolean
   }): Promise<void> {
     await this.updateRecord(input.repo, input.mrNumber, (cur) => {
       if (cur.state !== 'open') return cur
@@ -1319,7 +1433,9 @@ export class MrSupervisor implements MrToolsRuntime {
       const deliveredSet = new Set(input.deliveredNotes)
       const remainingDelivered = (cur.deliveredNoteIds ?? []).filter(k => !deliveredSet.has(k))
       const mergedPending = mergePendingSignals(signalsToRestore, cur.pendingSignals)
-      const preservedDueAt = cur.pendingSignals.length > 0 && cur.dueAt !== undefined ? cur.dueAt : undefined
+      const preservedDueAt = !input.clearDueAt && !this.closed && cur.pendingSignals.length > 0 && cur.dueAt !== undefined
+        ? cur.dueAt
+        : undefined
       return {
         ...cur,
         pendingSignals: mergedPending,

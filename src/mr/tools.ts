@@ -23,10 +23,10 @@ import {
 import {
   MAX_OWN_PUSHED_SHAS,
   MAX_SEEN_NOTE_IDS,
+  advanceHumanNoteWatermark,
   appendBoundedUnique,
   canonicalDiscussionNoteKey,
   collectBotNoteKeys,
-  maxIsoTimestamp,
 } from './signals.ts'
 import { ensureMrWorkspace } from './workspace.ts'
 
@@ -38,7 +38,7 @@ export interface MrToolsRuntime {
   updateRecord(repo: string, mrNumber: number, updater: (current: SupervisedMrRecord) => SupervisedMrRecord): Promise<SupervisedMrRecord>
 }
 
-const MAX_DISCUSSION_PAGES = 5
+const MAX_DISCUSSION_PAGES = 100
 
 /** Paginate `mrDiscussions` up to a bounded page count. */
 export async function listAllDiscussions(
@@ -52,7 +52,7 @@ export async function listAllDiscussions(
   for (let i = 0; i < MAX_DISCUSSION_PAGES; i += 1) {
     const res = await repos.mrDiscussions({ repo, number: mrNumber, page, perPage: 100, signal })
     all.push(...res.items)
-    if (res.nextPage === undefined) break
+    if (res.nextPage === undefined || res.items.length === 0 || res.nextPage <= page) break
     page = res.nextPage
   }
   return all
@@ -367,7 +367,18 @@ export function createMrTools(runtime: MrToolsRuntime): ToolDefinition[] {
           [...botNotes.keys, ...(current.deliveredNoteIds ?? [])],
           MAX_SEEN_NOTE_IDS,
         )
-        const nextCursor = maxIsoTimestamp([current.lastNoteCursor, botNotes.latestTimestamp])
+        const nextCursor = botRes.status === 'fulfilled' && discRes.status === 'fulfilled' && detailRes.status === 'fulfilled'
+          ? advanceHumanNoteWatermark({
+              detail: detailRes.value,
+              discussions: discRes.value,
+              bot: botRes.value,
+              previousSeenNoteIds: current.seenNoteIds,
+              nextSeenNoteIds: nextSeen,
+              pendingSignals: current.pendingSignals,
+              deliveredNoteIds: undefined,
+              previousCursor: current.lastNoteCursor,
+            })
+          : current.lastNoteCursor
         return {
           ...current,
           lastReviewedSha: args.headSha,
@@ -431,11 +442,9 @@ export function createMrTools(runtime: MrToolsRuntime): ToolDefinition[] {
       const noteKey = canonicalDiscussionNoteKey(args.discussionId, note.id)
       await runtime.updateRecord(record.repo, record.mrNumber, (current) => {
         const nextSeen = appendBoundedUnique(current.seenNoteIds, [noteKey], MAX_SEEN_NOTE_IDS)
-        const nextCursor = maxIsoTimestamp([current.lastNoteCursor, note.createdAt])
         return {
           ...current,
           seenNoteIds: nextSeen,
-          ...(nextCursor === undefined ? {} : { lastNoteCursor: nextCursor }),
           updatedAt: Date.now(),
         }
       })

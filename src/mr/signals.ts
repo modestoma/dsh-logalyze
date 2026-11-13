@@ -202,6 +202,63 @@ export function collectBotNoteKeys(
   return { keys, ...(latestTimestamp === undefined ? {} : { latestTimestamp }) }
 }
 
+/**
+ * Advance the discard watermark (`lastNoteCursor`) strictly from settled human notes
+ * that predate every unsettled human note on the MR. Bot publication/reply timestamps
+ * must never advance this watermark.
+ */
+export function advanceHumanNoteWatermark(input: {
+  readonly detail: Pick<MrDetail, 'comments'>
+  readonly discussions: readonly MrDiscussion[]
+  readonly bot: RepoUser
+  readonly previousSeenNoteIds?: readonly string[]
+  readonly nextSeenNoteIds: readonly string[] | undefined
+  readonly pendingSignals: readonly MrPendingSignal[] | undefined
+  readonly deliveredNoteIds?: readonly string[]
+  readonly previousCursor: string | undefined
+}): string | undefined {
+  const prevSeen = new Set(input.previousSeenNoteIds ?? [])
+  const nextSeen = new Set(input.nextSeenNoteIds ?? [])
+  const unsettledKeys = new Set<string>([
+    ...(input.deliveredNoteIds ?? []),
+    ...signalNoteKeys(input.pendingSignals ?? []),
+  ])
+  const capReached = prevSeen.size >= MAX_SEEN_NOTE_IDS || nextSeen.size >= MAX_SEEN_NOTE_IDS
+
+  const settledTimestamps: string[] = []
+  let minUnsettledTimestamp: string | undefined
+
+  const recordHumanNote = (key: string, createdAt: string): void => {
+    if (createdAt === '') return
+    const isSettled = (!nextSeen.has(key) && unsettledKeys.has(key))
+      ? false
+      : nextSeen.has(key)
+        || prevSeen.has(key)
+        || (capReached && input.previousCursor !== undefined && createdAt <= input.previousCursor)
+    if (isSettled) {
+      settledTimestamps.push(createdAt)
+    } else if (minUnsettledTimestamp === undefined || createdAt < minUnsettledTimestamp) {
+      minUnsettledTimestamp = createdAt
+    }
+  }
+
+  for (const discussion of input.discussions) {
+    for (const note of discussion.notes) {
+      if (isSameBotUser(note.author, input.bot)) continue
+      recordHumanNote(canonicalDiscussionNoteKey(discussion.id, note.id), note.createdAt)
+    }
+  }
+  for (const comment of input.detail.comments) {
+    if (isSameBotUser(comment.author, input.bot)) continue
+    recordHumanNote(canonicalCommentKey(comment.id), comment.createdAt)
+  }
+
+  const eligibleSettled = minUnsettledTimestamp === undefined
+    ? settledTimestamps
+    : settledTimestamps.filter(ts => ts < minUnsettledTimestamp!)
+  return maxIsoTimestamp([input.previousCursor, ...eligibleSettled])
+}
+
 /** Result of evaluating one polled MR against its stored state. */
 export interface PollClassification {
   readonly action: 'skip' | 'update'
@@ -236,15 +293,23 @@ export function classifyMrPollUpdate(input: {
     if (filter.reason === 'draft') {
       return { action: 'update', nextState: 'draft_skipped', signals: [], clearPending: true }
     }
-    return { action: 'skip', signals: [] }
+    if (existing === undefined) {
+      return { action: 'skip', signals: [] }
+    }
+    return { action: 'update', nextState: existing.state, signals: [], clearPending: true }
   }
 
   const origin = existing?.origin ?? 'external'
   const signals: MrPendingSignal[] = []
   const existingPending = existing?.pendingSignals ?? []
+  const reopenedAfterLabelClear = existing !== undefined
+    && existing.state !== 'draft_skipped'
+    && existing.lastReviewedSha === undefined
+    && existing.headSha === undefined
+    && origin === 'external'
 
-  if (existing === undefined) {
-    // New externally created MR; self-fix/self-skill MRs registered upfront already have a record.
+  if (existing === undefined || reopenedAfterLabelClear) {
+    // New externally created MR (or never-reviewed external MR whose ignored label was cleared).
     signals.push({ kind: 'opened', observedAt: nowMs, headSha: mr.headSha })
   } else if (existing.state === 'draft_skipped') {
     signals.push({ kind: 'ready-for-review', observedAt: nowMs, headSha: mr.headSha })
@@ -261,7 +326,7 @@ export function classifyMrPollUpdate(input: {
   }
 
   // Only detect human feedback once an MR is tracked (initial review reads all existing comments in context).
-  if (existing !== undefined && existing.state !== 'draft_skipped') {
+  if (existing !== undefined && existing.state !== 'draft_skipped' && !reopenedAfterLabelClear) {
     const notes = collectHumanFeedbackNotes(
       detail,
       discussions,
