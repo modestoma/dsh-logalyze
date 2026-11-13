@@ -131,7 +131,7 @@ export function outboxPlatformKey(taskId: string, revision: number, logId: strin
 // 5. issues (with strict AI vs Human write separation)
 // ---------------------------------------------------------------------------
 
-export const issueAiStatusSchema = z.enum(['located', 'pending'])
+export const issueAiStatusSchema = z.enum(['located', 'pending', 'fixed'])
 export type IssueAiStatus = z.infer<typeof issueAiStatusSchema>
 
 export const issueSchema = z.object({
@@ -411,7 +411,7 @@ export const supervisedMrStateSchema = z.enum(['open', 'merged', 'closed', 'draf
 export type SupervisedMrState = z.infer<typeof supervisedMrStateSchema>
 
 export const mrPendingSignalSchema = z.object({
-  kind: z.enum(['opened', 'push', 'discussion', 'ci-failed', 'ready-for-review']),
+  kind: z.enum(['opened', 'push', 'discussion', 'ci-failed', 'ready-for-review', 'conflict']),
   observedAt: z.number().int().nonnegative(),
   headSha: z.string().min(1).optional(),
   discussionId: z.string().min(1).optional(),
@@ -425,12 +425,24 @@ export const supervisedMrSchema = z.object({
   repo: z.string().min(1),
   mrNumber: z.number().int().positive(),
   origin: mrOriginSchema,
+  title: z.string().min(1).optional(),
+  url: z.string().min(1).optional(),
+  sourceBranch: z.string().min(1).optional(),
+  targetBranch: z.string().min(1).optional(),
+  author: z.string().min(1).optional(),
+  headSha: z.string().min(1).optional(),
+  isDraft: z.boolean().optional(),
+  issueId: z.string().min(1).optional(),
   sessionId: z.string().min(1).optional(),
   workDir: z.string().min(1).optional(),
   feishuLaunchKey: z.string().min(1).optional(),
   state: supervisedMrStateSchema,
   lastReviewedSha: z.string().min(1).optional(),
+  reviewedHeadSha: z.string().min(1).optional(),
   lastNoteCursor: z.string().min(1).optional(),
+  notifiedConflictSha: z.string().min(1).optional(),
+  seenNoteIds: z.array(z.string().min(1)).optional(),
+  deliveredNoteIds: z.array(z.string().min(1)).optional(),
   ownPushedShas: z.array(z.string().min(1)),
   autoFixAttempts: z.number().int().nonnegative(),
   pendingSignals: z.array(mrPendingSignalSchema),

@@ -4,8 +4,8 @@
  * @module dsh-logalyze/client/api
  */
 
-import { APPLICATION_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
-import type { ApplicationMetadata, EditableSettings, MutationError, MutationOk, StateWire } from '../settings/contract.ts'
+import { APPLICATION_ROUTE, BREAKER_RESET_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
+import type { ApplicationMetadata, BreakerStatusWire, EditableSettings, MutationError, MutationOk, StateWire } from '../settings/contract.ts'
 
 /**
  * Error text of a value thrown by a request.
@@ -98,4 +98,9 @@ export async function retryReport(id: string): Promise<StateWire> {
 /** Save the description and aliases of one enabled catalog repository. */
 export async function saveApplication(url: string, metadata: ApplicationMetadata): Promise<StateWire> {
   return (await request<MutationOk>(APPLICATION_ROUTE, { method: 'PUT', body: JSON.stringify({ url, ...metadata }) })).state
+}
+
+/** Reset a tripped or active supervision circuit breaker and resume blocked work. */
+export async function resetBreaker(scope: BreakerStatusWire['scope'], key: string): Promise<StateWire> {
+  return (await request<MutationOk>(BREAKER_RESET_ROUTE, { method: 'POST', body: JSON.stringify({ scope, key }) })).state
 }

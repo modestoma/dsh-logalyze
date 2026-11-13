@@ -7,6 +7,17 @@ describe('configuration', () => {
     const config = resolveConfig(undefined)
     expect(config).toMatchObject({ fetchIntervalMs: 0, maxAppsPerRequest: 4, subagentProvider: 'spawn', refreshWaitMs: 15000 })
     expect(defaultsOf(config).skillUpdates).toEqual({ enabled: true, maxFiles: 16, maxFileBytes: 262144 })
+    expect(defaultsOf(config).mrReview).toEqual({
+      enabled: true,
+      pollIntervalMs: 60_000,
+      debounceMs: 45_000,
+      maxConcurrentSessions: 3,
+      skipDraft: true,
+      ignoreLabels: [],
+      maxAutoFixAttempts: 2,
+      dailyMrTurnLimit: 12,
+      repoHourlyTurnLimit: 30,
+    })
   })
 
   it('normalizes allowed hosts and rejects schemes', () => {

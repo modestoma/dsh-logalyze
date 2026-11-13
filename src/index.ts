@@ -29,6 +29,7 @@ export type * from './settings/contract.ts'
 export type * from './deps/repos-contract.ts'
 export type * from './deps/actions-contract.ts'
 export * from './runtime/index.ts'
+export * from './mr/index.ts'
 export type { ApplicationAccess } from './apps/access.ts'
 export type { LeasedApp, ReadyApp, RepoLease } from './apps/registry.ts'
 export {

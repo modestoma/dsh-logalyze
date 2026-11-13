@@ -15,6 +15,8 @@ export const APPLICATION_ROUTE = '/logalyze/applications'
 export const REPORT_UPLOAD_ROUTE = '/logalyze/reports/upload'
 /** PUT：body `{ tokenEnv, value }` 把凭据存入 DSH 凭据库；DELETE：body `{ tokenEnv }` 删除已存的值。只接受分析接口令牌和日志平台 client_secret 的名称。 */
 export const TOKEN_ROUTE = '/logalyze/token'
+/** POST：body `{ scope, key }` 重置（un-trip）指定的熔断器，恢复受阻的 MR/日志自动监管。 */
+export const BREAKER_RESET_ROUTE = '/logalyze/breakers/reset'
 
 /**
  * POST：日志平台分析接口（Bearer 令牌鉴权，不走 DSH 登录）。它在 DSH 的
@@ -127,6 +129,28 @@ export interface AnalyzeSettings {
   upload: UploadSettings
 }
 
+/** MR automatic supervision and incremental review policy. */
+export interface MrReviewSettings {
+  /** Whether the MR polling/review loop is active. */
+  enabled: boolean
+  /** Polling interval across enabled `mr-review` repositories, in milliseconds. */
+  pollIntervalMs: number
+  /** Quiet window after the last MR push/discussion/CI signal before waking the review session, in milliseconds. */
+  debounceMs: number
+  /** Maximum concurrent MR review/fix sessions running at once. */
+  maxConcurrentSessions: number
+  /** Skip draft MRs until they transition out of draft (`ready-for-review`). */
+  skipDraft: boolean
+  /** Labels that opt an MR out of automatic review (case-insensitive exact match). */
+  ignoreLabels: string[]
+  /** Maximum automatic CI fix turns per self-authored (`self-fix` / `self-skill`) MR. */
+  maxAutoFixAttempts: number
+  /** Per-MR daily session turn cap before tripping the circuit breaker. */
+  dailyMrTurnLimit: number
+  /** Per-repository rolling hourly session turn cap before tripping the circuit breaker. */
+  repoHourlyTurnLimit: number
+}
+
 /** The settings the Web panel can override; every field is required on the wire. */
 export interface EditableSettings {
   /** Minimum age of a repository's last read of its application description before loading `/logalyze` reads it again, in milliseconds; 0 reads on every load. */
@@ -141,10 +165,12 @@ export interface EditableSettings {
   skillUpdates: SkillUpdateSettings
   /** Log-platform analyze API. */
   analyze: AnalyzeSettings
+  /** MR automatic supervision and incremental review. */
+  mrReview: MrReviewSettings
 }
 
 /** Keys of {@link EditableSettings}, in panel order. */
-export const EDITABLE_KEYS = ['fetchIntervalMs', 'maxAppsPerRequest', 'dispatchTimeoutMs', 'download', 'skillUpdates', 'analyze'] as const satisfies readonly (keyof EditableSettings)[]
+export const EDITABLE_KEYS = ['fetchIntervalMs', 'maxAppsPerRequest', 'dispatchTimeoutMs', 'download', 'skillUpdates', 'analyze', 'mrReview'] as const satisfies readonly (keyof EditableSettings)[]
 
 /** One editable key. */
 export type EditableKey = (typeof EDITABLE_KEYS)[number]
@@ -200,6 +226,8 @@ export interface MrRepoStatusWire {
   url: string
   /** Branch MR supervision tracks (`mr-review` feature branch, else catalog baseline branch). */
   branch?: string
+  /** Explicit `mr-review` feature branch filter when set in `dsh-repo`; absent watches all target branches. */
+  targetBranch?: string
   /** Catalog baseline branch when configured. */
   base?: string
   /** Whether `dsh-repo` access permits write/merge operations (`access !== 'read'`). */
@@ -339,6 +367,50 @@ export interface AnalyzeWire {
   legacyReports: LegacyReportWire[]
 }
 
+/** One supervised MR summary shown in the Web panel. */
+export interface SupervisedMrWire {
+  repo: string
+  mrNumber: number
+  title?: string
+  url?: string
+  origin: 'external' | 'self-fix' | 'self-skill'
+  state: 'open' | 'merged' | 'closed' | 'draft_skipped'
+  sourceBranch?: string
+  targetBranch?: string
+  author?: string
+  headSha?: string
+  lastReviewedSha?: string
+  autoFixAttempts: number
+  pendingCount: number
+  pendingKinds: Array<'opened' | 'push' | 'discussion' | 'ci-failed' | 'ready-for-review' | 'conflict'>
+  dueAt?: number
+  sessionId?: string
+  closedAt?: number
+  updatedAt?: number
+}
+
+/** One active or tripped circuit breaker status shown in the Web panel. */
+export interface BreakerStatusWire {
+  scope: 'mr' | 'mr-repo' | 'log-app' | 'mr-fix'
+  key: string
+  count: number
+  limit: number
+  tripped: boolean
+  reason?: string
+  trippedAt?: number
+}
+
+/** MR supervision overview in {@link StateWire}. */
+export interface MrSupervisionWire {
+  enabled: boolean
+  running: number
+  debouncing: number
+  lastPollAt?: number
+  lastError?: string
+  mrs: SupervisedMrWire[]
+  breakers: BreakerStatusWire[]
+}
+
 /** `GET /logalyze/state` response. */
 export interface StateWire {
   /** Effective settings: cordis.yml values with panel overrides applied. */
@@ -356,6 +428,8 @@ export interface StateWire {
   /** Whether the DSH composition provides `ctx.credentials`; without it the analyze token cannot be stored or read. */
   credentialsAvailable: boolean
   analyze: AnalyzeWire
+  /** Live state of stateful MR supervision and breakers. */
+  mrSupervision?: MrSupervisionWire
 }
 
 /** Successful mutation response. */

@@ -24,6 +24,8 @@ export interface RepoRegistryDeps {
   readonly repos: ReposClient
   /** Called after any status change (sync start/end, configuration, leases). */
   readonly onChange: () => void
+  /** Called after `mr-review` repositories are updated from `dsh-repo`. */
+  readonly onMrReposChange?: () => void
   readonly now?: () => number
   readonly applications?: ApplicationSettings
   readonly skills?: SkillRegistry
@@ -119,6 +121,7 @@ export class RepoRegistry {
   configureMrRepos(repos: readonly MrRepoStatusWire[]): void {
     if (this.closed) return
     this.mrEntries = repos.map(repo => ({ ...repo }))
+    this.deps.onMrReposChange?.()
     this.deps.onChange()
   }
 

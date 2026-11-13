@@ -26,9 +26,10 @@ export interface CatalogFollowerDeps {
 }
 
 function toMrWire(repos: readonly MrReviewRepo[]): MrRepoStatusWire[] {
-  return repos.map(({ url, branch, base, writable }) => ({
+  return repos.map(({ url, branch, targetBranch, base, writable }) => ({
     url,
     ...(branch === undefined ? {} : { branch }),
+    ...(targetBranch === undefined ? {} : { targetBranch }),
     ...(base === undefined ? {} : { base }),
     writable,
   }))

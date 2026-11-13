@@ -34,6 +34,8 @@ import { Dispatcher } from './dispatch/tool.ts'
 import type { HostContext, HostCredentials, ToolActivationContext, ToolDefinition, WorkingDirectoryService } from './host.ts'
 import { SkillViewer } from './improve/show.ts'
 import { SkillImprover } from './improve/tool.ts'
+import { MrSupervisor, createHostMrSessionDriver, createMrTools } from './mr/index.ts'
+import type { MrSessionDriver } from './mr/index.ts'
 import { PlatformClient, PlatformError, platformProblem } from './platform/client.ts'
 import { LegacyReports, legacyReportsDir } from './report/legacy.ts'
 import { AnalysisStore, defaultAnalysesDir } from './report/store.ts'
@@ -41,6 +43,7 @@ import { ReportTracker } from './report/tracker.ts'
 import { admitPlatformUrl, downloadLog, DownloadError } from './runs/download.ts'
 import type { PlatformLogDownloader, PlatformLogRef } from './runs/logs.ts'
 import { inRunDirectory, isDelegatedAgent, isInside } from './runs/run-dir.ts'
+import { CircuitBreakerRegistry } from './runtime/breaker.ts'
 import { openSupervisorDomain } from './runtime/domain.ts'
 import type { SupervisorDomain } from './runtime/domain.ts'
 import { createSupervisionPools } from './runtime/pool.ts'
@@ -57,6 +60,10 @@ import { messageOf } from './util/errors.ts'
 
 const reportRetrySchema = z.object({ id: z.string().regex(/^[0-9a-f]{24}$/u, '分析 id 不合法') }).strict()
 const credentialNameSchema = z.object({ tokenEnv: z.string() }).loose()
+const breakerResetSchema = z.object({
+  scope: z.enum(['mr', 'mr-repo', 'log-app', 'mr-fix']),
+  key: z.string().trim().min(1, '熔断器 key 不能为空'),
+}).strict()
 
 /** Optional seams for tests. */
 export interface ServiceOptions {
@@ -68,6 +75,14 @@ export interface ServiceOptions {
   readonly legacyReportsDir?: string
   /** Local fallback directory for `dsh_supervisor` when host `storageDomain` is absent. */
   readonly supervisorDir?: string
+  /** Local directory where per-MR review workspaces are created. */
+  readonly mrWorkspacesDir?: string
+  /** Custom MR session turn driver (used by tests and embedding hosts). */
+  readonly mrSessionDriver?: MrSessionDriver
+  /** Deterministic clock seam for tests. */
+  readonly now?: () => number
+  /** Disable background MR poll interval timer in tests (`pollNow()` drives manually). */
+  readonly autoMrPollTimer?: boolean
 }
 
 /** Package files the service serves. */
@@ -95,6 +110,13 @@ export class LogalyzeService {
   private readonly skill: ReturnType<typeof createEntrySkillProvider>
   private readonly reports: ReportTracker
   private readonly supervisorDir: string
+  private readonly mrWorkspacesDir: string
+  private readonly clock: () => number
+  private readonly autoMrPollTimer: boolean
+  private readonly hostMrDriver: ReturnType<typeof createHostMrSessionDriver> | undefined
+  private readonly mrSessionDriver: MrSessionDriver
+  private breakers: CircuitBreakerRegistry | undefined
+  private mrSupervisor: MrSupervisor | undefined
   private supervisorPromise: Promise<SupervisorDomain> | undefined
   private active = true
   private readonly refreshWaitMs: number
@@ -119,6 +141,11 @@ export class LogalyzeService {
     const workingDirectory = (): WorkingDirectoryService | undefined => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined
     const fetchSeam = options.fetch === undefined ? {} : { fetch: options.fetch }
     this.supervisorDir = options.supervisorDir ?? join(dirname(store.path), 'supervisor')
+    this.mrWorkspacesDir = options.mrWorkspacesDir ?? join(dirname(store.path), 'mr-workspaces')
+    this.clock = options.now ?? Date.now
+    this.autoMrPollTimer = options.autoMrPollTimer ?? true
+    this.hostMrDriver = options.mrSessionDriver === undefined ? createHostMrSessionDriver(ctx) : undefined
+    this.mrSessionDriver = options.mrSessionDriver ?? this.hostMrDriver!
     this.pools = createSupervisionPools()
     this.settings = new SettingsController(config, store, warn)
     this.refreshWaitMs = config.refreshWaitMs
@@ -133,6 +160,7 @@ export class LogalyzeService {
       applications: new ApplicationSettings(join(dirname(store.path), 'applications.json')),
       skills: ctx.skills,
       onChange: () => { this.onRegistryChange() },
+      onMrReposChange: () => { this.mrSupervisor?.notifyConfigOrReposChanged() },
     })
     this.catalog = new CatalogFollower({
       registry: this.registry,
@@ -198,6 +226,7 @@ export class LogalyzeService {
   registerTools(): void {
     this.ctx.on('session/event', (session, event) => {
       if (event.type === 'turn/end') this.improver.turnEnded(session.header.id)
+      this.hostMrDriver?.onSessionEvent(session.header.id, event.type, event.data)
       this.reports.sessionEvent(session, event)
     })
     this.ctx.on(FEISHU_TOPICS_STATUS_EVENT, (state) => { this.reports.statusChanged(state) })
@@ -208,6 +237,22 @@ export class LogalyzeService {
     register(this.dispatcher.definition(), hasApps, 'dispatch')
     register(this.improver.definition(), () => this.settings.get().skillUpdates.enabled && this.registry.readyApps().some(ready => ready.writable && ready.app.skill !== undefined), 'skill improvement')
     register(this.viewer.definition(), () => this.registry.readyApps().some(ready => ready.app.skill !== undefined), 'skill view')
+
+    const mrTools = createMrTools({
+      requireV8: () => this.repos.requireV8(),
+      workspacesRoot: () => this.mrWorkspacesDir,
+      resolveForTool: (sessionId, repo, mrNumber) => {
+        if (this.mrSupervisor === undefined) throw new Error('审微 MR 监管运行时尚未就绪')
+        return this.mrSupervisor.resolveForTool(sessionId, repo, mrNumber)
+      },
+      updateRecord: (repo, mrNumber, updater) => {
+        if (this.mrSupervisor === undefined) return Promise.reject(new Error('审微 MR 监管运行时尚未就绪'))
+        return this.mrSupervisor.updateRecord(repo, mrNumber, updater)
+      },
+    })
+    for (const tool of mrTools) {
+      register(tool, context => this.mrSupervisor?.isMrSession(context.agent.session.header.id) === true, tool.name)
+    }
   }
 
   private async offers(context: ToolActivationContext, condition: (context: ToolActivationContext) => boolean): Promise<boolean> {
@@ -234,10 +279,39 @@ export class LogalyzeService {
    */
   async boot(): Promise<void> {
     try {
-      await this.supervisorDomain().catch((error: unknown) => {
+      const domain = await this.supervisorDomain().catch((error: unknown) => {
         this.ctx.logger?.error?.('logalyze: 打开监管存储域失败：%s', messageOf(error))
+        return undefined
       })
       await this.settings.load()
+      if (domain !== undefined) {
+        this.breakers = new CircuitBreakerRegistry({
+          table: domain.circuitBreakers,
+          resolvePolicy: (key) => {
+            const mr = this.settings.get().mrReview
+            if (key.startsWith('mr-repo:')) return { windowMs: 60 * 60_000, limit: mr.repoHourlyTurnLimit, cooldownMs: 60 * 60_000 }
+            if (key.startsWith('mr:')) return { windowMs: 24 * 60 * 60_000, limit: mr.dailyMrTurnLimit, cooldownMs: 24 * 60 * 60_000 }
+            if (key.startsWith('mr-fix:')) return { windowMs: 365 * 24 * 60 * 60_000, limit: Math.max(1, mr.maxAutoFixAttempts), cooldownMs: 24 * 60 * 60_000 }
+            return undefined
+          },
+          now: this.clock,
+          onError: (error) => { this.ctx.logger?.warn?.('logalyze: 熔断通知失败：%s', messageOf(error)) },
+        })
+        this.mrSupervisor = new MrSupervisor({
+          table: domain.supervisedMrs,
+          breakers: this.breakers,
+          issues: domain.issues,
+          repos: this.repos,
+          mrPool: this.pools.mrPool,
+          workspacesRoot: this.mrWorkspacesDir,
+          sessionDriver: this.mrSessionDriver,
+          getSettings: () => this.settings.get().mrReview,
+          getMrRepos: () => this.registry.mrStatus(),
+          now: this.clock,
+          logger: this.ctx.logger,
+          autoPollTimer: this.autoMrPollTimer,
+        })
+      }
       await this.reports.boot().catch((error: unknown) => {
         this.ctx.logger?.error?.('logalyze: 读取分析记录失败：%s', messageOf(error))
       })
@@ -245,6 +319,7 @@ export class LogalyzeService {
         this.ctx.logger?.error?.('logalyze: 读取旧版回传记录失败：%s', messageOf(error))
       })
       await this.catalog.load()
+      await this.mrSupervisor?.boot()
     } finally {
       this.booted.resolve()
     }
@@ -255,6 +330,7 @@ export class LogalyzeService {
     await this.booted.promise
     if (!this.active) return
     await this.catalog.serviceAppeared()
+    this.mrSupervisor?.notifyConfigOrReposChanged()
   }
 
   /** Register both features with dsh-repo and follow its catalog and host changes. */
@@ -268,10 +344,13 @@ export class LogalyzeService {
     this.reports.shutdown()
     this.booted.resolve()
     await Promise.allSettled([
-      this.pools.drainAndClose(),
+      this.mrSupervisor?.drainAndClose(),
+      this.pools.drainAndClose({ cancelQueued: true, abortActive: true }),
       this.registry.close(),
-      this.supervisorPromise?.then(domain => domain.close(), () => undefined),
     ])
+    if (this.supervisorPromise !== undefined) {
+      await this.supervisorPromise.then(domain => domain.close(), () => undefined)
+    }
   }
 
   /** Check reports waiting for their first turn against `feishuTopics`; called whenever the service appears. */
@@ -395,6 +474,7 @@ export class LogalyzeService {
         reports: this.reports.list(),
         legacyReports: this.legacy.list(),
       },
+      ...(this.mrSupervisor === undefined ? {} : { mrSupervision: this.mrSupervisor.panelState() }),
     }
   }
 
@@ -435,13 +515,29 @@ export class LogalyzeService {
   /** Validate and persist a complete settings payload from the panel. */
   async save(raw: unknown): Promise<StateWire> {
     await this.settings.save(raw)
+    this.mrSupervisor?.notifyConfigOrReposChanged()
     return await this.state()
   }
 
   /** Remove every panel override. */
   async reset(): Promise<StateWire> {
     await this.settings.reset()
+    this.mrSupervisor?.notifyConfigOrReposChanged()
     return await this.state()
+  }
+
+  /** Reset a supervision circuit breaker and resume blocked work. */
+  async resetBreaker(raw: unknown): Promise<StateWire> {
+    await this.prepared()
+    const parsed = breakerResetSchema.safeParse(raw)
+    if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
+    await this.mrSupervisor?.resetBreaker(parsed.data.scope, parsed.data.key)
+    return await this.state()
+  }
+
+  /** Access the active MR supervision coordinator (for tests and internal integrations). */
+  mrSupervisorInstance(): MrSupervisor | undefined {
+    return this.mrSupervisor
   }
 
   /** Save only application metadata; catalog membership is checked on each write. */

@@ -141,13 +141,26 @@ describe('plugin', () => {
     h.repos.setCatalog([{ url: origin }])
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
     expect(h.skills.map(skill => skill.name)).toEqual(['dsh-logalyze'])
-    expect(h.tools.map(tool => tool.definition.name)).toEqual(['logalyze_dispatch', 'logalyze_improve_skill', 'logalyze_show_skill'])
-    const [tool, improve, show] = h.tools
+    expect(h.tools.map(tool => tool.definition.name)).toEqual([
+      'logalyze_dispatch',
+      'logalyze_improve_skill',
+      'logalyze_show_skill',
+      'supervisor_mr_prepare',
+      'supervisor_mr_publish_review',
+      'supervisor_mr_reply_thread',
+      'supervisor_mr_resolve_thread',
+      'supervisor_mr_checkpoint',
+    ])
+    const [tool, improve, show, ...mrTools] = h.tools
     const signal = new AbortController().signal
     const step = (depth?: number) => ({ agent: { id: 'a', session: { header: { id: 'a', ...depth === undefined ? {} : { delegationDepth: depth } } } }, signal })
     // The condition waits for the first sync, so a step prepared during startup still sees the cloned application.
     expect(await tool!.when?.(step())).toBe(true)
     expect(await tool!.when?.(step(1))).toBe(false)
+    // MR supervision tools are hidden outside bound MR supervision sessions.
+    for (const mrTool of mrTools) {
+      expect(await mrTool.when?.(step())).toBe(false)
+    }
     // The SKILL tools are offered to top-level agents while an application is usable.
     expect(await improve!.when?.(step())).toBe(true)
     expect(await improve!.when?.(step(1))).toBe(false)
@@ -278,7 +291,7 @@ describe('plugin', () => {
       if (autoInvoke) expect(listed?.description).toContain('订单服务（order-service')
       // Inside the repositories and the run directories' workspaces only the bundled guides are listed.
       for (const cwd of [join(h.repos.root, '.snapshots', 'local', 'x'), join(dir, '.logalyze', 'runs', 'r1', 'init', 'repo')]) {
-        expect((await provider.list({ cwd })).map(skill => skill.name)).toEqual(['logalyze-kit', 'logalyze-improve'])
+        expect((await provider.list({ cwd })).map(skill => skill.name)).toEqual(['logalyze-kit', 'logalyze-improve', 'mr-reviewer'])
       }
     }
   })
@@ -300,7 +313,7 @@ describe('plugin', () => {
     const initialState = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
     expect(initialState.mrRepos).toEqual([
       { url: origin, branch: 'main', base: 'main', writable: true },
-      { url: mrOnly, branch: 'release', base: 'develop', writable: false },
+      { url: mrOnly, branch: 'release', targetBranch: 'release', base: 'develop', writable: false },
     ])
     const payload = { url: origin, description: '面板描述', aliases: ['orders-v2', '订单新版'] }
     const put = (body: unknown, headers: Record<string, string> = {}) => fetch(`${h.base}/logalyze/applications`, { method: 'PUT', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) })

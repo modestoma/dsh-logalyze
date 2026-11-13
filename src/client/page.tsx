@@ -8,8 +8,8 @@
  */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
-import type { AnalysisWire, AnalyzeWire, ApplicationMetadata, EditableKey, EditableSettings, LegacyReportWire, PlatformClientAuth, ReportStatus, RepoStatusWire, StateWire, TokenStatusWire, UploadPhase } from '../settings/contract.ts'
-import { clearToken, fetchState, messageOf, resetSettings, retryReport, saveApplication, saveSettings, saveToken } from './api.ts'
+import type { AnalysisWire, AnalyzeWire, ApplicationMetadata, BreakerStatusWire, EditableKey, EditableSettings, LegacyReportWire, MrSupervisionWire, PlatformClientAuth, ReportStatus, RepoStatusWire, StateWire, SupervisedMrWire, TokenStatusWire, UploadPhase } from '../settings/contract.ts'
+import { clearToken, fetchState, messageOf, resetBreaker, resetSettings, retryReport, saveApplication, saveSettings, saveToken } from './api.ts'
 import { CHAT_ID_PATTERN } from '../settings/contract.ts'
 
 /** Sidebar label and page title. */
@@ -19,10 +19,11 @@ const KB = 1024
 const MB = 1024 * 1024
 const MINUTE = 60 * 1000
 
-type TabId = 'repos' | 'download' | 'analyze' | 'advanced'
+type TabId = 'repos' | 'mr' | 'download' | 'analyze' | 'advanced'
 
 const TABS: readonly { id: TabId; label: string }[] = [
   { id: 'repos', label: '应用仓库' },
+  { id: 'mr', label: 'MR 评审' },
   { id: 'download', label: '日志下载' },
   { id: 'analyze', label: '分析接口' },
   { id: 'advanced', label: '高级' },
@@ -57,6 +58,15 @@ interface Draft {
   uploadMaxFileMb: string
   uploadMaxMarkdownMb: string
   uploadConcurrency: string
+  mrEnabled: boolean
+  mrPollIntervalSec: string
+  mrDebounceSec: string
+  mrMaxConcurrent: string
+  mrSkipDraft: boolean
+  mrIgnoreLabels: string[]
+  mrMaxAutoFix: string
+  mrDailyTurnLimit: string
+  mrRepoHourlyLimit: string
 }
 
 function trimNumber(value: number): string {
@@ -91,6 +101,15 @@ function toDraft(settings: EditableSettings): Draft {
     uploadMaxFileMb: trimNumber(settings.analyze.upload.maxFileBytes / MB),
     uploadMaxMarkdownMb: trimNumber(settings.analyze.upload.maxMarkdownBytes / MB),
     uploadConcurrency: String(settings.analyze.upload.concurrency),
+    mrEnabled: settings.mrReview.enabled,
+    mrPollIntervalSec: trimNumber(settings.mrReview.pollIntervalMs / 1000),
+    mrDebounceSec: trimNumber(settings.mrReview.debounceMs / 1000),
+    mrMaxConcurrent: String(settings.mrReview.maxConcurrentSessions),
+    mrSkipDraft: settings.mrReview.skipDraft,
+    mrIgnoreLabels: [...settings.mrReview.ignoreLabels],
+    mrMaxAutoFix: String(settings.mrReview.maxAutoFixAttempts),
+    mrDailyTurnLimit: String(settings.mrReview.dailyMrTurnLimit),
+    mrRepoHourlyLimit: String(settings.mrReview.repoHourlyTurnLimit),
   }
 }
 
@@ -155,6 +174,17 @@ function fromDraft(draft: Draft): EditableSettings {
         maxMarkdownBytes: Math.round(positive(draft.uploadMaxMarkdownMb, 'Markdown 文件大小上限') * MB),
         concurrency: integer(draft.uploadConcurrency, '同时上传文件数'),
       },
+    },
+    mrReview: {
+      enabled: draft.mrEnabled,
+      pollIntervalMs: Math.round(positive(draft.mrPollIntervalSec, 'MR 轮询间隔') * 1000),
+      debounceMs: Math.round(positive(draft.mrDebounceSec, 'MR 信号防抖窗口', true) * 1000),
+      maxConcurrentSessions: integer(draft.mrMaxConcurrent, 'MR 评审并发上限'),
+      skipDraft: draft.mrSkipDraft,
+      ignoreLabels: draft.mrIgnoreLabels.map(label => label.trim()).filter(label => label !== ''),
+      maxAutoFixAttempts: integer(draft.mrMaxAutoFix, 'CI 自动修复上限', true),
+      dailyMrTurnLimit: integer(draft.mrDailyTurnLimit, '单 MR 日唤醒上限'),
+      repoHourlyTurnLimit: integer(draft.mrRepoHourlyLimit, '单仓库小时唤醒上限'),
     },
   }
 }
@@ -254,7 +284,7 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
   }, [syncing, reload])
 
   useEffect(() => {
-    if (tab !== 'analyze') return
+    if (tab !== 'analyze' && tab !== 'mr') return
     const timer = setInterval(() => { void reload(false) }, 5000)
     return () => { clearInterval(timer) }
   }, [tab, reload])
@@ -333,6 +363,16 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
       {state.overlayError === undefined ? null : <div className="lz__notice lz__notice--error">面板设置文件未生效：{state.overlayError}。保存一次会用当前内容覆盖它。</div>}
       <div className="lz__body" role="tabpanel">
         <div hidden={tab !== 'repos'}><ReposTab state={state} openRepoSettings={openRepoSettings} busy={busy} onSave={saveApp} /></div>
+        {tab === 'mr'
+          ? <MrReviewTab
+              draft={draft}
+              setDraft={setDraft}
+              supervision={state.mrSupervision}
+              overridden={state.overridden}
+              busy={busy}
+              onResetBreaker={(scope, key) => { void run(() => resetBreaker(scope, key), '已解除熔断并恢复等待任务', false) }}
+            />
+          : null}
         {tab === 'download' ? <DownloadTab draft={draft} setDraft={setDraft} overridden={state.overridden} /> : null}
         {tab === 'analyze'
           ? <AnalyzeTab
@@ -847,5 +887,152 @@ function NumberRow({ label, summary, unit, value, overridden = false, onChange }
         <span className="lz__unit">{unit}</span>
       </div>
     </div>
+  )
+}
+
+const MR_STATE_LABEL: Readonly<Record<SupervisedMrWire['state'], { pill: string; text: string }>> = {
+  open: { pill: 'lz__pill--ok', text: '监管中' },
+  merged: { pill: 'lz__pill', text: '已合并' },
+  closed: { pill: 'lz__pill', text: '已关闭' },
+  draft_skipped: { pill: 'lz__pill--warn', text: '草稿跳过' },
+}
+
+const BREAKER_SCOPE_LABEL: Readonly<Record<BreakerStatusWire['scope'], string>> = {
+  mr: '单 MR 日限',
+  'mr-repo': '单仓库时限',
+  'mr-fix': 'CI 自修上限',
+  'log-app': '日志应用时限',
+}
+
+function MrReviewTab({
+  draft,
+  setDraft,
+  supervision,
+  overridden,
+  busy,
+  onResetBreaker,
+}: TabProps & {
+  supervision: MrSupervisionWire | undefined
+  overridden: readonly EditableKey[]
+  busy: boolean
+  onResetBreaker: (scope: BreakerStatusWire['scope'], key: string) => void
+}): JSX.Element {
+  const [labelInput, setLabelInput] = useState('')
+  const addLabel = (): void => {
+    const trimmed = labelInput.trim()
+    if (trimmed === '' || draft.mrIgnoreLabels.some(item => item.toLowerCase() === trimmed.toLowerCase())) return
+    setDraft({ ...draft, mrIgnoreLabels: [...draft.mrIgnoreLabels, trimmed] })
+    setLabelInput('')
+  }
+  const mrs = supervision?.mrs ?? []
+  const breakers = supervision?.breakers ?? []
+  return (
+    <>
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">审微运行状态与熔断器</h2>
+        <div className="lz__list">
+          <div className="lz__row">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">
+                <span className={`lz__pill ${supervision?.enabled ? 'lz__pill--ok' : ''}`}><span className="lz__dot" />{supervision?.enabled ? '自动轮询运行中' : '已暂停'}</span>
+                <span className="lz__tag">活跃会话 {supervision?.running ?? 0}</span>
+                <span className="lz__tag">防抖等待 {supervision?.debouncing ?? 0}</span>
+              </div>
+              <div className="lz__rowSummary">
+                {supervision?.lastPollAt === undefined ? '尚未执行首轮 MR 轮询。' : `上次轮询：${formatTime(supervision.lastPollAt)}`}
+                {supervision?.lastError === undefined ? '' : ` · 最近异常：${supervision.lastError}`}
+              </div>
+            </div>
+          </div>
+          {breakers.length === 0 ? <div className="lz__emptyRow">当前没有活跃计数或已触发的熔断器。</div> : null}
+          {breakers.map(item => (
+            <div key={`${item.scope}:${item.key}`} className="lz__row">
+              <div className="lz__rowText">
+                <div className="lz__rowLabel">
+                  <span className="lz__tag">{BREAKER_SCOPE_LABEL[item.scope]}</span>
+                  <span className="lz__mono">{item.key}</span>
+                  <span className={`lz__pill ${item.tripped ? 'lz__pill--bad' : 'lz__pill--ok'}`}>
+                    <span className="lz__dot" />
+                    {item.tripped ? '已熔断' : '计数中'}（{item.count}/{item.limit}）
+                  </span>
+                </div>
+                {item.reason === undefined ? null : <div className="lz__rowSummary">{item.reason}</div>}
+              </div>
+              <div className="lz__rowCtl">
+                <button type="button" className="lz__btn lz__btn--ghost" disabled={busy} onClick={() => { onResetBreaker(item.scope, item.key) }}>解除熔断</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">受监管 MR 列表</h2>
+        <div className="lz__list">
+          {mrs.length === 0 ? <div className="lz__emptyRow">暂无已纳管的合并请求。请在「应用仓库」对应项目的 dsh-repo 中开启「MR 自动评审」。</div> : null}
+          {mrs.map((mr) => {
+            const st = MR_STATE_LABEL[mr.state]
+            return (
+              <div key={`${mr.repo}#${mr.mrNumber}`} className="lz__row lz__row--top">
+                <div className="lz__rowText">
+                  <div className="lz__rowLabel">
+                    {mr.url === undefined
+                      ? <span className="lz__mono">#{mr.mrNumber}</span>
+                      : <a href={mr.url} target="_blank" rel="noreferrer" className="lz__mono">#{mr.mrNumber}</a>}
+                    <span>{mr.title ?? mr.repo}</span>
+                    <span className={`lz__pill ${st.pill}`}><span className="lz__dot" />{st.text}</span>
+                    <span className="lz__tag">{mr.origin}</span>
+                  </div>
+                  <div className="lz__rowSummary">
+                    <span className="lz__mono">{mr.repo}</span>
+                    {mr.sourceBranch !== undefined && mr.targetBranch !== undefined ? ` · ${mr.sourceBranch} → ${mr.targetBranch}` : ''}
+                    {mr.headSha !== undefined ? ` · HEAD ${mr.headSha.slice(0, 8)}` : ''}
+                    {mr.lastReviewedSha !== undefined ? ` · 已审 ${mr.lastReviewedSha.slice(0, 8)}` : ''}
+                    {mr.pendingCount > 0 ? ` · 待处理 ${mr.pendingCount} (${mr.pendingKinds.join(', ')})` : ''}
+                    {mr.autoFixAttempts > 0 ? ` · CI 自修 ${mr.autoFixAttempts} 次` : ''}
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </section>
+
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">MR 自动评审策略与安全限流 <Overridden keys={overridden} name="mrReview" /></h2>
+        <div className="lz__list">
+          <div className="lz__row">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">启用有状态 MR 自动评审（审微）</div>
+              <div className="lz__rowSummary">开启后按轮询间隔扫描开启「MR 自动评审」的仓库，持续追踪新提交、新评论与己方 MR CI 状态。</div>
+            </div>
+            <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="启用 MR 自动评审" checked={draft.mrEnabled} onChange={(event) => { setDraft({ ...draft, mrEnabled: event.target.checked }) }} /></div>
+          </div>
+          <div className="lz__row">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">跳过草稿（Draft）MR</div>
+              <div className="lz__rowSummary">草稿期间不触发评审，转为正式（Ready for review）后自动触发首次评审。</div>
+            </div>
+            <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="跳过草稿 MR" checked={draft.mrSkipDraft} onChange={(event) => { setDraft({ ...draft, mrSkipDraft: event.target.checked }) }} /></div>
+          </div>
+          <NumberRow label="轮询间隔" summary="增量轮询远端 MR 更新的时间间隔。" unit="秒" value={draft.mrPollIntervalSec} onChange={(value) => { setDraft({ ...draft, mrPollIntervalSec: value }) }} />
+          <NumberRow label="信号防抖窗口" summary="收到 push 或新评论后的静默合并窗口，0 表示立即唤醒。" unit="秒" value={draft.mrDebounceSec} onChange={(value) => { setDraft({ ...draft, mrDebounceSec: value }) }} />
+          <NumberRow label="MR 评审并发上限" summary="同时运行的 MR 评审/修复会话最大数量（mrPool）。" unit="个" value={draft.mrMaxConcurrent} onChange={(value) => { setDraft({ ...draft, mrMaxConcurrent: value }) }} />
+          <NumberRow label="CI 自动修复上限" summary="每个己方 MR 触发 CI 失败自修的最大次数，超出后触发熔断并人工提醒。" unit="次" value={draft.mrMaxAutoFix} onChange={(value) => { setDraft({ ...draft, mrMaxAutoFix: value }) }} />
+          <NumberRow label="单 MR 24h 唤醒上限" summary="单个 MR 每天最多唤醒会话次数。" unit="次" value={draft.mrDailyTurnLimit} onChange={(value) => { setDraft({ ...draft, mrDailyTurnLimit: value }) }} />
+          <NumberRow label="单仓库 1h 唤醒上限" summary="单个仓库每小时最多唤醒 MR 会话次数。" unit="次" value={draft.mrRepoHourlyLimit} onChange={(value) => { setDraft({ ...draft, mrRepoHourlyLimit: value }) }} />
+          {draft.mrIgnoreLabels.map(label => (
+            <div key={label} className="lz__row">
+              <div className="lz__rowText"><span className="lz__mono">忽略标签：{label}</span></div>
+              <div className="lz__rowCtl"><button type="button" className="lz__btn lz__btn--danger" onClick={() => { setDraft({ ...draft, mrIgnoreLabels: draft.mrIgnoreLabels.filter(item => item !== label) }) }}>移除</button></div>
+            </div>
+          ))}
+          <div className="lz__addRow">
+            <input className="lz__input" placeholder="忽略标签名，例如 no-ai-review" value={labelInput} onChange={(event) => { setLabelInput(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') addLabel() }} />
+            <button type="button" className="lz__btn" disabled={labelInput.trim() === ''} onClick={addLabel}>添加忽略标签</button>
+          </div>
+        </div>
+      </section>
+    </>
   )
 }
