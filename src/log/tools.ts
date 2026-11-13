@@ -30,6 +30,7 @@ import type {
 } from '../runtime/domain.ts'
 import {
   REPORT_DIR,
+  REPORT_ENTRY,
   type DownloadSettings,
   type UploadSettings,
 } from '../settings/contract.ts'
@@ -819,11 +820,17 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
 
         const savedAttachments: string[] = []
         const skippedAttachments: string[] = []
+        const seenDestKeys = new Map<string, string>()
         for (const relRaw of args.attachments ?? []) {
           const cleanRel = relRaw.replace(/\\/gu, '/').replace(/^\.\//u, '').replace(/^scratch\//u, '')
           const problem = pathProblem(cleanRel)
           if (problem !== undefined) {
             throw new Error(`附件 "${relRaw}" 不符合日志平台命名限制：${problem}`)
+          }
+          if (cleanRel.toLowerCase() === REPORT_ENTRY.toLowerCase()) {
+            throw new Error(
+              `附件 "${relRaw}" 不能使用根级保留文件名 "${REPORT_ENTRY}"（该名称固定用于自动生成的入口报告）；请重命名文件或放入子目录（例如 "scratch/attachments/${REPORT_ENTRY}"）`,
+            )
           }
           const candidates = [
             resolve(workDir, relRaw),
@@ -840,6 +847,12 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
           }
           if (srcPath === undefined) {
             throw new Error(`附件 "${relRaw}" 在工作区 scratch/ 中不存在或非普通文件`)
+          }
+          const destKey = cleanRel.toLowerCase()
+          const priorSrc = seenDestKeys.get(destKey)
+          if (priorSrc !== undefined) {
+            if (priorSrc === srcPath) continue
+            throw new Error(`附件 "${relRaw}" 与另一附件映射到同一目标路径 "${cleanRel}"，请使用不同文件名`)
           }
           const info = await stat(srcPath)
           if (info.size === 0 || info.size > MAX_ATTACHMENT_BYTES) {
@@ -858,6 +871,7 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
           } finally {
             await fh.close()
           }
+          seenDestKeys.set(destKey, srcPath)
           savedAttachments.push(cleanRel)
         }
 

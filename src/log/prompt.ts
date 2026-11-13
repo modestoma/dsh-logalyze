@@ -283,8 +283,9 @@ export function renderSupervisorLogReport(params: {
   readonly input: LogTaskInput
   readonly revision: LogTaskRevision
   readonly skipped: readonly string[]
+  readonly uploadedFiles?: ReadonlySet<string>
 }): string {
-  const { task, input, revision, skipped } = params
+  const { task, input, revision, skipped, uploadedFiles } = params
   const appLabel = task.appName ?? task.appId
   const item = revision.items?.find(candidate => candidate.ref === input.ref)
   const triggeredAt = new Date(task.createdAt ?? revision.createdAt).toISOString()
@@ -325,9 +326,12 @@ export function renderSupervisorLogReport(params: {
   out.push('## 批次总体摘要')
   out.push(revision.summary.trim())
 
-  if ((revision.attachments?.length ?? 0) > 0) {
+  const attachmentsToLink = (revision.attachments ?? []).filter(
+    file => uploadedFiles === undefined || uploadedFiles.has(file),
+  )
+  if (attachmentsToLink.length > 0) {
     out.push('## 附带报告文件')
-    out.push((revision.attachments ?? []).map(file => `- [${file}](${file.split('/').map(s => encodeURIComponent(s)).join('/')})`).join('\n'))
+    out.push(attachmentsToLink.map(file => `- [${file}](${file.split('/').map(s => encodeURIComponent(s)).join('/')})`).join('\n'))
   }
 
   if (skipped.length > 0) {

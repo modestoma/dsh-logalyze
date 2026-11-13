@@ -1846,7 +1846,9 @@ export class LogSupervisor {
       skipped: [],
     })
     const manifest = buildManifest(listing, upload, Buffer.byteLength(preliminaryEntry, 'utf8'))
-    const finalEntry = manifest.skipped.length === 0
+    const uploadedSet = new Set(manifest.files.map(f => f.path))
+    const hasOmittedAttachments = (revision.attachments ?? []).some(f => !uploadedSet.has(f))
+    const finalEntry = manifest.skipped.length === 0 && !hasOmittedAttachments
       ? preliminaryEntry
       : renderSupervisorLogReport({
         task,
@@ -1854,6 +1856,7 @@ export class LogSupervisor {
         input,
         revision,
         skipped: manifest.skipped,
+        uploadedFiles: uploadedSet,
       })
 
     const detailUrl = await uploadRevision(this.deps.platform, {

@@ -250,6 +250,10 @@ async function unpackTarBuffer(
   maxBytes: number,
   maxEntries: number,
 ): Promise<{ readonly files: string[]; readonly totalBytes: number }> {
+  if (tarBytes.length < 1024) {
+    throw new ArchiveCorruptError('TAR 归档长度不足，缺少标准的双零结束块')
+  }
+
   const files: string[] = []
   let totalBytes = 0
   let entryCount = 0
@@ -260,12 +264,17 @@ async function unpackTarBuffer(
 
   while (offset + 512 <= tarBytes.length) {
     if (isZeroBlock(tarBytes, offset)) {
+      if (paxPath !== undefined || gnuLongName !== undefined) {
+        throw new ArchiveCorruptError('TAR 扩展头后缺少目标条目')
+      }
       zeroBlocks += 1
       offset += 512
       if (zeroBlocks >= 2) break
       continue
     }
-    zeroBlocks = 0
+    if (zeroBlocks > 0) {
+      throw new ArchiveCorruptError('TAR 结束零块不完整')
+    }
     if (!verifyTarChecksum(tarBytes, offset)) {
       throw new ArchiveCorruptError('TAR 文件头校验和错误')
     }
@@ -274,8 +283,8 @@ async function unpackTarBuffer(
     const size = parseOctal(tarBytes, offset + 124, 12)
     const dataStart = offset + 512
     const paddedSize = Math.ceil(size / 512) * 512
-    if (dataStart + size > tarBytes.length) {
-      throw new ArchiveCorruptError('TAR 文件内容截断')
+    if (dataStart + size > tarBytes.length || dataStart + paddedSize > tarBytes.length) {
+      throw new ArchiveCorruptError('TAR 文件内容或块填充截断')
     }
     const content = tarBytes.subarray(dataStart, dataStart + size)
     offset = dataStart + paddedSize
@@ -332,6 +341,19 @@ async function unpackTarBuffer(
 
     await writeFileSafely(resolved.abs, destDir, content)
     files.push(resolved.rel)
+  }
+
+  if (paxPath !== undefined || gnuLongName !== undefined) {
+    throw new ArchiveCorruptError('TAR 扩展头后缺少目标条目')
+  }
+  if (zeroBlocks < 2) {
+    if (offset < tarBytes.length) {
+      throw new ArchiveCorruptError('TAR 归档头部截断（尾部存在不足 512 字节的残缺块）')
+    }
+    throw new ArchiveCorruptError('TAR 归档缺少标准的双零结束块（归档可能被截断）')
+  }
+  if (files.length === 0) {
+    throw new ArchiveCorruptError('TAR 归档中不包含任何普通日志文件')
   }
 
   return { files, totalBytes }
@@ -463,6 +485,10 @@ async function unpackZipBuffer(
 
     await writeFileSafely(resolved.abs, destDir, uncompressed)
     files.push(resolved.rel)
+  }
+
+  if (files.length === 0) {
+    throw new ArchiveCorruptError('ZIP 归档中不包含任何普通日志文件')
   }
 
   return { files, totalBytes }

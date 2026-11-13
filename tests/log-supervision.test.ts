@@ -433,6 +433,31 @@ describe('safe archive unpacker (unpackLogSlot)', () => {
     const bombRes = await unpackLogSlot({ archivePath: bombPath, fileName: 'bomb.zip', destDir: bombDest, maxBytes: 4096 })
     expect(bombRes.status).toBe('corrupted')
     if (bombRes.status === 'corrupted') expect(bombRes.error).toContain('超过上限')
+
+    // 4566593853: Reject <512-byte non-TAR inputs (.tar and .tar.gz) and truncated TARs without clean EOF blocks.
+    const shortTarPath = join(dir, 'short.tar')
+    await writeFile(shortTarPath, Buffer.from('not-a-tar-archive'))
+    const shortTarDest = join(dir, 'slot-short-tar')
+    const shortTarRes = await unpackLogSlot({ archivePath: shortTarPath, fileName: 'short.tar', destDir: shortTarDest, maxBytes: 1024 * 1024 })
+    expect(shortTarRes.status).toBe('corrupted')
+    expect(await readFile(join(shortTarDest, 'CORRUPTED.txt'), 'utf8')).toContain('TAR')
+
+    const shortTgzPath = join(dir, 'short.tar.gz')
+    await writeFile(shortTgzPath, gzipSync(Buffer.from('not-a-tar-archive')))
+    const shortTgzDest = join(dir, 'slot-short-tgz')
+    const shortTgzRes = await unpackLogSlot({ archivePath: shortTgzPath, fileName: 'short.tar.gz', destDir: shortTgzDest, maxBytes: 1024 * 1024 })
+    expect(shortTgzRes.status).toBe('corrupted')
+    expect(await readFile(join(shortTgzDest, 'CORRUPTED.txt'), 'utf8')).toContain('TAR')
+
+    const validTar = buildTarBuffer([{ name: 'first.log', content: 'ok\n' }])
+    const truncatedTar = Buffer.concat([validTar.subarray(0, validTar.length - 1024), Buffer.alloc(100, 0x41)])
+    const truncTarPath = join(dir, 'truncated.tar')
+    await writeFile(truncTarPath, truncatedTar)
+    const truncTarDest = join(dir, 'slot-trunc-tar')
+    const truncTarRes = await unpackLogSlot({ archivePath: truncTarPath, fileName: 'truncated.tar', destDir: truncTarDest, maxBytes: 1024 * 1024 })
+    expect(truncTarRes.status).toBe('corrupted')
+    await expect(stat(join(truncTarDest, 'first.log'))).rejects.toThrow()
+    expect(await readFile(join(truncTarDest, 'CORRUPTED.txt'), 'utf8')).toContain('TAR')
   })
 })
 
@@ -1137,6 +1162,25 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
       }],
     }, h.toolExecCtx(feishuSessionId, workDir))).rejects.toThrow(/repos\//)
 
+    // 4566593847: Root report.md attachment collides with generated entry -> rejected; nested subdirectory succeeds.
+    await mkdir(join(workDir, 'scratch', 'attachments'), { recursive: true })
+    await writeFile(join(workDir, 'scratch', 'report.md'), 'colliding root attachment\n')
+    await writeFile(join(workDir, 'scratch', 'attachments', 'report.md'), 'nested report attachment\n')
+    await expect(submit.execute({
+      summary: 'colliding report.md attachment',
+      items: [{
+        ref: 'L1',
+        status: 'diagnosed',
+        rootCauseCategory: 'code_defect',
+        conclusion: 'handleOrder 返回 null',
+        evidences: [
+          { source: 'logs/L1/service.log', locator: 'L1', excerpt: 'NullPointerException' },
+          { source: 'repos/order-service/src/handler.ts', locator: 'L1', excerpt: 'return null' },
+        ],
+      }],
+      attachments: ['scratch/report.md'],
+    }, h.toolExecCtx(feishuSessionId, workDir))).rejects.toThrow(/report\.md/)
+
     // Valid submit linking ISS-order-service-0001 -> no platform Outbox entries created!
     const submitRes = await submit.execute({
       summary: '确认 handleOrder 空返回值缺陷',
@@ -1151,12 +1195,14 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
         ],
         issueLink: { mode: 'existing', issueId: 'ISS-order-service-0001' },
       }],
+      attachments: ['scratch/attachments/report.md'],
     }, h.toolExecCtx(feishuSessionId, workDir)) as {
       readonly revision: number
       readonly outboxEnqueued: readonly string[]
     }
     expect(submitRes.revision).toBe(1)
     expect(submitRes.outboxEnqueued).toEqual([])
+    expect((await stat(join(workDir, 'report', 'revisions', 'rev-1', 'attachments', 'report.md'))).isFile()).toBe(true)
 
     // 4. Turn ends -> LogSupervisor posts feishuActions.propose card with [fix_code, improve_skill]
     h.service.logSupervisorInstance()!.onSessionEvent(feishuSessionId, 'turn/end', { reason: { kind: 'completed' } })
