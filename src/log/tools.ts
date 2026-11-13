@@ -91,12 +91,19 @@ export interface LogToolsRuntime {
   ): Promise<string>
   readonly fetch?: typeof fetch
   resolveTaskForSession(sessionId: string, taskId?: string): { readonly taskId: string; readonly task: LogTaskRecord } | undefined
+  withSessionOperation<T>(sessionId: string, fn: () => Promise<T>): Promise<T>
   createFeishuTask(input: {
     readonly sessionId: string
     readonly workDir: string
     readonly app: ReadyApp
     readonly inputs: readonly LogTaskInput[]
+    readonly isolateWorkDir?: boolean
   }): Promise<{ readonly taskId: string; readonly task: LogTaskRecord }>
+  discardFeishuTask(input: {
+    readonly sessionId: string
+    readonly taskId: string
+    readonly isolatedWorkDir?: string
+  }): Promise<void>
   updateTask(taskId: string, updater: (current: LogTaskRecord) => LogTaskRecord): Promise<LogTaskRecord>
   withTaskOperation<T>(taskId: string, fn: () => Promise<T>): Promise<T>
   onRevisionSubmitted(params: {
@@ -188,7 +195,16 @@ function sessionIdOf(exec: ToolRunContext): string {
 
 function workspaceRootOf(exec: ToolRunContext, runtime: LogToolsRuntime, boundWorkDir?: string): string {
   const sessionCwd = exec.agent?.session?.header?.cwd
-  if (sessionCwd !== undefined && sessionCwd !== '') return resolve(sessionCwd)
+  if (sessionCwd !== undefined && sessionCwd !== '') {
+    const resolvedCwd = resolve(sessionCwd)
+    if (boundWorkDir !== undefined && boundWorkDir !== '') {
+      const resolvedBound = resolve(boundWorkDir)
+      if (isInside(resolvedBound, resolvedCwd)) {
+        return resolvedBound
+      }
+    }
+    return resolvedCwd
+  }
   if (boundWorkDir !== undefined && boundWorkDir !== '') return resolve(boundWorkDir)
   const sessionId = sessionIdOf(exec)
   return resolve(runtime.logWorkspacesRoot(), sessionId.replace(/[^A-Za-z0-9._-]+/gu, '_'))
@@ -279,7 +295,12 @@ async function ensureAppWorkspace(params: {
   return repoDir
 }
 
-async function resolveExistingEvidencePath(workDir: string, slug: string, source: string): Promise<string | undefined> {
+async function resolveExistingEvidencePath(
+  workDir: string,
+  slug: string,
+  source: string,
+  sessionCwd?: string,
+): Promise<string | undefined> {
   const trimmed = source.trim()
   if (trimmed === '' || trimmed.includes('\0')) return undefined
   const candidates: string[] = []
@@ -288,6 +309,9 @@ async function resolveExistingEvidencePath(workDir: string, slug: string, source
   } else {
     candidates.push(resolve(workDir, trimmed))
     candidates.push(resolve(workDir, 'repos', slug, trimmed))
+    if (sessionCwd !== undefined && sessionCwd !== '') {
+      candidates.push(resolve(sessionCwd, trimmed))
+    }
   }
   for (const candidate of candidates) {
     if (!isInside(candidate, workDir)) continue
@@ -512,47 +536,100 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
       }
       const args = parsed.data
       const sessionId = sessionIdOf(exec)
-      let bound = runtime.resolveTaskForSession(sessionId, args.taskId)
+      let bound: { readonly taskId: string; readonly task: LogTaskRecord }
+      let createdTaskCleanup: { readonly taskId: string; readonly isolatedWorkDir?: string } | undefined
 
-      let app: ReadyApp
-      if (bound !== undefined) {
-        app = runtime.readyApp(bound.task.appId)
-      } else {
-        if (args.taskId !== undefined) {
+      if (args.taskId !== undefined) {
+        if (args.logs !== undefined) {
+          throw new Error('指定 taskId 复用已有任务时不能同时传入 logs 新日志列表；如需分析新日志请省略 taskId 并传入 app 与 logs')
+        }
+        const found = runtime.resolveTaskForSession(sessionId, args.taskId)
+        if (found === undefined) {
           throw new Error(`找不到日志监管任务 "${args.taskId}"`)
         }
-        if (args.app === undefined) {
-          throw new Error('当前会话尚未绑定日志任务，请在首次调用 supervisor_log_prepare 时传入 app（应用名/别名/id）与 logs')
-        }
-        if (args.logs === undefined || args.logs.length === 0) {
-          throw new Error('飞书人工分析首次调用 supervisor_log_prepare 时必须提供至少一份 logs（path 或 url）')
-        }
-        app = runtime.resolveApp(args.app)
-        const workDir = workspaceRootOf(exec, runtime)
-        const baseDir = exec.agent?.session.header.cwd ?? workDir
-        const inputs: LogTaskInput[] = []
-        const downloadSettings = runtime.downloadSettings()
-        for (const [index, log] of args.logs.entries()) {
-          const ref = `L${index + 1}`
-          if ('path' in log) {
-            const absPath = resolve(baseDir, log.path)
-            const info = await lstat(absPath).catch((err: unknown) => {
-              throw new Error(`日志路径不可读：${absPath}（${messageOf(err)}）`)
-            })
-            if (!info.isFile() || info.isSymbolicLink()) {
-              throw new Error(`日志路径必须是普通文件（拒绝符号链接）：${absPath}`)
-            }
-            inputs.push({ ref, path: absPath, fileName: basename(absPath) })
-          } else {
-            const admitted = admitUrl(log.url, downloadSettings)
-            inputs.push({ ref, url: admitted.href, fileName: fileNameFor(admitted, `${ref}.log`) })
+        if (args.app !== undefined) {
+          const requestedApp = runtime.resolveApp(args.app)
+          if (requestedApp.app.id !== found.task.appId) {
+            throw new Error(`任务 "${args.taskId}" 绑定应用为 ${found.task.appId}，与传入的 app (${requestedApp.app.id}) 不一致`)
           }
         }
-        bound = await runtime.createFeishuTask({ sessionId, workDir, app, inputs })
+        bound = found
+      } else if (args.logs !== undefined) {
+        if (args.logs.length === 0) {
+          throw new Error('飞书人工分析调用 supervisor_log_prepare 时必须提供至少一份 logs（path 或 url）')
+        }
+        const logs = args.logs
+        const allocated = await runtime.withSessionOperation(sessionId, async () => {
+          const priorBound = runtime.resolveTaskForSession(sessionId)
+          let app: ReadyApp
+          if (args.app !== undefined) {
+            app = runtime.resolveApp(args.app)
+          } else if (priorBound !== undefined) {
+            app = runtime.readyApp(priorBound.task.appId)
+          } else {
+            throw new Error('当前会话尚未绑定日志任务，请在首次调用 supervisor_log_prepare 时传入 app（应用名/别名/id）与 logs')
+          }
+          const baseWorkDir = workspaceRootOf(exec, runtime)
+          const baseDir = exec.agent?.session?.header?.cwd ?? baseWorkDir
+          const inputs: LogTaskInput[] = []
+          const downloadSettings = runtime.downloadSettings()
+          for (const [index, log] of logs.entries()) {
+            const ref = `L${index + 1}`
+            if ('path' in log) {
+              const absPath = resolve(baseDir, log.path)
+              const info = await lstat(absPath).catch((err: unknown) => {
+                throw new Error(`日志路径不可读：${absPath}（${messageOf(err)}）`)
+              })
+              if (!info.isFile() || info.isSymbolicLink()) {
+                throw new Error(`日志路径必须是普通文件（拒绝符号链接）：${absPath}`)
+              }
+              inputs.push({ ref, path: absPath, fileName: basename(absPath) })
+            } else {
+              const admitted = admitUrl(log.url, downloadSettings)
+              inputs.push({ ref, url: admitted.href, fileName: fileNameFor(admitted, `${ref}.log`) })
+            }
+          }
+          const isolateWorkDir = priorBound !== undefined
+            || (await pathExists(join(baseWorkDir, 'logs', 'manifest.json')))
+          const created = await runtime.createFeishuTask({
+            sessionId,
+            workDir: baseWorkDir,
+            app,
+            inputs,
+            isolateWorkDir,
+          })
+          return {
+            created,
+            cleanup: {
+              taskId: created.taskId,
+              ...(isolateWorkDir && created.task.workDir !== undefined ? { isolatedWorkDir: created.task.workDir } : {}),
+            },
+          }
+        })
+        bound = allocated.created
+        createdTaskCleanup = allocated.cleanup
+      } else {
+        const found = runtime.resolveTaskForSession(sessionId)
+        if (found === undefined) {
+          if (args.app === undefined) {
+            throw new Error('当前会话尚未绑定日志任务，请在首次调用 supervisor_log_prepare 时传入 app（应用名/别名/id）与 logs')
+          }
+          throw new Error('飞书人工分析首次调用 supervisor_log_prepare 时必须提供至少一份 logs（path 或 url）')
+        }
+        if (args.app !== undefined) {
+          const requestedApp = runtime.resolveApp(args.app)
+          if (requestedApp.app.id !== found.task.appId) {
+            throw new Error(
+              `当前会话绑定的任务属于应用 ${found.task.appId}，不能在不提供新 logs 的情况下切换到应用 ${requestedApp.app.id}；如需分析新日志请同时传入 logs`,
+            )
+          }
+        }
+        bound = found
       }
 
       const initialTaskId = bound.taskId
-      return await runtime.withTaskOperation(initialTaskId, async () => {
+      try {
+        return await runtime.withTaskOperation(initialTaskId, async () => {
         const currentBound = runtime.resolveTaskForSession(sessionId, initialTaskId)
         if (currentBound === undefined) {
           throw new Error(`找不到日志监管任务 "${initialTaskId}"`)
@@ -631,6 +708,12 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
           candidateIssues: formatIssueCandidates(candidates),
         }
       })
+      } catch (error) {
+        if (createdTaskCleanup !== undefined) {
+          await runtime.discardFeishuTask({ sessionId, ...createdTaskCleanup }).catch(() => undefined)
+        }
+        throw error
+      }
     },
   }
 
@@ -799,7 +882,7 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
           }
           let hasRepoEvidence = false
           for (const ev of item.evidences) {
-            const resolved = await resolveExistingEvidencePath(workDir, slug, ev.source)
+            const resolved = await resolveExistingEvidencePath(workDir, slug, ev.source, exec.agent?.session?.header?.cwd)
             if (resolved === undefined) {
               throw new Error(`槽位 ${item.ref} 的证据路径 "${ev.source}" 在工作区 "${workDir}" 中不存在或非普通文件；请填写真实可读的文件路径`)
             }
@@ -1052,7 +1135,18 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
         const workDir = task.workDir ?? workspaceRootOf(exec, runtime)
         const slug = appSlugOf(app.app.id)
         const expectedRepoDir = join(workDir, 'repos', args.kind === 'improve_skill' ? `${slug}-knowledge` : slug)
-        const workspacePath = args.workspaceDir !== undefined ? resolve(workDir, args.workspaceDir) : expectedRepoDir
+        let workspacePath = args.workspaceDir !== undefined ? resolve(workDir, args.workspaceDir) : expectedRepoDir
+        if (
+          args.workspaceDir !== undefined
+          && !isInside(workspacePath, workDir)
+          && exec.agent?.session?.header?.cwd !== undefined
+          && exec.agent.session.header.cwd !== ''
+        ) {
+          const fromCwd = resolve(exec.agent.session.header.cwd, args.workspaceDir)
+          if (isInside(fromCwd, workDir)) {
+            workspacePath = fromCwd
+          }
+        }
         if (!isInside(workspacePath, workDir)) {
           throw new Error(`工作区路径 ${workspacePath} 必须位于当前会话目录 ${workDir} 之内`)
         }

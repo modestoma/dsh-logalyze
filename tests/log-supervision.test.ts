@@ -581,11 +581,13 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     readonly maxConcurrentBatches?: number
     readonly appHourlyBatchLimit?: number
     readonly origin?: string
+    readonly withSecondApp?: boolean
     readonly settingsPath?: string
     readonly skipSaveApplication?: boolean
     readonly supervisorDir?: string
     readonly withPlatform?: boolean
     readonly setupPlatform?: (platform: FakePlatform) => void
+    readonly allowedHosts?: readonly string[]
     readonly fetch?: typeof fetch
     readonly onLogTurn?: (req: LogSessionTurnRequest, tools: readonly ToolDefinition<unknown>[]) => Promise<void>
     readonly onMrTurn?: (req: { repo: string; mrNumber: number; origin: string; prompt: string }) => Promise<void>
@@ -596,9 +598,29 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     const origin = options.origin ?? await createAppRepo(join(dir, 'order-service'), {
       'src/handler.ts': 'export function handleOrder() { return null }\n',
     })
+    const secondOrigin = options.withSecondApp
+      ? await createAppRepo(join(dir, 'payment-service'), {
+          '.agents/logalyze.yaml': [
+            'id: payment-service',
+            'name: 支付服务',
+            'description: 支付网关与回调处理',
+            'aliases: [支付, pay-comp]',
+            'logHints: [payment-service, PayClient]',
+            'skill: log-analysis',
+            '',
+          ].join('\n'),
+          'src/pay.ts': 'export const pay = true\n',
+        })
+      : undefined
 
     const fakeRepos = new FakeReposWithMr(join(dir, 'repos-store'))
-    fakeRepos.setCatalog([{ url: origin, base: 'main' }], ['log-analysis', 'mr-review'])
+    fakeRepos.setCatalog(
+      [
+        { url: origin, base: 'main' },
+        ...(secondOrigin === undefined ? [] : [{ url: secondOrigin, base: 'main' }]),
+      ],
+      ['log-analysis', 'mr-review'],
+    )
 
     const fakePlatform = new FakePlatform()
     if (options.withPlatform !== false) {
@@ -663,6 +685,11 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
         enabled: true,
         debounceMs: 0,
       },
+      ...(options.allowedHosts === undefined ? {} : {
+        download: {
+          allowedHosts: [...options.allowedHosts],
+        },
+      }),
       ...(options.withPlatform !== false ? {
         analyze: {
           platform: fakePlatform.settings(),
@@ -727,6 +754,9 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     await service.boot()
     if (!options.skipSaveApplication) {
       await service.saveApplication({ url: origin, description: '订单服务', aliases: ['order-comp'] })
+      if (secondOrigin !== undefined) {
+        await service.saveApplication({ url: secondOrigin, description: '支付服务', aliases: ['pay-comp'] })
+      }
     }
     cleanups.push(() => service.shutdown())
 
@@ -744,6 +774,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     return {
       dir,
       origin,
+      secondOrigin,
       service,
       fakeRepos,
       fakePlatform,
@@ -1088,6 +1119,9 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
   it('supports manual Feishu ZIP diagnosis without platform config AND closes the full fix_code + isolated improve_skill MR loop', async () => {
     const h = await createFullHarness({
       withPlatform: false, // Even when log platform is completely unconfigured!
+      withSecondApp: true,
+      allowedHosts: ['logs.example.com'],
+      fetch: async () => new Response('missing', { status: 404 }),
       onMrTurn: async () => undefined,
     })
 
@@ -1272,6 +1306,59 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     await mrSup.flushDebouncedDue()
     await waitFor(() => h.mrTurns.some(t => t.mrNumber === fixPush.mrNumber && t.origin === 'self-fix'))
     expect(h.mrTurns.find(t => t.mrNumber === fixPush.mrNumber)?.prompt).toContain('ci-failed')
+
+    // 7. 4566693290: Failed initial prepare with new logs rolls back cleanly without orphan task/workspace,
+    // and supplying another valid manual ZIP in the same session creates an isolated new task/workspace
+    // instead of silently reusing Task 1's manifest and revising Task 1.
+    await expect(prepare.execute({
+      app: 'pay-comp',
+      logs: [{ url: 'https://logs.example.com/missing.zip' }],
+    }, h.toolExecCtx(feishuSessionId, workDir, 'c-prep-fail-url'))).rejects.toThrow(/404|HTTP/i)
+    expect(domain.logTasks.size).toBe(1)
+
+    const secondZip = join(h.dir, 'payment-crash.zip')
+    await writeFile(secondZip, buildZipBuffer([
+      { name: 'pay.log', content: 'PaymentGatewayTimeout at PayClient:12\n' },
+    ]))
+
+    const secondPrep = await prepare.execute({
+      app: 'pay-comp',
+      logs: [{ path: secondZip }],
+    }, h.toolExecCtx(feishuSessionId, workDir, 'c-prep-second')) as {
+      readonly taskId: string
+      readonly appId: string
+      readonly reused: boolean
+      readonly workDir: string
+      readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+    }
+    expect(secondPrep.taskId).not.toBe(prepRes.taskId)
+    expect(secondPrep.appId).toBe('payment-service')
+    expect(secondPrep.reused).toBe(false)
+    expect(secondPrep.workDir).toBe(join(workDir, 'tasks', secondPrep.taskId))
+    expect(secondPrep.slots.map(s => s.files)).toEqual([['pay.log']])
+
+    // Switching app without providing new logs rejects clearly instead of silently reusing.
+    await expect(prepare.execute({
+      app: 'order-service',
+    }, h.toolExecCtx(feishuSessionId, workDir, 'c-prep-switch-err'))).rejects.toThrow(/同时传入 logs/)
+
+    const secondSubmit = await submit.execute({
+      summary: '支付网关超时定位完成',
+      items: [{
+        ref: 'L1',
+        status: 'diagnosed',
+        rootCauseCategory: 'hardware_or_external',
+        conclusion: '上游支付网关超时',
+        evidences: [{ source: 'logs/L1/pay.log', locator: 'L1', excerpt: 'PaymentGatewayTimeout' }],
+      }],
+    }, h.toolExecCtx(feishuSessionId, workDir, 'c-sub-second')) as {
+      readonly taskId: string
+      readonly revision: number
+    }
+    expect(secondSubmit.taskId).toBe(secondPrep.taskId)
+    expect(secondSubmit.revision).toBe(1)
+    expect(domain.logTasks.get(prepRes.taskId)?.revisions).toHaveLength(1)
+    expect(domain.logTasks.get(secondPrep.taskId)?.revisions).toHaveLength(1)
   }, 20_000)
 
   it('launches Feishu topic immediately under topic-on-start deliveryMode and prevents symlink follow in unpack', async () => {

@@ -691,7 +691,10 @@ export class LogalyzeService {
         requireSup().platformDownload(log, dir, fileName, download, signal),
       resolveTaskForSession: (sessionId, taskId) =>
         requireSup().resolveTaskForSession(sessionId, taskId),
+      withSessionOperation: (sessionId, fn) =>
+        requireSup().withSessionOperation(sessionId, fn),
       createFeishuTask: input => requireSup().createFeishuTask(input),
+      discardFeishuTask: input => requireSup().discardFeishuTask(input),
       updateTask: (taskId, updater) => requireSup().updateTask(taskId, updater),
       withTaskOperation: (taskId, fn) => requireSup().withTaskOperation(taskId, fn),
       onRevisionSubmitted: params => requireSup().onRevisionSubmitted(params),

@@ -9,7 +9,7 @@
  */
 
 import { randomBytes } from 'node:crypto'
-import { mkdir, readdir, stat } from 'node:fs/promises'
+import { mkdir, readdir, rm, stat } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { z } from 'zod'
 import type { ReadyApp, RepoRegistry } from '../apps/registry.ts'
@@ -182,6 +182,7 @@ export class LogSupervisor {
   private readonly batchLocks = new Map<string, Promise<unknown>>()
   private readonly taskLocks = new Map<string, Promise<unknown>>()
   private readonly toolOpLocks = new Map<string, Promise<unknown>>()
+  private readonly sessionOpLocks = new Map<string, Promise<unknown>>()
   private readonly watermarkLocks = new Map<string, Promise<unknown>>()
   private readonly backgroundWork = new Set<Promise<unknown>>()
   private readonly activeTaskIds = new Set<string>()
@@ -220,7 +221,10 @@ export class LogSupervisor {
       },
     })
 
-    for (const [taskId, task] of this.deps.logTasks.entries()) {
+    const bootTasks = [...this.deps.logTasks.entries()].sort(
+      (a, b) => (a[1].updatedAt ?? a[1].createdAt ?? 0) - (b[1].updatedAt ?? b[1].createdAt ?? 0),
+    )
+    for (const [taskId, task] of bootTasks) {
       if (task.sessionId !== undefined) this.indexSessionTask(task.sessionId, taskId)
       if (task.feishuLaunchKey !== undefined) this.launchKeyToTaskId.set(task.feishuLaunchKey, taskId)
     }
@@ -253,7 +257,10 @@ export class LogSupervisor {
       await this.deduplicatePendingBatch(bKey)
     }
 
-    for (const [taskId, task] of this.deps.logTasks.entries()) {
+    const bootTasks = [...this.deps.logTasks.entries()].sort(
+      (a, b) => (a[1].updatedAt ?? a[1].createdAt ?? 0) - (b[1].updatedAt ?? b[1].createdAt ?? 0),
+    )
+    for (const [taskId, task] of bootTasks) {
       if (task.sessionId !== undefined) this.indexSessionTask(task.sessionId, taskId)
       if (task.feishuLaunchKey !== undefined) this.launchKeyToTaskId.set(task.feishuLaunchKey, taskId)
 
@@ -635,7 +642,9 @@ export class LogSupervisor {
         return downloaded.path
       },
       resolveTaskForSession: (sessionId, taskId) => this.resolveTaskForSession(sessionId, taskId),
+      withSessionOperation: (sessionId, fn) => this.withSessionOperation(sessionId, fn),
       createFeishuTask: input => this.createFeishuTask(input),
+      discardFeishuTask: input => this.discardFeishuTask(input),
       updateTask: (taskId, updater) => this.updateTask(taskId, updater),
       withTaskOperation: (taskId, fn) => this.withTaskOperation(taskId, fn),
       onRevisionSubmitted: params => this.onRevisionSubmitted(params),
@@ -1992,10 +2001,19 @@ export class LogSupervisor {
     if (explicitTaskId !== undefined) {
       const task = this.deps.logTasks.get(explicitTaskId)
       if (task !== undefined) {
-        this.indexSessionTask(sessionId, explicitTaskId)
+        this.indexSessionTask(sessionId, explicitTaskId, true)
         return { taskId: explicitTaskId, task }
       }
       return undefined
+    }
+
+    const ids = this.sessionToTaskIds.get(sessionId)
+    if (ids !== undefined) {
+      for (let i = ids.length - 1; i >= 0; i -= 1) {
+        const candidateId = ids[i]!
+        const rec = this.deps.logTasks.get(candidateId)
+        if (rec !== undefined) return { taskId: candidateId, task: rec }
+      }
     }
 
     const launchKey = this.deps.getTopics()?.launchKeyOf(sessionId)
@@ -2007,15 +2025,6 @@ export class LogSupervisor {
           this.indexSessionTask(sessionId, fromLaunch)
           return { taskId: fromLaunch, task: rec }
         }
-      }
-    }
-
-    const ids = this.sessionToTaskIds.get(sessionId)
-    if (ids !== undefined) {
-      for (let i = ids.length - 1; i >= 0; i -= 1) {
-        const candidateId = ids[i]!
-        const rec = this.deps.logTasks.get(candidateId)
-        if (rec !== undefined) return { taskId: candidateId, task: rec }
       }
     }
 
@@ -2040,15 +2049,18 @@ export class LogSupervisor {
     readonly workDir: string
     readonly app: ReadyApp
     readonly inputs: readonly LogTaskInput[]
+    readonly isolateWorkDir?: boolean
   }): Promise<{ readonly taskId: string; readonly task: LogTaskRecord }> {
     const now = this.now()
     const taskId = `feishu-${now}-${randomBytes(4).toString('hex')}`
+    const taskWorkDir = input.isolateWorkDir ? join(input.workDir, 'tasks', taskId) : input.workDir
+    await mkdir(taskWorkDir, { recursive: true })
     const record: LogTaskRecord = {
       source: 'feishu',
       appId: input.app.app.id,
       appName: input.app.app.name,
       sessionId: input.sessionId,
-      workDir: input.workDir,
+      workDir: taskWorkDir,
       inputs: [...input.inputs],
       status: 'running',
       revisions: [],
@@ -2056,8 +2068,32 @@ export class LogSupervisor {
       updatedAt: now,
     }
     await this.deps.logTasks.put(taskId, record)
-    this.indexSessionTask(input.sessionId, taskId)
+    this.indexSessionTask(input.sessionId, taskId, true)
     return { taskId, task: this.deps.logTasks.get(taskId)! }
+  }
+
+  private async discardFeishuTask(input: {
+    readonly sessionId: string
+    readonly taskId: string
+    readonly isolatedWorkDir?: string
+  }): Promise<void> {
+    await this.withTaskLock(input.taskId, async () => {
+      const cur = this.deps.logTasks.get(input.taskId)
+      if (cur === undefined || cur.source !== 'feishu' || cur.revisions.length > 0) return
+      await this.deps.logTasks.delete(input.taskId)
+      const list = this.sessionToTaskIds.get(input.sessionId)
+      if (list !== undefined) {
+        const filtered = list.filter(id => id !== input.taskId)
+        if (filtered.length === 0) {
+          this.sessionToTaskIds.delete(input.sessionId)
+        } else {
+          this.sessionToTaskIds.set(input.sessionId, filtered)
+        }
+      }
+      if (input.isolatedWorkDir !== undefined && input.isolatedWorkDir !== '') {
+        await rm(input.isolatedWorkDir, { recursive: true, force: true })
+      }
+    })
   }
 
   private updateTask(taskId: string, updater: (current: LogTaskRecord) => LogTaskRecord): Promise<LogTaskRecord> {
@@ -2074,9 +2110,14 @@ export class LogSupervisor {
     })
   }
 
-  private indexSessionTask(sessionId: string, taskId: string): void {
+  private indexSessionTask(sessionId: string, taskId: string, promote = false): void {
     const list = this.sessionToTaskIds.get(sessionId) ?? []
-    if (!list.includes(taskId)) {
+    const existingIdx = list.indexOf(taskId)
+    if (existingIdx === -1) {
+      list.push(taskId)
+      this.sessionToTaskIds.set(sessionId, list)
+    } else if (promote && existingIdx !== list.length - 1) {
+      list.splice(existingIdx, 1)
       list.push(taskId)
       this.sessionToTaskIds.set(sessionId, list)
     }
@@ -2157,6 +2198,10 @@ export class LogSupervisor {
 
   private withTaskOperation<T>(key: string, fn: () => Promise<T>): Promise<T> {
     return this.serializeKeyedLock(this.toolOpLocks, key, fn)
+  }
+
+  private withSessionOperation<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    return this.serializeKeyedLock(this.sessionOpLocks, key, fn)
   }
 
   private withWatermarkLock<T>(fn: () => Promise<T>): Promise<T> {
