@@ -224,22 +224,36 @@ function verifyTarChecksum(buf: Uint8Array, offset: number): boolean {
 }
 
 function parsePaxRecords(data: Uint8Array): Record<string, string> {
-  const text = Buffer.from(data).toString('utf8')
-  const out: Record<string, string> = {}
-  let pos = 0
-  while (pos < text.length) {
-    const space = text.indexOf(' ', pos)
-    if (space === -1) break
-    const len = Number.parseInt(text.slice(pos, space), 10)
-    if (!Number.isInteger(len) || len <= 0) break
-    const record = Buffer.from(text, 'utf8').subarray(Buffer.byteLength(text.slice(0, pos))).subarray(0, len).toString('utf8')
-    const eq = record.indexOf('=')
-    if (eq !== -1) {
-      const key = record.slice(record.indexOf(' ') + 1, eq)
-      const value = record.slice(eq + 1).replace(/\n$/u, '')
-      out[key] = value
+  const buf = Buffer.isBuffer(data)
+    ? data
+    : Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+  const out = Object.create(null) as Record<string, string>
+  let offset = 0
+  while (offset < buf.length) {
+    const space = buf.indexOf(0x20, offset)
+    if (space <= offset || space - offset > 12) break
+    let len = 0
+    let validLen = true
+    for (let i = offset; i < space; i += 1) {
+      const byte = buf[i]!
+      if (byte < 0x30 || byte > 0x39) {
+        validLen = false
+        break
+      }
+      len = len * 10 + (byte - 0x30)
     }
-    pos += record.length
+    if (!validLen || len <= space - offset + 1 || offset + len > buf.length) break
+    const recordEnd = offset + len
+    const valueEnd = buf[recordEnd - 1] === 0x0a ? recordEnd - 1 : recordEnd
+    const eq = buf.subarray(space + 1, valueEnd).indexOf(0x3d)
+    if (eq !== -1) {
+      const eqPos = space + 1 + eq
+      const key = buf.toString('utf8', space + 1, eqPos)
+      if (key !== '') {
+        out[key] = buf.toString('utf8', eqPos + 1, valueEnd)
+      }
+    }
+    offset = recordEnd
   }
   return out
 }
@@ -291,7 +305,9 @@ async function unpackTarBuffer(
 
     if (typeFlag === 'x') {
       const recs = parsePaxRecords(content)
-      if (typeof recs.path === 'string') paxPath = recs.path
+      if (typeof recs.path === 'string') {
+        paxPath = recs.path === '' ? undefined : recs.path
+      }
       continue
     }
     if (typeFlag === 'g') {

@@ -138,7 +138,7 @@ function buildZipBuffer(entries: readonly { readonly name: string; readonly cont
   return Buffer.concat([...locals, ...centrals, eocd])
 }
 
-function buildTarBuffer(entries: readonly { readonly name: string; readonly content?: string | Buffer; readonly type?: '0' | '2'; readonly linkname?: string }[]): Buffer {
+function buildTarBuffer(entries: readonly { readonly name: string; readonly content?: string | Buffer; readonly type?: '0' | '2' | 'x'; readonly linkname?: string }[]): Buffer {
   const blocks: Buffer[] = []
   for (const entry of entries) {
     const type = entry.type ?? '0'
@@ -427,6 +427,35 @@ describe('safe archive unpacker (unpackLogSlot)', () => {
     const plainRes = await unpackLogSlot({ archivePath: plainPath, fileName: 'raw.log', destDir: plainDest, maxBytes: 1024 * 1024 })
     expect(plainRes.status).toBe('ok')
     expect(plainRes.files).toEqual(['raw.log'])
+
+    // 4577181992: Large PAX extended header with many short records parses linearly without blocking the event loop.
+    const makePaxRecord = (key: string, value: string): Buffer => {
+      const body = Buffer.from(` ${key}=${value}\n`, 'utf8')
+      let totalLen = body.length + String(body.length).length
+      while (Buffer.byteLength(`${totalLen}`, 'ascii') + body.length !== totalLen) {
+        totalLen = Buffer.byteLength(`${totalLen}`, 'ascii') + body.length
+      }
+      return Buffer.concat([Buffer.from(`${totalLen}`, 'ascii'), body])
+    }
+    const shortRec = makePaxRecord('k', '1234')
+    expect(shortRec.length).toBe(9)
+    const paxHeaderData = Buffer.concat([
+      ...Array.from({ length: 40_000 }, () => shortRec),
+      makePaxRecord('path', 'logs/中文目录/pax-service.log'),
+    ])
+    const paxTarPath = join(dir, 'pax-large.tar')
+    await writeFile(paxTarPath, buildTarBuffer([
+      { name: 'PaxHeaders.0/fallback.log', type: 'x', content: paxHeaderData },
+      { name: 'fallback.log', content: 'pax ok\n' },
+    ]))
+    const paxDest = join(dir, 'slot-pax')
+    const paxStart = Date.now()
+    const paxRes = await unpackLogSlot({ archivePath: paxTarPath, fileName: 'pax-large.tar', destDir: paxDest, maxBytes: 2 * 1024 * 1024 })
+    const elapsedMs = Date.now() - paxStart
+    expect(paxRes.status).toBe('ok')
+    expect(paxRes.files).toEqual(['logs/中文目录/pax-service.log'])
+    expect(await readFile(join(paxDest, 'logs/中文目录/pax-service.log'), 'utf8')).toBe('pax ok\n')
+    expect(elapsedMs).toBeLessThan(1_000)
   })
 
   it('rejects Zip-Slip, symlink entries, Zip-Bomb byte caps, and isolates corrupted archives', async () => {
