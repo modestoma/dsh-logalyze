@@ -11,7 +11,12 @@
 
 ## 项目状态
 
-已发布到 npm（`dsh-logalyze`，稳定版 0.x）：打通「`/logalyze` 入口 → 识别应用 → 派发子 Agent 到应用代码仓库的只读快照 → 汇总结论」这条链路，附带一个示例应用仓库。接口仍可能调整。
+已完成 M1–M4 全量核心能力交付（合入 `dev` 分支，保持 npm 包名 `dsh-logalyze` 与 Cordis 插件名 `logalyze` 不变）：
+
+- **M1 跨插件底座与共享运行时**：协同 [dsh_channels](https://github.com/modestoma/dsh_channels)（`feishuActions` v1 非阻塞动作提议卡 + `feishuBitable` v1 多维表格服务端读写）与 [dsh-repo](https://github.com/modestoma/dsh-repo)（`dshRepos` v8 行级评审与讨论线程契约），建立 `dsh_supervisor` 存储域（7 张强类型表）、并发隔离池（`logPool` / `mrPool`）、滑动防抖器、滑动窗口熔断器与幂等 Outbox。
+- **M2 审微（MR 自动评审）**：自动跟随启用「MR 自动评审」的仓库，以「1 条 MR = 1 个持久化 `mr-reviewer` Session」完成首次行级评审、Push 增量重审、人类讨论回复与自动 Resolve，以及己方修复 MR（`self-fix` / `self-skill`）的 CI/评审跟进。
+- **M3 观象（日志自动监管与闭环处置）**：支持 `/logalyze` 手动入口、`/open-api/logalyze` 平台接口，以及 `logSupervision` 日志平台增量水位线轮询 + `(product, component, error_code)` 窗口攒批；集成共享镜像克隆（`<workDir>/repos/<app>`）、`IssueMemory` 检索、Outbox 报告回传，以及经 `propose_actions` 触发的一键 `[🔧 修复代码并提 MR]` / `[📚 改进分析流程 / 沉淀案例]` 闭环。
+- **M4 问题库双向同步与统一面板**：本地 `IssueMemory` 与飞书多维表格后台双向幂等同步（严格隔离 AI 列与人工列），提供 Web 左侧栏「智能监管」5 标签页（运行总览 / 应用与日志监管 / MR 自动评审 / 已知问题库 / 模型与高级）整页面板。
 
 ## 核心能力
 
@@ -127,6 +132,34 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
         maxFileBytes: 52428800         # 单文件上限
         maxMarkdownBytes: 20971520     # Markdown 文件（含 report.md）上限
         concurrency: 4                 # 同时上传的文件数
+    logSupervision:                    # 观象日志平台自动轮询、窗口攒批与闭环处置
+      enabled: false                   # 默认关闭
+      pollIntervalMs: 60000            # 轮询日志平台归档列表间隔
+      batchSizeThreshold: 5            # 同组攒批达到该条数立即发车（1–50）
+      maxBatchSize: 20                 # 单批最多容纳日志数（1–50，>= batchSizeThreshold）
+      batchWindowMs: 300000            # 首批入槽后最大等待时间（0 表示不额外等待）
+      maxConcurrentBatches: 4          # logPool 并发执行上限（1–16）
+      appHourlyBatchLimit: 15          # 单应用每小时批次上限（触发 log:<appId> 熔断）
+      feishuChatId: oc_xxx             # 自动监管投递的目标飞书群（不填时无头后台运行）
+      deliveryMode: quiet-until-done   # quiet-until-done（静默出结论后再发话题）| topic-on-start
+      maxUnpackBytes: 536870912        # 单日志槽位累计最大解压字节数
+    mrReview:                          # 审微 MR 自动初审、增量重审与己方 MR 跟进
+      enabled: true                    # 默认开启（有开启 mr-review 的仓库且 dshRepos 为 v8 时生效）
+      pollIntervalMs: 60000            # 巡检 MR 与讨论更新间隔
+      debounceMs: 45000                # Push / 评论防抖窗口（合并连续 push；单批最大等待 5 分钟）
+      maxConcurrentSessions: 3         # mrPool 并发会话上限（1–16）
+      skipDraft: true                  # 自动跳过 Draft / WIP 合并请求
+      ignoreLabels: []                 # 命中的标签（精确大小写不敏感匹配）不自动评审
+      maxAutoFixAttempts: 2            # 己方修复/SKILL 改进 MR 的自动修复 CI 最大尝试次数
+      dailyMrTurnLimit: 12             # 单条 MR 每日自动唤醒次数上限（触发 mr:<repo>#<num> 熔断）
+      repoHourlyTurnLimit: 30          # 单仓库每小时自动唤醒次数上限（触发 mr-repo:<repo> 熔断）
+      customInstructions: ''           # 团队附加评审规范，注入每次 MR 唤醒提示词（最多 4000 字）
+      feishuChatId: oc_xxx             # 可选：MR 熔断/合并冲突需人工介入时的飞书告警群
+    issueSync:                         # 已知问题库与飞书多维表格双向同步
+      enabled: true                    # 默认开启（填写 bitableUrl 后开始远端同步）
+      bitableUrl: https://example.feishu.cn/base/bascnxxx  # /base/<token> 或 /wiki/<node_token>
+      table: tblxxx                    # 可选：数据表 ID 或表名（覆盖链接中 ?table=）
+      syncIntervalMs: 300000           # 后台周期双向同步间隔（最小 5000）
     analyzeTokenRef: LOGALYZE_ANALYZE_TOKEN             # 接口访问令牌在 DSH 凭据库中的名称
     platformSecretRef: LOGALYZE_PLATFORM_CLIENT_SECRET  # 日志平台 client_secret 在 DSH 凭据库中的名称
 ```
@@ -135,48 +168,39 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
 
 ### 应用仓库
 
-观象自己不运行 git，也不依赖其他插件的包。仓库清单、只读快照、工作区和推送 SKILL 修改都调用运行时的 `dshRepos` 服务（服务版本 7，例如由 [dsh-repo](https://github.com/modestoma/dsh-repo) 提供），它用到的方法见 `src/deps/repos-contract.ts`。没有该服务或服务版本不符时观象没有应用仓库，原因显示在设置面板。
+智能监管自己不运行 git，也不依赖其他插件的 npm 包。仓库清单、只读快照、会话内共享克隆与推送合并请求都调用运行时的 `dshRepos` 服务（由 [dsh-repo](https://github.com/modestoma/dsh-repo) 提供），契约声明见 `src/deps/repos-contract.ts`。没有该服务或服务版本不符时相关仓库不可用，原因显示在设置面板：
 
-- 观象在服务出现时注册功能 `log-analysis`（标题「日志分析」），dsh-repo 设置页的每个仓库多一个「日志分析」开关；插件卸载时撤销注册。
-- 应用仓库是 `repoList({ feature: 'log-analysis' })` 返回的仓库。分析读「日志分析」功能的分支，没选时读仓库的基线分支：每次读取取该分支最新提交的只读快照（`snapshotAcquire`，dsh-repo 先从远端拉取），从快照读出应用描述和 SKILL 后立即释放。清单变化后观象重新配置注册表，新出现或日志分析分支变了的仓库立即读取，被删除或关掉功能的仓库在进行中的分析结束后移除。
-- 起草接入和 SKILL 改进的工作区不指定起点和分支：dsh-repo 从仓库的基线分支最新提交开始，按它的分支命名模板生成分支名（默认同一会话的工作区用同一个分支，所以同一会话里的多次改进会推到同一个分支和合并请求），合并请求合回基线分支。基线分支和日志分析分支不同时（例如基线 `dev`、日志分析 `main`），合并后的 SKILL 要等基线分支合入日志分析分支后才在分析中生效。
-- 仓库在清单里的权限决定观象能做什么：「只读」只分析，面板标出「只读」；起草接入和 SKILL 改进要推送分支、创建合并请求，需要「可改代码」或「可合并」。只读仓库不提供起草工具，改进工具对它报错并说明到 dsh-repo 改权限，它的分析子 Agent 也不记录 SKILL 不足；只有只读应用时不提供改进工具。权限改变后立即生效，不重新读取。
-
-主机、访问令牌和镜像目录都在提供 `dshRepos` 的插件中配置；观象面板「应用仓库」分页的「在 dsh-repo 中管理仓库」跳到 dsh-repo 的设置页。该服务报告主机或令牌变更后，观象自动重新读取全部仓库。镜像目录没有默认值：服务报告未设置（`settingsGet().mirrorDir` 为 `undefined`）时，读取应用描述、代码快照、SKILL 改进和接入起草都失败并带上服务给出的原因，面板「应用仓库」分页显示提示和「去设置镜像目录」按钮；设置后下一次 `/logalyze` 即恢复。
-
-子 Agent 的命令在 dsh 的文件沙箱中运行：镜像和代码快照只读，只有父会话的项目目录可写，运行目录就在其中。SKILL 改进和接入起草的工作区也建在运行目录里，所以父会话必须有项目目录，工作区必须位于其中，子 Agent 才能修改工作区里的文件。工作区是 dsh-repo 创建的普通 git 克隆，带自己的 `.git`，`origin` 经 dsh-repo 的本机 git 代理访问远端；子 Agent 被要求只改文件、不执行 git 写操作，提交和推送由观象经 `workspacePush` 完成。dsh-repo 不允许工作区套在另一个工作区里，所以会话目录本身是 dsh-repo 工作区时（例如在 dsh-repo 设置页「工作区」里新建的目录中开的会话）无法改进 SKILL 或起草接入，工具报出 dsh-repo 的原因。Linux 的 bubblewrap 沙箱会把 `/tmp` 换成空的临时目录，所以镜像目录不能放在 `/tmp` 下（dsh-repo 拒绝这样的目录），否则子 Agent 的命令看不到仓库。飞书会话的文件访问被渠道插件限制在话题目录内，所以部署时镜像目录不能在 DSH 主目录或渠道的会话目录下，并且要把代码快照目录 `<镜像目录>/.snapshots` 加入渠道插件的可读目录，分析子 Agent 才读得到代码。
+- 插件在 `dshRepos` 服务出现时注册两项仓库级功能：`log-analysis`（标题「日志分析」，`dshRepos` v7/v8 均可）与 `mr-review`（标题「MR 自动评审」，需 `dshRepos` **v8** 提供行级评审、增量 compare 与讨论线程接口；版本为 v7 时面板「MR 自动评审」标出升级提示），插件卸载时撤销注册。
+- 启用「日志分析」的仓库不再要求提交 `.agents/logalyze.yaml`：仓库在 dsh-repo 中打开「日志分析」即可被收录，应用描述（`description`）与触发别名（`aliases` / 平台原始 `component_code`）直接在智能监管 Web 面板配置并持久化在 `$DSH_HOME/logalyze/applications.json`；若仓库历史保留 `.agents/logalyze.yaml` 且本地尚无记录，首次同步时自动一次性迁移其描述与别名。
+- 日志分析与 MR 自动评审均支持通过 `dshRepos.workspaceCreate` 在当前会话工作目录下创建镜像克隆工作区（`<workDir>/repos/<slug>`），从本地裸镜像秒级检出并共享 Git 对象；写操作推送均由 `dshRepos.workspacePush` 经过 dsh-repo 的 `access/authorize` 与写权限门控完成。
+- 仓库在清单里的权限决定能做什么：「只读」仅允许分析与 MR 评审，面板标出「只读」；修改代码、改进 SKILL 与提交合并请求需要「可改代码」或「可合并」。Linux 沙箱环境下镜像目录不能放在 `/tmp` 下；飞书会话中需要将代码快照目录 `<镜像目录>/.snapshots` 加入渠道插件可读目录以支持传统只读快照派发。
 
 ### 设置面板
 
-DSH Web 左侧栏的「观象」入口打开整页设置面板：
+DSH Web 左侧栏的 **「智能监管」** 入口打开统一 5 标签页整页面板（顶部常驻健康指标条，底部联动草稿保存条）：
 
-| 分页 | 内容 |
+| 标签页 | ID | 内容与功能 |
+|---|---|---|
+| **运行总览** | `overview` | 日志与 MR 监管域健康总览、活跃任务计数、异常与已触发熔断器一键解除（`POST /logalyze/breakers/reset`）、平台报告死信队列重试及近期任务/MR 活动 |
+| **应用与日志监管** | `log` | 跟随 `dsh-repo` 已开启「日志分析」的应用仓库（支持就地编辑应用描述与单行添加/删除触发别名并保存 `PUT /logalyze/applications`）；`logSupervision` 水位线状态与暂停/恢复/时间回拨控制（`POST /logalyze/log-supervision/watermark`）、攒批参数、`/open-api/logalyze` 接口与 OAuth2 平台凭据（`PUT/DELETE /logalyze/token`）、日志下载/上传限制及最近报告回传与手动重传（`POST /logalyze/reports/upload`） |
+| **MR 自动评审** | `mr` | 跟随 `dsh-repo` 已开启「MR 自动评审」的仓库清单（含目标分支与只读/可写标记）、审微运行状态与熔断器、受监管 MR 列表（`open`/`merged`/`closed`/`draft_skipped`、origin 标记及待处理信号）、`mrReview` 并发/防抖/忽略标签/熔断阈值、`customInstructions` 与可选 `feishuChatId` 告警群 |
+| **已知问题库** | `issues` | `feishuBitable` v1 就绪状态、一键「立即同步」（`POST /logalyze/issues/sync`）与「检查字段映射」（`POST /logalyze/issues/check` 对 16 列标准 Schema 逐列诊断）、`issueSync` 表格链接/表名/周期配置、本地 `IssueMemory` 问题检索列表与 `humanConclusion` / `fixMrUrl` 状态 |
+| **模型与高级** | `advanced` | 只读展示 `cordis.yml` 运行时配置（`analyzeTokenRef`、`platformSecretRef`、`subagentProvider`、`refreshWaitMs`、`autoInvoke`）、仓库读取间隔与派发上限、`skillUpdates` 开关与文件限制，以及清除覆盖恢复默认值（`DELETE /logalyze/settings`） |
+
+面板读取状态走 `GET /logalyze/state`，保存设置走 `PUT /logalyze/settings`（写入 `$DSH_HOME/logalyze/settings.json`，仅保存与 `cordis.yml` 不同的覆盖键并共用同一 Zod 校验），所有 `/logalyze/*` 路由均经过宿主 `connection.requestRejection` 登录与来源校验，写操作另做同源校验。
+
+## 应用仓库约定与内置 SKILL
+
+管理员在 dsh-repo「代码仓库 → 仓库」添加仓库并打开「日志分析」后即可生效，**不再强制要求仓库内预先提交 `.agents/logalyze.yaml` 或指定分析 SKILL**（参见包内 `/logalyze-kit`）。应用描述与触发别名（含中文简称与平台原始 `component_code`）均可在智能监管面板「应用与日志监管」中可视化配置并保存在 `$DSH_HOME/logalyze/applications.json`；若仓库历史上存在旧版 `.agents/logalyze.yaml`，首次同步时自动一次性迁移其描述与别名。
+
+若应用仓库自带专属排查流程，可按标准路径放在 `.dsh/skills/` 或 `.agents/skills/<skill>/SKILL.md`（不得设 `user-invocable: false`），DSH 与 `log-supervisor` 会在检出代码工作区后自动发现并按需加载；无专属 SKILL 时直接结合日志与仓内代码排查。此外，本插件内置 4 个随包指导 SKILL（`src/skill/bundled.ts`）：
+
+| 内置 SKILL | 用途说明 |
 |---|---|
-| 应用仓库 | 只读：dsh-repo 清单中打开了「日志分析」的仓库，每个仓库的日志分析分支、应用状态（已配置、缺应用描述可初始化、不可用）、清单权限为只读时的「只读」标记、读取的提交号、应用描述与不可用原因，以及跳转到 dsh-repo 设置页的按钮；镜像的拉取状态和重新拉取在 dsh-repo 的「仓库」分页 |
-| 日志下载 | 允许下载的域名、单文件大小上限、下载超时 |
-| 分析接口 | [日志平台分析接口](#日志平台分析接口)的开关、访问令牌（只显示是否已设置）、飞书渠道是否就绪、[报告回传](#报告回传)的命令与上限、最近 50 份报告的回传记录（可手动重新上传），以及调用地址与字段摘要 |
-| 高级 | 更新间隔、单次应用数上限、派发超时、SKILL 改进开关与文件上限，恢复 cordis.yml 配置 |
-
-面板保存的值写入 `$DSH_HOME/logalyze/settings.json`（只保存与 cordis.yml 不同的字段），按与配置相同的规则校验；分析接口令牌存入 DSH 凭据库。面板接口 `/logalyze/*` 使用 DSH 自己的登录与来源校验，写操作另做同源校验。
-
-## 应用仓库约定
-
-每个应用仓库需要两样东西（完整示例见 [examples/order-service](examples/order-service)，接入步骤与 SKILL 写作要点见[应用仓库接入指南](docs/app-repo-guide.md)）：
-
-`.agents/logalyze.yaml` 应用描述：
-
-```yaml
-id: order-service               # 小写短横线格式，派发与分析请求按它对应应用
-name: 订单服务                   # 显示名，也是子 Agent 的标签
-description: 下单、库存扣减与支付回调
-aliases: [订单, 下单, order]     # 用户对它的其他叫法
-logHints: [order-service, OrderController]   # 能识别本应用日志的字符串
-skill: log-analysis             # 对应 .agents/skills/log-analysis/SKILL.md
-```
-
-`.agents/skills/<skill>/SKILL.md`：这个应用的日志分析流程（如何解压日志包、日志格式、代码结构、常见问题）。它不能设置 `user-invocable: false`，因为派发时用 `/<skill>` 加载。
-
-插件读取仓库的日志分析分支时检查这两个文件；缺失、不合法，或多个仓库声明同一个 id 时，相关应用不可用，原因显示在设置面板。应用描述和 SKILL 必须是普通文件，不能是符号链接。DSH 也从 `.dsh/skills/` 加载项目 SKILL，并且同名时它优先，所以应用仓库不要在 `.dsh/skills/` 下留同名的 SKILL。从清单删除仓库或关掉日志分析不会删除本地镜像。
+| `/logalyze-kit` | 应用接入指引：仓库功能开关、面板描述/别名配置及可选仓内 SKILL 发现规则 |
+| `/logalyze-improve` | SKILL 改进指南：缺陷总结、案例模板（`cases/`）、脱敏规范与改动说明格式 |
+| `/log-supervisor` | 观象自动监管主 Agent 指南：1:1 日志槽位核验、`IssueMemory` 检索与闭环动作提议规范 |
+| `/mr-reviewer` | 审微 MR 监督主 Agent 指南：行级评审准入、增量 Diff 重审、讨论回复与自修检查 |
 
 ## SKILL 改进
 
@@ -198,18 +222,7 @@ skill: log-analysis             # 对应 .agents/skills/log-analysis/SKILL.md
 - 推送和合并请求都为调用的 Agent 发起：`dshRepos` 先发 `access/authorize` 事件问其他插件这个会话能不能改代码（例如飞书渠道插件按发起人或群的权限回答），被拒绝时以 `forbidden` 失败、不问用户；提交者是该主机令牌所属的账号，作者和尾注由其他插件通过 `repo/commit-trailers` 事件决定（例如飞书私聊里作者是发起人，群里加 `Feishu-Chat:` 尾注），观象不再自己配置作者。提交说明末尾有 `DSH-Session: <会话 id>`，合并请求描述也写明了来源会话与分析提交。
 - 日志内容不可信，可能诱导模型写出不当的 SKILL 或在案例里留下未脱敏的数据。观象只限制改动范围，内容需要合并请求的评审者把关。
 
-## 在对话中起草接入
-
-仓库只能由管理员在 dsh-repo 的「代码仓库 → 仓库」中添加并打开「日志分析」。清单里的可写仓库缺少应用描述或 SKILL 时，用户可以在对话里说「为订单服务起草观象接入」。顶层 Agent 有两个工具，子会话中都不提供：
-
-| 工具 | 何时提供 | 做什么 |
-|---|---|---|
-| `logalyze_init_repo` | 有可写仓库已读取但日志分析分支上缺少应用描述或 SKILL 时 | 参数为仓库地址、可选的用户说明和样例日志（`path` 或白名单内的 `url`）。经 `dshRepos` 在运行目录 `.logalyze/runs/<runId>/init/repo/` 创建工作区（起点是基线分支的最新提交，推送分支由 dsh-repo 按分支命名模板生成），以它为工作目录启动一个起草子 Agent，首行用 `/logalyze-kit` 加载接入套件，直接在工作区写出 `.agents/logalyze.yaml` 和一个日志分析 SKILL（大型仓库按领域拆到 `references/`），说明写在工作区之外的 `init/reason.md`；结束后检查初稿并写出 `init/changes.diff`，不推送 |
-| `logalyze_submit_init` | 本会话有起草结果时 | 参数为起草的运行目录（`…/init`）。在其中找到工作区并重新检查初稿；这份初稿已经推送过时直接报告分支已存在。调用 `dshRepos.workspacePush`，经 dsh-repo 的审批把工作区的改动提交、推送到工作区的分支，并创建合回基线分支的合并请求；提交说明首行和合并请求标题是 `chore: 接入观象日志分析：<应用名>（<应用 id>）` |
-
-**接入套件 `/logalyze-kit`。** 观象自带一个 SKILL，写明怎样为应用仓库编写应用描述和日志分析 SKILL：从代码和日志配置里找什么、`logalyze.yaml` 字段、SKILL.md 与 `references/` 的结构模板、约束和自检清单。正文在包内的 [skills/logalyze-kit/SKILL.md](skills/logalyze-kit/SKILL.md)，插件加载时读取，缺失或不合法时加载失败。它在任何目录都列出（包括子 Agent 所在的仓库快照），只能由用户输入或首行手势加载，模型不会自行选用。开发者也可以在自己的仓库里运行 dsh，输入 `/logalyze-kit` 直接编写或改进 SKILL。
-
-初稿的检查规则与读取应用描述时相同：`logalyze.yaml` 合法，SKILL 存在、frontmatter 的 `name` 等于 `skill` 字段、不设置 `user-invocable: false`，应用 id 不与其他仓库重复；工作区的改动只能是 `.agents/logalyze.yaml` 和它指定的 `.agents/skills/<skill>/` 下新增或修改的文件，其他位置的改动、删除、重命名都让初稿不合格，文件数和大小上限沿用 `skillUpdates.maxFiles` 与 `maxFileBytes`（关闭 SKILL 改进时同样生效）。起草子 Agent 的等待上限是 `dispatchTimeoutMs`。推送前由 dsh-repo 为调用的会话发 `access/authorize`，并按它的「写操作」设置经 DSH 的审批服务弹出审批：经 dsh_channels 使用时显示为飞书决策卡片，在 DSH Web 中显示为审批提示；只有「允许」才推送，会话的审批策略为 `never`（例如 DSH 的「完全访问」权限模式）时请求一律被拒绝。令牌权限、提交作者和合并请求的规则与 [SKILL 改进](#skill-改进) 相同；合并后，日志分析分支包含这些文件时，下一次 `/logalyze` 即启用该应用。检查按推送后的内容进行：被仓库忽略规则（如 `.gitignore`）排除的文件不会被推送，应用描述或 SKILL 被忽略时初稿不合格。用户拒绝提交时，初稿仍在运行目录的工作区中，可以再次提交或手动提交。
+> 除对话式触发 `logalyze_improve_skill` 外，在 `LogSupervisor` 监管话题中也可直接点击非阻塞动作按钮 **`[📚 改进分析流程 / 沉淀案例]`**，在隔离的知识工作区（`repos/<app>-knowledge`）中就地完善 SKILL/解析脚本与 `cases/` 案例，并通过 `supervisor_log_push_mr` 发起独立合并请求。
 
 ## 日志平台分析接口
 
@@ -306,9 +319,49 @@ Content-Type: application/json
 - 分析记录最多保留 200 份，最近活动（接受请求或记录一轮）超过 30 天的记录被清理；启动时和每接受一次新分析时清理，正在上传的记录这次跳过。清理删除记录文件和 `$DSH_HOME/logalyze/analyses/<分析 id>/`，话题工作目录里的 `report/` 归话题所有，不删除。
 - 旧版回传命令留下的记录（`$DSH_HOME/logalyze/reports/`）只在面板展示，不再上传，30 天无活动后在启动时删除。
 
+## 日志自动监管与闭环处置（观象）
+
+除被动 `/logalyze` 与 `/open-api/logalyze` 接口外，开启 `logSupervision.enabled`（需配置好日志平台与 `feishuChatId` 通知群；不填 `feishuChatId` 时以无头模式后台诊断并回传平台）后，`LogSupervisor` 以持久化状态机持续监管日志平台：
+
+- **增量水位线轮询与分组攒批**：按 `archived_at` 水位游标 `[cursorTime, T1)`（保存于 `dsh_supervisor` 存储域 `watermarks` 表，支持在面板「应用与日志监管」或 `POST /logalyze/log-supervision/watermark` 执行暂停、恢复与时间回拨）分页拉取已归档日志，并按 `(product_code, component_code, error_code)` 在 `pending_batches` 表持续攒批：同组累计达到 `batchSizeThreshold`（默认 5，单批上限 `maxBatchSize` 默认 20）或距首发入槽超过 `batchWindowMs`（默认 5 分钟）即切片发车。
+- **并发隔离、安全解压与单应用熔断**：全部批次在独立并发池 `logPool`（`maxConcurrentBatches` 默认 4）中调度；单应用滚动 1 小时内批次数超过 `appHourlyBatchLimit`（默认 15）触发 `log:<appId>` 熔断，推送飞书告警并阻塞该应用后续自动发车，直到冷却期结束或在面板「运行总览」点击恢复，不波及其他应用。
+- **`log-supervisor` 会话内诊断工具链**：每次批次分配 1 个持久化主 Agent Session（使用内置 `/log-supervisor` 指南）：
+  - `supervisor_log_prepare`：幂等下载日志、`maxUnpackBytes` 防 Zip Slip / BOM 限制解压到 `<workDir>/logs/L1..Ln/`，经 `dshRepos.workspaceCreate` 在 `<workDir>/repos/<appSlug>` 创建或更新共享镜像克隆工作区，并预检索 `IssueMemory`（优先透传已有 `humanConclusion`）。
+  - `supervisor_issue_search`：在诊断过程中按关键词、错误码或 `issueId` 随时查询本地已知问题库。
+  - `supervisor_log_submit`：校核 1:1 全槽位覆盖与证据路径真实性后写入 `log_tasks` 修订，写入/更新 `IssueMemory`，并通过单调防倒退的 `OutboxRunner`（`outbox_platform` 表）幂等上传每份日志的 `report.md` 与附件。
+  - `supervisor_log_push_mr`：针对 `fix_code`（原地代码分支）或 `improve_skill`（隔离工作区 `<appSlug>-knowledge`），经 `dshRepos.workspacePush` 创建合并请求并自动登记入「审微」MR 持续监管队列。
+- **两种飞书投递模式与非阻塞动作闭环**：
+  - `quiet-until-done`（默认）：第 1 阶段后台无头完成分析与报告生成，第 2 阶段通过 `feishuTopics` 在目标群发送摘要根卡与精简总结并附带动作按钮；适合高噪异常降噪。
+  - `topic-on-start`：批次发车即在飞书开话题流式直播诊断过程，支持人工中途插话追问。
+  - 回合结束通过 `feishuActions` v1 / `propose_actions` 自动挂出独立动作卡片：**`[🔧 修复代码并提 MR]`**（要求群/本人具备 `code-write` 权限）与 **`[📚 改进分析流程 / 沉淀案例]`**；点击后零阻塞唤醒同一 Session 直接在 `<workDir>/repos/<appSlug>` 就地改代码、跑测试、发 MR。终态 `log_tasks` 记录及工作区默认留存 90 天（被 `IssueMemory` 代表报告引用的记录豁免清理）。
+
+## MR 自动评审（审微）
+
+当 `mrReview.enabled` 开启（默认开启）且 `dsh-repo` 提供 `dshRepos` **v8** 时，`MrSupervisor` 自动巡检所有启用了「MR 自动评审」（`mr-review`）的仓库：
+
+- **增量发现与滑动防抖**：周期扫描 `open` 与近期更新 MR，结合 `KeyedDebouncer`（滑动窗口 `debounceMs` 默认 45 秒、最长等待 5 分钟）把短时间内的连续 `git push` 与多条人类评论合并为一次唤醒，避免刷屏与重复消耗。支持跳过 Draft/WIP（`skipDraft: true`）与标签黑名单（`ignoreLabels`，大小写不敏感精确匹配）。
+- **1 MR = 1 持久化 `mr-reviewer` Session**：
+  - **外部 MR**（`origin: 'external'`）：在 `<mrWorkspacesDir>/<repoSlug>-mr-<number>` 就地结合全仓引用与测试开展首次全量评审；后续新提交时仅拉取 `lastReviewedSha..headSha` 增量 Diff，通过 `supervisor_mr_prepare` / `supervisor_mr_publish_review`（含行级评论与总评，支持在面板或配置追加 `mrReview.customInstructions` 团队规范）、`supervisor_mr_reply_thread` / `supervisor_mr_resolve_thread` 自动解决已修复线程，并用 `supervisor_mr_checkpoint` 更新游标。
+  - **己方 MR**（`self-fix` / `self-skill`）：复用发起该 MR 的既有话题 Session 持续跟踪 CI 结果（`ci-failed` 在 `maxAutoFixAttempts` 上限内自动修并登记 `ownPushedSha`）与人类评审意见；遇到合并冲突时禁止自动 rebase/强推，如有配置 `mrReview.feishuChatId` 则发飞书告警卡通知人工介入。
+- **自触发防护与多重熔断**：缓存代码主机当前机器人账号（`currentBotUser`）及 `ownPushedShas`（Bounded LRU），入口层硬性过滤机器人自身的评论与提交；设置单 MR 每日上限（`dailyMrTurnLimit: 12`）、单仓库每小时上限（`repoHourlyTurnLimit: 30`）与自修次数上限（`maxAutoFixAttempts: 2`），触限触发熔断并在设置 `mrReview.feishuChatId` 时发飞书告警，可在面板「运行总览」一键重置。已关闭/合并的 MR 克隆工作区保留 14 天、表记录保留 60 天后自动清理。
+
+## 已知问题库与飞书多维表格同步
+
+本地 `dsh_supervisor` 存储域的 `issues` 表通过 `IssueMemory`（与类型隔离的 `IssuesTable`）作为主存储永久沉淀各应用发现的故障模式；配置 `issueSync.bitableUrl` 后，后台 `IssueBitableSyncer` 通过 `dsh_channels` 的 `feishuBitable` v1（`ctx.get('feishuBitable')`）实现**零阻塞双向异步同步**：
+
+- **严格列属权边界（16 列标准 Schema）**：
+  - **AI 写入列（13 列）**：`问题ID`（必填文本主键，其余 12 列可选）、`应用`、`标题`、`匹配特征`、`排除特征`、`AI 诊断结论`、`AI 状态`、`解决建议`、`首次发现`、`最近出现`、`示例报告`、`最新报告`、`修复 MR`。本地写入 `IssueMemory` 后在 2 秒防抖窗口触发后台推送，且采用 `expectedAiFingerprint` 并发守卫，推送期间发生的新诊断更新不会丢失 `syncDirty` 标记。
+  - **人工拥有列（3 列）**：`人工确认结论`、`人工状态`、`负责人`。**同步器物理禁止写操作触碰人工列**；每次周期（`syncIntervalMs`，默认 5 分钟）或手动触发同步时按 `问题ID` 拉回人工纠偏结果写入本地 `IssueMemory`，在下一次同类日志分析时优先透传给 `log-supervisor` 与 `supervisor_issue_search` 供核验复用。
+- **故障隔离与自检**：飞书断连、未配多维表格或表结构缺失时，本地 `IssueMemory` 与日志诊断零受阻，恢复连通后自动补同步；支持在面板「已知问题库」执行 **「检查字段映射」**（`POST /logalyze/issues/check`）查看 16 列逐列匹配、类型兼容与只读列告警，或手动点击 **「立即同步」**（`POST /logalyze/issues/sync`）。
+
 ## 通过飞书使用
 
-在飞书里使用 `/logalyze` 不需要观象与飞书渠道插件之间的任何接口：渠道插件把不在自己命令表中的 `/` 开头消息作为普通 prompt 交给 dsh，dsh 识别 `/logalyze` 后展开入口 SKILL。飞书附件的宿主路径会出现在消息里，入口 SKILL 会把它作为日志路径派发。只有[日志平台分析接口](#日志平台分析接口)经渠道插件的 `feishuTopics` 服务发卡开话题；观象在 `src/deps/topics-contract.ts` 本地声明它用到的服务接口，不依赖渠道插件的包，运行时按服务名查找，没有加载时其余功能不受影响。写操作的授权和提交身份同样只经 `access/authorize`、`repo/commit-trailers` 两个中立事件由渠道插件回答（见[SKILL 改进](#skill-改进)）。
+在飞书里使用 `/logalyze` 不需要与飞书渠道插件之间的耦合依赖：渠道插件把不在自己命令表中的 `/` 开头消息作为普通 prompt 交给 dsh，dsh 识别 `/logalyze` 后展开入口 SKILL。智能监管均以运行时按服务名动态查找的方式消费 `dsh_channels` 提供的公开契约（定义均本地镜像在 `src/deps/`）：
+
+- **`feishuTopics`（v3）**：用于 `/open-api/logalyze` 分析接口、`LogSupervisor` 自动批次播报/总结卡，以及 `MrSupervisor` 告警通知。
+- **`feishuActions`（v1）**：用于观象在分析结束卡片挂出非阻塞后续按钮（如 `[🔧 修复代码并提 MR]` / `[📚 改进分析流程 / 沉淀案例]`），并在点击后按渠道权限判权唤醒原 Session。
+- **`feishuBitable`（v1）**：用于 `IssueBitableSyncer` 后台读写用户配置的飞书多维表格（支持 `/base/<token>` 与 `/wiki/<node_token>`），与渠道 `feishu_wiki_base_edit` 共用表级写队列。
+- **权限与提交身份事件**：写操作授权与 Git 提交署名经 `access/authorize`、`repo/commit-trailers` 中立事件由渠道插件回答，不直接耦合渠道实现。
 
 ## 开发
 
@@ -332,33 +385,36 @@ pnpm check        # 类型检查（Host 与 Client）+ 单元测试 + 构建 + �
 
 | 路径 | 内容 |
 |---|---|
-| `src/index.ts` | Cordis 插件入口（`name = 'logalyze'`） |
-| `src/service.ts` | 组装共享监管运行时、入口 SKILL、工具与面板状态 |
+| `src/index.ts` | Cordis 插件入口（`name = 'logalyze'`）与跨插件服务动态监听 |
+| `src/service.ts` | 组装共享监管运行时、观象/审微编排器、问题库同步器、入口 SKILL 与工具 |
 | `src/runtime/` | 共享监管运行时：`dsh_supervisor` 7 张状态表、并发池、键控防抖器、滑动窗口熔断器、单调修订 Outbox |
-| `src/deps/` | 跨插件窄契约：`dshRepos`（v7/v8）、`feishuTopics`、`feishuActions`（v1）声明与查找 |
+| `src/deps/` | 跨插件窄契约：`dshRepos`（v7/v8）、`feishuTopics`（v3）、`feishuActions`（v1）、`feishuBitable`（v1）声明与查找 |
 | `src/apps/` | 应用注册表、一次性旧元数据迁移、跟随 dsh-repo 仓库清单（`log-analysis` 与 `mr-review`） |
+| `src/log/` | **观象域**：`LogSupervisor` 轮询/攒批、`unpack` 安全解压、`supervisor_log_*` 工具、提示词与报告渲染 |
+| `src/mr/` | **审微域**：`MrSupervisor` 增量轮询/防抖、信号去重与自滤、`supervisor_mr_*` 工具与工作区管理 |
+| `src/issues/` | `IssueMemory` 本地已知问题库检索与 `IssueBitableSyncer` 飞书多维表格双向同步器 |
 | `src/runs/` | 运行目录、日志准入与下载、子 Agent 运行、工作区准备、改动检查、推送与合并请求 |
-| `src/dispatch/` | 派发工具与分析子 Agent 首条消息 |
+| `src/dispatch/` | `/logalyze` 传统派发工具与分析子 Agent 首条消息 |
 | `src/improve/` | SKILL 查看工具、SKILL 不足记录、改进工具与改进子 Agent 首条消息 |
-| `src/skill/` | `/logalyze` 入口 SKILL、快照可选 SKILL 发现封装与随包指导 SKILL（`/logalyze-kit`、`/logalyze-improve`） |
-| `skills/logalyze-kit/` | 应用接入指南 SKILL 正文 |
-| `skills/logalyze-improve/` | SKILL 改进指南正文 |
-| `src/analyze/` | 日志平台分析接口：请求校验、令牌、到 `feishuTopics` 的转换 |
+| `src/skill/` | `/logalyze` 入口 SKILL、快照可选 SKILL 发现封装与 4 个随包指南（`logalyze-kit`、`logalyze-improve`、`log-supervisor`、`mr-reviewer`） |
+| `skills/` | `logalyze-kit`、`logalyze-improve`、`log-supervisor`、`mr-reviewer` SKILL 正文 |
+| `src/analyze/` | 日志平台分析接口 `/open-api/logalyze`：请求校验、令牌、到 `feishuTopics` 的转换 |
+| `src/platform/` | 日志平台开放 API OAuth2 客户端（令牌缓存、元数据查询、下载签发与修订上传） |
 | `src/report/` | 报告回传：轮次记录、每份日志的 `report.md` 生成、文件清单、修订上传、持久化 |
-| `src/settings/` | 面板契约、应用元数据 `applications.json`、生效设置与覆盖文件、HTTP 路由 |
-| `src/util/` | 取消、文件读写、HTTP 等通用小工具 |
-| `src/client/` | 左侧栏「智能监管」入口与设置页面（含可编辑描述与可删除触发别名标签） |
-| `docs/supervisor/` | AI 原生智能监管中心（观象 + 审微）架构与设计规格 |
+| `src/settings/` | 面板契约、应用元数据 `applications.json`、生效设置与覆盖文件、HTTP 路由（含 `/logalyze/issues/*`） |
+| `src/client/` | 左侧栏「智能监管」5 标签页整页面板（运行总览 / 应用与日志监管 / MR 自动评审 / 已知问题库 / 模型与高级） |
+| `docs/supervisor/` | AI 原生智能监管中心（观象 + 审微）架构、跨插件契约与存储运维设计规格 |
 | `examples/order-service/` | 示例应用仓库 |
 
 ## 路线图
 
-- [x] 确定插件结构与 bundle 打包方式（分体派发初版）
-- [ ] 按日志中的版本号切换应用代码版本
-- [ ] 观：通用日志解析与异常检测工具，供各应用 SKILL 复用
-- [ ] 象：事件关联与问题全貌
-- [ ] 推演：Agent 驱动的根因分析
-- [ ] 使用文档与示例
+- [x] 插件结构与 bundle 打包方式（保持 `dsh-logalyze` / `logalyze` 兼容演进）
+- [x] **M1**：跨插件底座原语（`feishuActions` v1、`dshRepos` v8）与 `dsh_supervisor` 共享运行时骨架
+- [x] **M2（审微）**：代码仓库 MR 自动初审、Push 增量重审、讨论回复/Resolve 与己方 MR CI 跟进
+- [x] **M3（观象）**：日志平台自动轮询攒批、安全解压、仓内共享克隆排查、Outbox 报告回传与「修代码 / 改 SKILL」闭环
+- [x] **M4**：本地 `IssueMemory` ↔ 飞书多维表格双向异步同步与 Web「智能监管」5 标签页统一面板
+- [ ] 可选进阶：按日志版本号（`swVersion` / `componentVersion`）自动切换参考代码 Tag
+- [ ] 可选进阶：更多日志平台 / 代码托管适配器与多维度统计趋势看板
 
 ## 许可证
 

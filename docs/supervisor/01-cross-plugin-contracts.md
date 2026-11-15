@@ -1,6 +1,6 @@
-# 01. 跨插件契约设计：`dsh_channels` 通用动作提议 & `dsh-repo` v8 评审感知
+# 01. 跨插件契约设计：`dsh_channels`（`feishuActions` / `feishuBitable`）& `dsh-repo` v8 评审感知
 
-本文档定义 `dsh-supervisor` 所依赖的两项跨插件底层公开契约。两项契约均保持**领域无关（Domain-Agnostic）**，不引入任何耦合“日志分析”或特定业务流程的私有概念。
+本文档定义 `dsh-supervisor`（落地于 `dsh-logalyze`）所依赖的三项跨插件底层公开契约。全部契约均保持**领域无关（Domain-Agnostic）**，不引入任何耦合“日志分析”或特定业务流程的私有概念。
 
 ---
 
@@ -196,3 +196,52 @@ export interface MrReviewResult {
 | **批量提交行级评审 (`mrReview`)** | `pulls.createReview({ commit_id, event: 'COMMENT'\|'APPROVE'\|'REQUEST_CHANGES', body, comments: [{ path, line, side: 'RIGHT'\|'LEFT', body }] })` | 逐条 `MergeRequestDiscussions.create`（携带 `position: { position_type: 'text', base_sha, start_sha, head_sha, new_path, old_path, new_line, old_line }`，先从 MR `diff_refs` 读取三元组 SHA）+ 总评 Note；`approve` 调 `MergeRequestApprovals.approve` |
 | **回复讨论线程 (`mrDiscussionReply`)** | `pulls.createReplyForReviewComment` 或 GraphQL `addPullRequestReviewThreadReply` | `MergeRequestDiscussions.addNote(projectId, mrIid, discussionId, body)` |
 | **解决/重开线程 (`mrDiscussionResolve`)** | GraphQL `resolveReviewThread` / `unresolveReviewThread`（传入 `threadId`） | `MergeRequestDiscussions.resolve(projectId, mrIid, discussionId, resolved)` |
+
+---
+
+## Part C：`dsh_channels` 通用多维表格读写契约（`feishuBitable` v1）
+
+### 1. 设计目标
+
+`dsh_channels` 既有的 `feishu_wiki_base_read` / `feishu_wiki_base_edit` 是面向对话模型的工具，写操作会按会话路线触发 HITL 授权卡且受 `wikiRoots` 约束；而「已知问题库 ↔ 飞书多维表格」等后台同步任务需要在无人工回合参与时按管理员配置的 URL 进行幂等读写。因此新增领域无关的 `feishuBitable` v1 服务（`ctx.get('feishuBitable')`），直接使用机器人应用身份经飞书 `base/v3` 与 `wiki/v2` 接口读写。
+
+### 2. 服务契约：`FeishuBitableService`（`ctx.get('feishuBitable')`）
+
+```ts
+export type FeishuBitableServiceName = 'feishuBitable'
+export type FeishuBitableVersion = 1
+
+export interface BitableTargetInput {
+  readonly url: string
+  readonly table?: string
+}
+
+export type BitableFailureCode =
+  | 'invalid-target'
+  | 'not-connected'
+  | 'ambiguous-table'
+  | 'table-not-found'
+  | 'permission-denied'
+  | 'not-found'
+  | 'rate-limited'
+  | 'api-error'
+
+export type BitableResult<T> =
+  | ({ readonly ok: true } & T)
+  | { readonly ok: false; readonly code: BitableFailureCode; readonly message: string }
+
+export interface FeishuBitableService {
+  readonly version: FeishuBitableVersion
+  inspectTable(target: BitableTargetInput): Promise<BitableResult<BitableTableSchema>>
+  listRecords(input: BitableListRecordsInput): Promise<BitableResult<BitableRecordPage>>
+  createRecords(input: BitableCreateRecordsInput): Promise<BitableResult<{ readonly baseToken: string; readonly tableId: string; readonly recordIds: readonly string[] }>>
+  updateRecords(input: BitableUpdateRecordsInput): Promise<BitableResult<{ readonly baseToken: string; readonly tableId: string; readonly ignoredFields: readonly string[] }>>
+  onChange?(listener: () => void): () => void
+}
+```
+
+### 3. 目标解析、共享写锁与并发安全
+
+1. **URL 与数据表解析**：支持 `https://<tenant>.feishu.cn/base/<token>`、`/bitable/<token>` 与知识库内嵌表 `/wiki/<node_token>`；`/wiki/` 节点经 `wiki.getNode(..., 'wiki')` 解析并缓存（最多 64 项）为 `objToken`（仅接受 `objType === 'bitable'`）。`table`（优先）或 URL 查询参数 `?table=<tableId>` 可按 `tableId` 或精确表名匹配；单表时省略自动选中，多表且未指定时返回 `ambiguous-table`。
+2. **表级共享写锁**：`base/v3` 写接口不支持同表并发写。`dsh_channels` 在 `base-api.ts` 中提供按 `<baseToken>:<tableId>` 维度的共享串行队列（`withBaseTableWriteLock`），确保 `feishuBitable` 的 `createRecords` / `updateRecords` 与模型工具 `feishu_wiki_base_edit` 严禁交错并发写同一张表。
+3. **批量与重连语义**：单批新增/更新上限均为 `200` 条记录；通道连接状态变化时经 `onChange` 通知订阅方，卸载/重载前通过 `drain()` 等待在途请求结束。所需飞书细分权限为 `base:table:read`、`base:field:read`、`base:record:read`、`base:record:create`、`base:record:update`（`/wiki/` 链接另需 `wiki:wiki:readonly` 或 `wiki:wiki`）。

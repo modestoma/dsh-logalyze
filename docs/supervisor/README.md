@@ -10,7 +10,7 @@
 | 文档 | 内容范围 |
 | :--- | :--- |
 | **[README.md](./README.md)**（本文） | 顶层愿景、五大架构准则、三仓职责边界、端到端业务闭环与分阶段里程碑（Roadmap） |
-| **[01-cross-plugin-contracts.md](./01-cross-plugin-contracts.md)** | 跨插件契约规范：`dsh_channels` 通用非阻塞动作提议卡（`feishuActions`）与 `dsh-repo` v8 行级评审/增量感知接口 |
+| **[01-cross-plugin-contracts.md](./01-cross-plugin-contracts.md)** | 跨插件契约规范：`dsh_channels` 通用动作提议卡（`feishuActions` v1）与多维表格读写（`feishuBitable` v1）、`dsh-repo` v8 行级评审/增量感知接口 |
 | **[02-log-supervision.md](./02-log-supervision.md)** | **日志监管域（观象）**：日志平台轮询聚合、主 Agent 诊断、结论自动回传、已知问题库，以及主动提议「修代码 / 改 SKILL」闭环 |
 | **[03-mr-supervision.md](./03-mr-supervision.md)** | **代码评审域（审微）**：仓库级新 MR 自动发现、同 Session 有状态初审、新 Push 增量 Diff 重审、新评论互动与自产 MR 修复闭环 |
 | **[04-storage-and-operations.md](./04-storage-and-operations.md)** | 持久化存储表结构、沙箱与防风暴熔断护栏、Web「智能监管」面板设计、以及从 `dsh-logalyze` 演进为 `dsh-supervisor` 的代码重构清单 |
@@ -83,9 +83,9 @@ flowchart TB
 
 | 仓库 | 演进策略 | 核心职责边界 |
 | :--- | :--- | :--- |
-| **`dsh_channels`** | **保持纯渠道 + 新增 1 个通用原语** | 保持现有飞书长连接、路由、附件 v2、`feishuTopics` v3、`ReadFence` 与 `access/authorize` 不变；**仅新增通用的非阻塞动作提议卡（`feishuActions` v1）**，支持任意会话在回合末挂出持久化操作按钮并在点击后回调唤醒该会话。 |
+| **`dsh_channels`** | **保持纯渠道 + 新增 2 个通用原语** | 保持现有飞书长连接、路由、附件 v2、`feishuTopics` v3、`ReadFence` 与 `access/authorize` 不变；**新增通用非阻塞动作提议卡（`feishuActions` v1）与服务端多维表格读写（`feishuBitable` v1）**，分别支持回合末持久化操作按钮与跨插件无状态表格读写。 |
 | **`dsh-repo`** | **契约升级至 v8（补齐行级评审能力）** | 保持现有主机管理、仓库清单、裸镜像、本地工作区与 Git 代理不变；**补齐 GitHub / GitLab 双端 PR/MR 行级评审（Inline Review Comments）与讨论线程读取/回复/Resolve API**，并为 `mrList` 补充按更新时间排序筛选以支撑高效仓库级增量扫描。 |
-| **`dsh-supervisor`**<br/>*(原 `dsh-logalyze` 演进)* | **合并演进为统一监管中心** | 向 `dsh-repo` 注册「日志分析」与「MR 自动评审」两项仓库级功能开关；内含共享监管底座（调度/防抖/熔断/Outbox）、**日志监管域（观象）**、**MR 监管域（审微）**、闭环修复与 SKILL 沉淀动作编排，以及统一的 Web 侧栏「智能监管」管理面板。 |
+| **`dsh-supervisor`**<br/>*(保留 npm 包名 `dsh-logalyze`、Cordis `id: logalyze` 就地演进)* | **就地演进为统一监管中心** | 向 `dsh-repo` 注册「日志分析」与「MR 自动评审」两项仓库级功能开关；内含共享监管底座（`dsh_supervisor` 存储域/并发池/防抖/熔断/Outbox）、**日志监管域（观象）**、**MR 监管域（审微）**、闭环修复与 SKILL 沉淀动作编排、已知问题库↔多维表格同步器，以及统一的 Web 侧栏「智能监管」5 标签页管理面板。 |
 
 ---
 
@@ -101,7 +101,7 @@ flowchart LR
     M3 --> M4["M4: 多维表格双向同步与统一监管面板<br/>(Issue 看板同步 + 熔断/队列可观测 UI)"]
 ```
 
-### Milestone 1：跨插件底座原语与 `dsh-supervisor` 骨架
+### Milestone 1：跨插件底座原语与 `dsh-supervisor` 骨架（✅ 已在 `dev` 合入）
 - **涉及仓库**：`dsh_channels`、`dsh-repo`、`dsh-supervisor`
 - **交付内容**：
   1. `dsh_channels` 实现 `feishuActions` v1 服务与 `propose_actions` 面向模型工具，支持持久化按钮渲染、权限校验（`chat` / `code-write` / `admin`）、重启恢复与唤醒投递。
@@ -111,7 +111,7 @@ flowchart LR
   - 任意测试 Session 调用 `propose_actions` 可在飞书生成按钮，重启 DSH 后点击按钮仍能校验权限并唤醒原 Session，重复点击幂等拦截。
   - `dsh-repo` 单测与契约验证覆盖 GitHub / GitLab 行级评论创建、回复与 Resolve。
 
-### Milestone 2：代码仓库 MR 自动初审与增量重审闭环（审微）
+### Milestone 2：代码仓库 MR 自动初审与增量重审闭环（审微）（✅ 已在 `dev` 合入）
 - **涉及仓库**：`dsh-supervisor`（依赖 M1 的 `dsh-repo` v8）
 - **交付内容**：
   1. 向 `dsh-repo` 注册 `mr-review`（「MR 自动评审」）仓库功能开关；实现 `RepoMrWatcher`（增量扫描新开 MR、Push 与新讨论，90s 防抖窗口，严格过滤机器人自身账号动作）。
@@ -120,7 +120,7 @@ flowchart LR
 - **验收标准（AC-M2）**：
   - 在已开启「MR 自动评审」的仓库新建 MR，自动触发初审并落行级评论；连续推送 2 个修复提交后防抖合并触发一次同 Session 重审，已修复项被自动 Resolve、未修项继续跟进，机器人自身评论绝不触发自激循环。
 
-### Milestone 3：日志平台自动监管 + 主动询问「修代码 / 改 SKILL」大闭环（观象）
+### Milestone 3：日志平台自动监管 + 主动询问「修代码 / 改 SKILL」大闭环（观象）（✅ 已在 `dev` 合入）
 - **涉及仓库**：`dsh-supervisor`
 - **交付内容**：
   1. 日志平台轮询器（`LogPoller`）与批次聚合调度器（按 `product + component + error_code` 凑满 N 条或超时 T 分钟发车，持久化水位线与单应用熔断）。
@@ -133,7 +133,7 @@ flowchart LR
   - 平台新归档日志在无人干预下完成拉取、分析、平台报告回传与飞书通知；飞书无平台配置时手动上传 ZIP 同样走通分析与追问。
   - 点击 `[🔧 修复代码并提 MR]` 与 `[📚 改进 SKILL / 沉淀案例]` 均能在同一会话上下文中产出真实可评审的 PR/MR，且后续在该 MR 下的评论能继续唤醒跟进。
 
-### Milestone 4：飞书多维表格双向同步与 Web 统一监管面板
+### Milestone 4：飞书多维表格双向同步与 Web 统一监管面板（✅ 已在 `dev` 合入）
 - **涉及仓库**：`dsh-supervisor`、`dsh_channels`（若需窄化服务端表格读写 helper）
 - **交付内容**：
   1. 本地 `IssueMemory` 与飞书多维表格后台双向同步器：自动归档/更新同类问题行（稳定 `issueId`），读取人工填写的「人工确认/纠正」注入下次同类分析上下文，绝不覆盖人工列。
