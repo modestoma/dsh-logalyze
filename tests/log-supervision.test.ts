@@ -1370,7 +1370,69 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     expect(secondSubmit.revision).toBe(1)
     expect(domain.logTasks.get(prepRes.taskId)?.revisions).toHaveLength(1)
     expect(domain.logTasks.get(secondPrep.taskId)?.revisions).toHaveLength(1)
-  }, 20_000)
+
+    // 8. 4576880036: Verify workspace repository ownership and cross-task isolation before pushing MR.
+    await writeFile(join(secondPrep.workDir, 'repos', 'payment-service', 'src', 'pay.ts'), 'export const pay = false\n')
+    const pushesBefore = h.fakeRepos.pushes.length
+
+    await expect(pushMr.execute({
+      kind: 'fix_code',
+      taskId: prepRes.taskId,
+      workspaceDir: `tasks/${secondPrep.taskId}/repos/payment-service`,
+      commitMessage: 'fix(pay): wrong repo push',
+      mrTitle: 'fix(pay): wrong repo',
+    }, h.toolExecCtx(feishuSessionId, workDir, 'call-wrong-descendant'))).rejects.toThrow(/归属仓库.*不一致/)
+    expect(h.fakeRepos.pushes).toHaveLength(pushesBefore)
+    expect(domain.issues.get('ISS-order-service-0001')?.fixMrUrl).toBe(fixPush.mrUrl)
+
+    const directPayWs = join(workDir, 'repos', 'payment-service')
+    await h.fakeRepos.workspaceCreate({
+      repo: h.secondOrigin!,
+      path: directPayWs,
+      branch: 'fix/direct-pay-ws',
+    })
+    await writeFile(join(directPayWs, 'src', 'pay.ts'), 'export const pay = "direct"\n')
+    await expect(pushMr.execute({
+      kind: 'fix_code',
+      taskId: prepRes.taskId,
+      workspaceDir: 'repos/payment-service',
+      commitMessage: 'fix(pay): direct wrong repo',
+      mrTitle: 'fix(pay): direct wrong repo',
+    }, h.toolExecCtx(feishuSessionId, workDir, 'call-wrong-direct'))).rejects.toThrow(/归属仓库.*不一致/)
+    expect(h.fakeRepos.pushes).toHaveLength(pushesBefore)
+
+    const thirdPrep = await prepare.execute({
+      app: 'order-service',
+      logs: [{ path: localZip }],
+    }, h.toolExecCtx(feishuSessionId, workDir, 'c-prep-third')) as {
+      readonly taskId: string
+      readonly workDir: string
+    }
+    expect(thirdPrep.workDir).toBe(join(workDir, 'tasks', thirdPrep.taskId))
+    await writeFile(join(thirdPrep.workDir, 'repos', 'order-service', 'src', 'handler.ts'), 'export function handleOrder() { return "child" }\n')
+    await expect(pushMr.execute({
+      kind: 'fix_code',
+      taskId: prepRes.taskId,
+      workspaceDir: `tasks/${thirdPrep.taskId}/repos/order-service`,
+      commitMessage: 'fix(order): cross-task push',
+      mrTitle: 'fix(order): cross-task',
+    }, h.toolExecCtx(feishuSessionId, workDir, 'call-cross-task'))).rejects.toThrow(/隔离任务目录/)
+    expect(h.fakeRepos.pushes).toHaveLength(pushesBefore)
+
+    const payPush = await pushMr.execute({
+      kind: 'fix_code',
+      taskId: secondPrep.taskId,
+      commitMessage: 'fix(pay): handle gateway timeout',
+      mrTitle: 'fix(pay): timeout retry',
+    }, h.toolExecCtx(feishuSessionId, secondPrep.workDir, 'call-pay-fix')) as {
+      readonly repo: string
+      readonly mrNumber: number
+      readonly mrSupervisionRegistered: boolean
+    }
+    expect(payPush.repo).toBe(h.secondOrigin)
+    expect(payPush.mrSupervisionRegistered).toBe(true)
+    expect((await h.service.state()).mrSupervision?.mrs.some(m => m.repo === h.secondOrigin && m.mrNumber === payPush.mrNumber)).toBe(true)
+  }, 30_000)
 
   it('launches Feishu topic immediately under topic-on-start deliveryMode and prevents symlink follow in unpack', async () => {
     const h = await createFullHarness({

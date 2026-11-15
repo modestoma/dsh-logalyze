@@ -273,6 +273,10 @@ async function ensureAppWorkspace(params: {
 }): Promise<string> {
   const { repos, repoDir, app, taskId, mode, exec } = params
   if (await pathExists(join(repoDir, '.git'))) {
+    const status = await repos.workspaceStatus({ path: repoDir, signal: exec.signal })
+    if (status.workspace.repo !== app.url) {
+      throw new Error(`工作区 ${repoDir} 归属仓库 ${status.workspace.repo}，与目标应用 ${app.app.id} 的仓库 ${app.url} 不一致`)
+    }
     return repoDir
   }
   const dirEntries = await readdir(repoDir).catch(() => [] as string[])
@@ -303,6 +307,7 @@ async function resolveExistingEvidencePath(
 ): Promise<string | undefined> {
   const trimmed = source.trim()
   if (trimmed === '' || trimmed.includes('\0')) return undefined
+  const childTasksDir = join(workDir, 'tasks')
   const candidates: string[] = []
   if (isAbsolute(trimmed)) {
     candidates.push(resolve(trimmed))
@@ -314,7 +319,7 @@ async function resolveExistingEvidencePath(
     }
   }
   for (const candidate of candidates) {
-    if (!isInside(candidate, workDir)) continue
+    if (!isInside(candidate, workDir) || isInside(candidate, childTasksDir)) continue
     try {
       const info = await lstat(candidate)
       if (info.isFile() && !info.isSymbolicLink()) return candidate
@@ -853,7 +858,7 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
           throw new Error(`找不到日志监管任务 "${initialBound.taskId}"`)
         }
         const { taskId, task } = bound
-        const workDir = task.workDir ?? workspaceRootOf(exec, runtime)
+        const workDir = task.workDir !== undefined && task.workDir !== '' ? resolve(task.workDir) : workspaceRootOf(exec, runtime)
         const app = runtime.readyApp(task.appId)
         const slug = appSlugOf(app.app.id)
 
@@ -876,6 +881,9 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
 
         // 2. Validate evidence presence & real file existence inside <workDir>
         const reposDir = join(workDir, 'repos')
+        const diagnosisRepoDir = join(reposDir, slug)
+        const knowledgeRepoDir = join(reposDir, `${slug}-knowledge`)
+        const childTasksDir = join(workDir, 'tasks')
         for (const item of args.items) {
           if (item.status === 'diagnosed' && item.evidences.length === 0) {
             throw new Error(`槽位 ${item.ref} 标记为 diagnosed，必须提供至少一条可追溯的 evidences`)
@@ -886,7 +894,7 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
             if (resolved === undefined) {
               throw new Error(`槽位 ${item.ref} 的证据路径 "${ev.source}" 在工作区 "${workDir}" 中不存在或非普通文件；请填写真实可读的文件路径`)
             }
-            if (isInside(resolved, reposDir)) {
+            if (isInside(resolved, diagnosisRepoDir) || isInside(resolved, knowledgeRepoDir)) {
               hasRepoEvidence = true
             }
           }
@@ -921,7 +929,7 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
           ]
           let srcPath: string | undefined
           for (const candidate of candidates) {
-            if (!isInside(candidate, workDir)) continue
+            if (!isInside(candidate, workDir) || isInside(candidate, childTasksDir)) continue
             const info = await lstat(candidate).catch(() => undefined)
             if (info?.isFile() && !info.isSymbolicLink()) {
               srcPath = candidate
@@ -1132,7 +1140,7 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
           throw new Error(`应用 ${app.app.id} 的代码仓库为只读权限，禁止推送代码修复或 SKILL 改进`)
         }
 
-        const workDir = task.workDir ?? workspaceRootOf(exec, runtime)
+        const workDir = task.workDir !== undefined && task.workDir !== '' ? resolve(task.workDir) : workspaceRootOf(exec, runtime)
         const slug = appSlugOf(app.app.id)
         const expectedRepoDir = join(workDir, 'repos', args.kind === 'improve_skill' ? `${slug}-knowledge` : slug)
         let workspacePath = args.workspaceDir !== undefined ? resolve(workDir, args.workspaceDir) : expectedRepoDir
@@ -1156,6 +1164,17 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
 
         const repos = runtime.requireRepos()
         const status = await repos.workspaceStatus({ path: workspacePath, signal: exec.signal })
+        if (status.workspace.repo !== app.url) {
+          throw new Error(
+            `工作区 ${workspacePath} 归属仓库 ${status.workspace.repo}，与当前任务目标应用 ${app.app.id} 的仓库 ${app.url} 不一致`,
+          )
+        }
+        const childTasksDir = join(workDir, 'tasks')
+        if (isInside(workspacePath, childTasksDir)) {
+          throw new Error(
+            `工作区路径 ${workspacePath} 位于隔离任务目录 ${childTasksDir} 之下，不能跨任务混用工作区；请切换对应的 taskId 或使用当前任务的工作区`,
+          )
+        }
         if (status.files.length === 0) {
           throw new Error(`工作区 ${workspacePath} 相对于基准提交没有改动，无需推送`)
         }
@@ -1192,6 +1211,7 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
 
         let mrSupervisionRegistered = false
         if (mr !== undefined && runtime.registerSelfMr !== undefined) {
+          const targetBranch = status.workspace.base !== '' ? status.workspace.base : app.branch
           await runtime.registerSelfMr({
             repo: app.url,
             mrNumber: mr.number,
@@ -1204,7 +1224,7 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
             title: args.mrTitle,
             url: mr.webUrl,
             sourceBranch: pushed.branch,
-            ...(app.branch === undefined ? {} : { targetBranch: app.branch }),
+            ...(targetBranch === undefined ? {} : { targetBranch }),
           })
           mrSupervisionRegistered = true
         }
