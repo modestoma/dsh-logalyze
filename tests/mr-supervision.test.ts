@@ -257,6 +257,7 @@ async function createServiceHarness(options: {
   readonly clock?: () => number
   readonly mrConfig?: Record<string, unknown>
   readonly driver: MrSessionDriver
+  readonly feishuTopics?: unknown
 }) {
   const routes = new Map<string, (req: IncomingMessage, res: ServerResponse) => void | Promise<void>>()
   const tools = new Map<string, { definition: ToolDefinition<unknown>; when?: (context: ToolActivationContext) => boolean | Promise<boolean> }>()
@@ -288,6 +289,7 @@ async function createServiceHarness(options: {
       if (name === DSH_REPOS_SERVICE) return dshRepos
       if (name === 'webServer') return webServer
       if (name === 'connection') return connection
+      if (name === 'feishuTopics') return options.feishuTopics
       return undefined
     },
     on: () => () => {},
@@ -2433,5 +2435,79 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     } finally {
       process.off('unhandledRejection', onUnhandled)
     }
+  })
+
+  it('injects mrReview.customInstructions into MR prompt and sends breaker alert to mrReview.feishuChatId', async () => {
+    const { dir, cleanup } = await tempDir('logalyze-mr-custom-alert-')
+    cleanups.push(cleanup)
+    const origin = await createAppRepo(join(dir, 'repo'))
+    const fakeV8 = new FakeReposV8(join(dir, 'repos'))
+    fakeV8.base.catalog = [{ id: 'r1', url: origin, base: 'main', access: 'write', features: [{ id: 'mr-review' }] }]
+
+    const prompts: string[] = []
+    const driver: MrSessionDriver = {
+      async runTurn(req) {
+        prompts.push(req.prompt)
+        const sid = req.existingSessionId ?? `s-custom-${prompts.length}`
+        await req.onSessionBound?.(sid)
+        return { sessionId: sid }
+      },
+    }
+
+    const launchCalls: Array<Record<string, unknown>> = []
+    const fakeTopics = {
+      version: 3 as const,
+      launch: async (spec: Record<string, unknown>) => {
+        launchCalls.push(spec)
+        return {
+          created: true,
+          key: spec.key,
+          state: { status: 'running', sessionId: 'topic-alert-1', chatId: spec.chatId },
+        }
+      },
+      state: async () => undefined,
+      launchKeyOf: async () => undefined,
+      updateLinks: async () => false,
+    }
+
+    let clockMs = 5_000_000
+    const h = await createServiceHarness({
+      fakeV8,
+      dir,
+      clock: () => clockMs,
+      mrConfig: {
+        debounceMs: 0,
+        dailyMrTurnLimit: 1,
+        customInstructions: '禁止跳过边界空值测试，优先检查并发竞态',
+        feishuChatId: 'oc_mr_alert_chat',
+      },
+      driver,
+      feishuTopics: fakeTopics,
+    })
+    cleanups.push(h.dispose)
+
+    const mr31 = fakeV8.upsertMr(origin, 31, { headSha: 'sha-a', updatedAt: '2026-11-01T04:00:00Z' })
+    const supervisor = h.service.mrSupervisorInstance()!
+
+    await supervisor.pollNow()
+    await supervisor.flushDebouncedDue()
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]).toContain('### 团队附加评审要求')
+    expect(prompts[0]).toContain('禁止跳过边界空值测试，优先检查并发竞态')
+    expect(launchCalls).toHaveLength(0)
+
+    mr31.info = { ...mr31.info, headSha: 'sha-b', updatedAt: '2026-11-01T04:01:00Z' }
+    await supervisor.pollNow()
+    await supervisor.flushDebouncedDue()
+    expect(prompts).toHaveLength(1)
+
+    await vi.waitFor(() => {
+      expect(launchCalls).toHaveLength(1)
+    })
+    expect(launchCalls[0]).toMatchObject({
+      chatId: 'oc_mr_alert_chat',
+      requester: { kind: 'external', label: '审微告警' },
+    })
+    expect(String(launchCalls[0]!.key)).toMatch(/^mr-alert:[0-9a-f]{24}$/)
   })
 })

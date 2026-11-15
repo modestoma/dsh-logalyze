@@ -1399,6 +1399,7 @@ export class MrSupervisor implements MrToolsRuntime {
         status,
         signals: signalsToRun,
         maxAutoFixAttempts: latestSettings.maxAutoFixAttempts,
+        ...(latestSettings.customInstructions === undefined ? {} : { customInstructions: latestSettings.customInstructions }),
       })
 
       const result = await this.deps.sessionDriver.runTurn({

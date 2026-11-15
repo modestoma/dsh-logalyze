@@ -11,7 +11,7 @@ import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
 import type { LogalyzeService } from '../service.ts'
 import { HttpError, mediaTypeOf, readBody, sendJson } from '../util/http.ts'
 import { SettingsError } from './controller.ts'
-import { APPLICATION_ROUTE, BREAKER_RESET_ROUTE, LOG_WATERMARK_ROUTE, OUTBOX_RETRY_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from './contract.ts'
+import { APPLICATION_ROUTE, BREAKER_RESET_ROUTE, ISSUE_CHECK_ROUTE, ISSUE_SYNC_ROUTE, LOG_WATERMARK_ROUTE, OUTBOX_RETRY_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
@@ -146,6 +146,20 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       path: OUTBOX_RETRY_ROUTE,
       handler: guarded(gate, ['POST'], async (req, res) => {
         sendJson(res, 200, { ok: true, state: await service.retryOutboxDead(await readJsonBody(req)) })
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: ISSUE_SYNC_ROUTE,
+      handler: guarded(gate, ['POST'], async (_req, res) => {
+        sendJson(res, 200, { ok: true, state: await service.syncIssuesNow() })
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: ISSUE_CHECK_ROUTE,
+      handler: guarded(gate, ['POST'], async (req, res) => {
+        sendJson(res, 200, { ok: true, state: await service.checkIssuesBitable(await readJsonBody(req)) })
       }),
     }),
   ]

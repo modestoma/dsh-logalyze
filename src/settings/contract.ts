@@ -21,6 +21,10 @@ export const BREAKER_RESET_ROUTE = '/logalyze/breakers/reset'
 export const LOG_WATERMARK_ROUTE = '/logalyze/log-supervision/watermark'
 /** POST：body `{ key? }` 立即重试指定或全部处于 dead 状态的平台报告回传任务。 */
 export const OUTBOX_RETRY_ROUTE = '/logalyze/outbox/retry'
+/** POST：手动触发一轮「已知问题库 ↔ 飞书多维表格」双向同步。 */
+export const ISSUE_SYNC_ROUTE = '/logalyze/issues/sync'
+/** POST：body `{ bitableUrl?, table? }` 对指定（或已保存）飞书多维表格执行字段映射自检。 */
+export const ISSUE_CHECK_ROUTE = '/logalyze/issues/check'
 
 /**
  * POST：日志平台分析接口（Bearer 令牌鉴权，不走 DSH 登录）。它在 DSH 的
@@ -153,6 +157,22 @@ export interface MrReviewSettings {
   dailyMrTurnLimit: number
   /** Per-repository rolling hourly session turn cap before tripping the circuit breaker. */
   repoHourlyTurnLimit: number
+  /** Optional custom team instructions appended to every MR review wake prompt. */
+  customInstructions?: string
+  /** Optional Feishu group chat (`oc_…`) used as fallback notification target for MR alerts/breakers. */
+  feishuChatId?: string
+}
+
+/** Two-way synchronization policy between local IssueMemory and Feishu Bitable. */
+export interface IssueSyncSettings {
+  /** Whether background and post-diagnosis two-way Bitable sync is active. */
+  enabled: boolean
+  /** Feishu Base (`/base/...`) or Wiki-embedded Base (`/wiki/...`) URL; omitted disables remote sync until configured. */
+  bitableUrl?: string
+  /** Optional target table ID (`tbl…`) or exact table name; overrides `?table=` query in `bitableUrl`. */
+  table?: string
+  /** Periodic two-way sync interval in milliseconds. */
+  syncIntervalMs: number
 }
 
 /** Feishu delivery mode for automatic log-supervision batches. */
@@ -200,10 +220,12 @@ export interface EditableSettings {
   mrReview: MrReviewSettings
   /** Automatic log-platform supervision, window batching, and outbox delivery. */
   logSupervision: LogSupervisionSettings
+  /** Known issues two-way Feishu Bitable synchronization. */
+  issueSync: IssueSyncSettings
 }
 
 /** Keys of {@link EditableSettings}, in panel order. */
-export const EDITABLE_KEYS = ['fetchIntervalMs', 'maxAppsPerRequest', 'dispatchTimeoutMs', 'download', 'skillUpdates', 'analyze', 'mrReview', 'logSupervision'] as const satisfies readonly (keyof EditableSettings)[]
+export const EDITABLE_KEYS = ['fetchIntervalMs', 'maxAppsPerRequest', 'dispatchTimeoutMs', 'download', 'skillUpdates', 'analyze', 'mrReview', 'logSupervision', 'issueSync'] as const satisfies readonly (keyof EditableSettings)[]
 
 /** One editable key. */
 export type EditableKey = (typeof EDITABLE_KEYS)[number]
@@ -505,6 +527,84 @@ export interface LogSupervisionWire {
   breakers: BreakerStatusWire[]
 }
 
+/** Availability of `feishuBitable` v1 exposed by `@dsh/channels`. */
+export type BitableAvailability = 'ready' | 'missing' | 'incompatible'
+
+/** One known issue item rendered in the Web panel. */
+export interface IssueItemWire {
+  issueId: string
+  appId: string
+  title: string
+  matchCriteria: string
+  exclusionCriteria?: string
+  aiDiagnosis: string
+  aiStatus: string
+  resolutionAdvice: string
+  humanConclusion?: string
+  humanStatus?: string
+  assignee?: string
+  firstSeenAt: number
+  lastSeenAt: number
+  sampleReportUrl?: string
+  latestReportUrl?: string
+  fixMrUrl?: string
+  bitableRecordId?: string
+  syncDirty: boolean
+}
+
+/** Column mapping diagnostic entry produced by `POST /logalyze/issues/check`. */
+export interface BitableColumnCheckWire {
+  name: string
+  role: 'ai' | 'human'
+  required: boolean
+  expectedType: 'text' | 'select' | 'datetime' | 'link' | 'user'
+  status: 'matched' | 'missing' | 'type_mismatch' | 'readonly'
+  actualType?: string
+  detail?: string
+}
+
+/** Schema & field-mapping self-check result for the target Feishu Bitable table. */
+export interface BitableSchemaCheckWire {
+  ok: boolean
+  checkedAt: number
+  targetUrl: string
+  table?: string
+  resolvedBaseToken?: string
+  resolvedTableId?: string
+  resolvedTableName?: string
+  errorCode?: string
+  error?: string
+  columns: BitableColumnCheckWire[]
+  missingRequired: string[]
+  missingOptional: string[]
+  warnings: string[]
+}
+
+/** Known issues & Feishu Bitable synchronization overview in {@link StateWire}. */
+export interface IssueOverviewWire {
+  enabled: boolean
+  bitableAvailable: BitableAvailability
+  bitableDetail?: string
+  syncing: boolean
+  totalCount: number
+  dirtyCount: number
+  linkedCount: number
+  humanConfirmedCount: number
+  lastSyncAt?: number
+  lastError?: string
+  lastCheck?: BitableSchemaCheckWire
+  items: IssueItemWire[]
+}
+
+/** Read-only cordis runtime settings summary rendered in the Advanced tab. */
+export interface RuntimeInfoWire {
+  analyzeTokenRef: string
+  platformSecretRef: string
+  subagentProvider: string
+  refreshWaitMs: number
+  autoInvoke: boolean
+}
+
 /** `GET /logalyze/state` response. */
 export interface StateWire {
   /** Effective settings: cordis.yml values with panel overrides applied. */
@@ -526,6 +626,10 @@ export interface StateWire {
   mrSupervision?: MrSupervisionWire
   /** Live state of stateful log supervision, pending batches, outbox, and app breakers. */
   logSupervision?: LogSupervisionWire
+  /** Known issues library & Bitable two-way sync overview. */
+  issues?: IssueOverviewWire
+  /** Read-only cordis runtime fields displayed in Advanced tab. */
+  runtime?: RuntimeInfoWire
 }
 
 /** Successful mutation response. */

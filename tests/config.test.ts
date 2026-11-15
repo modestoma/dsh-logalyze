@@ -29,6 +29,42 @@ describe('configuration', () => {
       deliveryMode: 'quiet-until-done',
       maxUnpackBytes: 512 * 1024 * 1024,
     })
+    expect(defaultsOf(config).issueSync).toEqual({
+      enabled: true,
+      syncIntervalMs: 300_000,
+    })
+  })
+
+  it('validates mrReview optional fields and issueSync bitable URLs', () => {
+    const custom = resolveConfig({
+      mrReview: {
+        customInstructions: '  注意检查权限校验与并发锁。 ',
+        feishuChatId: ' oc_mr_team_1 ',
+      },
+      issueSync: {
+        enabled: true,
+        bitableUrl: 'https://mi.feishu.cn/base/appBase123?table=tblIssues',
+        table: ' tblIssues ',
+        syncIntervalMs: 10_000,
+      },
+    })
+    expect(custom.mrReview.customInstructions).toBe('注意检查权限校验与并发锁。')
+    expect(custom.mrReview.feishuChatId).toBe('oc_mr_team_1')
+    expect(custom.issueSync.bitableUrl).toBe('https://mi.feishu.cn/base/appBase123?table=tblIssues')
+    expect(custom.issueSync.table).toBe('tblIssues')
+
+    const cleared = resolveConfig({
+      mrReview: { customInstructions: '   ', feishuChatId: '' },
+      issueSync: { bitableUrl: '', table: '   ' },
+    })
+    expect(cleared.mrReview.customInstructions).toBeUndefined()
+    expect(cleared.mrReview.feishuChatId).toBeUndefined()
+    expect(cleared.issueSync.bitableUrl).toBeUndefined()
+    expect(cleared.issueSync.table).toBeUndefined()
+
+    expect(() => resolveConfig({ mrReview: { feishuChatId: 'bad_chat' } })).toThrow(/chat_id/)
+    expect(() => resolveConfig({ issueSync: { bitableUrl: 'https://example.com/not-bitable' } })).toThrow(/飞书多维表格地址/)
+    expect(() => resolveConfig({ issueSync: { syncIntervalMs: 1000 } })).toThrow(/issueSync\.syncIntervalMs/)
   })
 
   it('normalizes allowed hosts and rejects schemes', () => {
