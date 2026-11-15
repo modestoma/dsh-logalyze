@@ -1,9 +1,9 @@
 /**
- * 分析接口话题的首轮消息：以 `/logalyze` 开头，列出应用、错误码和日志表
+ * 分析接口话题的首轮消息：以 `/supervisor` 开头，列出应用、错误码和日志表
  * （编号 L1…Ln 与日志平台元数据），附上调用方说明、集中分析的要求和报告
  * 文件的规则。日志的下载地址不写进消息，派发时按编号由观象现取。
  *
- * @module dsh-logalyze/analyze/prompt
+ * @module dsh-supervisor/analyze/prompt
  */
 
 import { DISPATCH_TOOL_NAME } from '../tool-names.ts'
@@ -41,7 +41,7 @@ function quote(text: string): string {
  * The first message of an analysis topic.
  * @param record - the accepted analysis.
  * @param limits - upload limits named in the report rules.
- * @returns prompt text whose first line is `/logalyze`.
+ * @returns prompt text whose first line is `/supervisor`.
  */
 export function analysisPrompt(record: AnalysisRecord, limits: UploadSettings): string {
   const count = record.logs.length
@@ -49,7 +49,7 @@ export function analysisPrompt(record: AnalysisRecord, limits: UploadSettings): 
   const refs = record.logs.map(log => log.ref)
   const rows = record.logs.map(log => `| ${log.ref} | ${cell(log.fileName)} | ${cell(log.productSn)} | ${cell(log.hwVersion)} | ${cell(log.swVersion)} | ${cell(log.componentVersion)} | ${cell(log.logType)} | ${size(log.sizeBytes)} | ${cell(log.createdAt)} |`)
   const parts = [
-    '/logalyze',
+    '/supervisor',
     `观象分析接口发起的日志分析。下面${batch ? ` ${count} 份` : '的'}日志来自日志平台，${batch ? '属于同一应用、同一错误码' : '已确定应用和错误码'}。`,
     [
       `- 应用：${record.appName}（id: \`${record.app}\`，由日志的 component_code \`${record.componentCode}\` 对应）`,

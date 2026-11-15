@@ -4,7 +4,7 @@
  * - 默认通过 DSH `sessionController`（以及 `dsh_channels` 的 `repo/resolve-agent`）
  *   创建无头监管会话并基于 `requestId` (`source.rpcId`) + `turn/end` 等待执行结束，不做忙等轮询。
  *
- * @module dsh-logalyze/log/session-driver
+ * @module dsh-supervisor/log/session-driver
  */
 
 import { randomUUID } from 'node:crypto'

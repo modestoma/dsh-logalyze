@@ -5,7 +5,7 @@
  * - 己方 MR（`self-fix` / `self-skill`）在工作树干净且可快进时同步，绝不自动 rebase 或丢弃本地未推送提交；
  * - 清理过期目录时严格校验路径位于工作区根目录之内。
  *
- * @module dsh-logalyze/mr/workspace
+ * @module dsh-supervisor/mr/workspace
  */
 
 import { execFile } from 'node:child_process'

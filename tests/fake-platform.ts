@@ -76,7 +76,7 @@ export class FakePlatform {
 
   /** Platform settings pointing at this server. */
   settings(overrides: Partial<PlatformSettings> = {}): PlatformSettings {
-    return { baseUrl: this.base, tokenUrl: `${this.base}/oauth/token`, clientId: 'logalyze', clientAuth: 'body', scope: 'log:search log:download log:upload', timeoutMs: 5000, ...overrides }
+    return { baseUrl: this.base, tokenUrl: `${this.base}/oauth/token`, clientId: 'supervisor', clientAuth: 'body', scope: 'log:search log:download log:upload', timeoutMs: 5000, ...overrides }
   }
 
   /** Add a log with downloadable content. */
@@ -155,7 +155,7 @@ export class FakePlatform {
     const [id, secret] = basic === undefined
       ? [form.get('client_id'), form.get('client_secret')]
       : Buffer.from(basic, 'base64').toString('utf8').split(':').map(part => decodeURIComponent(part.replace(/\+/gu, ' ')))
-    if (form.get('grant_type') !== 'client_credentials' || id !== 'logalyze' || secret !== this.secret) return send(res, 401, { error: 'invalid_client' })
+    if (form.get('grant_type') !== 'client_credentials' || id !== 'supervisor' || secret !== this.secret) return send(res, 401, { error: 'invalid_client' })
     this.issued += 1
     const token = `token-${this.issued}`
     this.valid.add(token)

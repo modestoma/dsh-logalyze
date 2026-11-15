@@ -3,7 +3,7 @@
  * （默认并发 3）提供互不饥饿的槽位隔离、`AbortSignal` 排队/执行期取消、实时活跃
  * 与排队统计，以及插件卸载时的 `drainAndClose()` 平滑屏障。
  *
- * @module dsh-logalyze/runtime/pool
+ * @module dsh-supervisor/runtime/pool
  */
 
 /** Default concurrency of the automatic log analysis pool (`04-storage-and-operations.md`). */

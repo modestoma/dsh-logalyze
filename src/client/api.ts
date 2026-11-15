@@ -1,7 +1,7 @@
 /**
- * 设置面板的同源 HTTP 客户端，直接请求 Host 半侧注册的 `/logalyze/*` 路由。
+ * 设置面板的同源 HTTP 客户端，直接请求 Host 半侧注册的 `/supervisor/*` 路由。
  *
- * @module dsh-logalyze/client/api
+ * @module dsh-supervisor/client/api
  */
 
 import { APPLICATION_ROUTE, BREAKER_RESET_ROUTE, ISSUE_CHECK_ROUTE, ISSUE_SYNC_ROUTE, LOG_WATERMARK_ROUTE, OUTBOX_RETRY_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'

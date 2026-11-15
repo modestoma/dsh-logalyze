@@ -4,7 +4,7 @@
  * 应用目录里唯一的应用（应用 id 或别名逐字相等）。核对不通过时给出可读原因，
  * 接口以 422 拒绝，不发卡片。
  *
- * @module dsh-logalyze/analyze/batch
+ * @module dsh-supervisor/analyze/batch
  */
 
 import type { PlatformLog } from '../platform/client.ts'

@@ -1,6 +1,6 @@
 ---
-name: logalyze-improve
-description: 改进观象（logalyze）的日志分析 SKILL：按分析中暴露的不足或用户的纠正修改 SKILL.md 与 references，并把具体问题整理为 cases/ 下的案例。
+name: supervisor-improve
+description: 改进智能监管（观象）的日志分析 SKILL：按分析中暴露的不足或用户的纠正修改 SKILL.md 与 references，并把具体问题整理为 cases/ 下的案例。
 ---
 
 # 观象 SKILL 改进指南：从一次分析中沉淀案例

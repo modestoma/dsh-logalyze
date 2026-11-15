@@ -6,7 +6,7 @@
  * - 分析接口令牌、日志平台客户端、分析请求受理与报告回传；
  * - Web 设置面板状态与写入口。
  *
- * @module dsh-logalyze/service
+ * @module dsh-supervisor/service
  */
 
 import { createHash } from 'node:crypto'
@@ -19,11 +19,11 @@ import { newAnalysisRecord } from './analyze/record.ts'
 import type { AnalyzeGate } from './analyze/server.ts'
 import { StoredCredential } from './analyze/token.ts'
 import { analysisTopicSpec, analyzeResponseOf, refused } from './analyze/topics.ts'
-import { LOGALYZE_APPLICATIONS_SERVICE } from './apps/access.ts'
+import { SUPERVISOR_APPLICATIONS_SERVICE } from './apps/access.ts'
 import type { ApplicationAccess } from './apps/access.ts'
 import { CatalogFollower } from './apps/catalog.ts'
 import { RepoRegistry } from './apps/registry.ts'
-import type { LogalyzeConfig } from './config.ts'
+import type { SupervisorConfig } from './config.ts'
 import { describeIssue } from './config.ts'
 import { FEISHU_ACTIONS_SERVICE, lookupActions } from './deps/actions.ts'
 import { FEISHU_BITABLE_SERVICE, lookupBitable } from './deps/bitable.ts'
@@ -80,9 +80,9 @@ const bitableCheckSchema = z.object({
 export interface ServiceOptions {
   /** Fetch used for log downloads and the log platform. */
   readonly fetch?: typeof fetch
-  /** Analysis record directory; defaults to `$DSH_HOME/logalyze/analyses`. */
+  /** Analysis record directory; defaults to `$DSH_HOME/supervisor/analyses`. */
   readonly analysesDir?: string
-  /** Directory of the former report records; defaults to `$DSH_HOME/logalyze/reports`. */
+  /** Directory of the former report records; defaults to `$DSH_HOME/supervisor/reports`. */
   readonly legacyReportsDir?: string
   /** Local fallback directory for `dsh_supervisor` when host `storageDomain` is absent. */
   readonly supervisorDir?: string
@@ -108,12 +108,12 @@ export interface ServiceOptions {
 
 /** Package files the service serves. */
 export interface ServiceAssets {
-  /** Bundled guide skills (`/logalyze-kit`, `/logalyze-improve`). */
+  /** Bundled guide skills (`/supervisor-kit`, `/supervisor-improve`, `/mr-reviewer`, `/log-supervisor`). */
   readonly bundled: readonly BundledSkill[]
 }
 
 /** The plugin's long-lived state. */
-export class LogalyzeService {
+export class SupervisorService {
   readonly registry: RepoRegistry
   readonly pools: SupervisionPools
   private readonly settings: SettingsController
@@ -164,7 +164,7 @@ export class LogalyzeService {
    */
   constructor(
     private readonly ctx: HostContext,
-    config: LogalyzeConfig,
+    config: SupervisorConfig,
     store: OverlayStore,
     assets: ServiceAssets,
     options: ServiceOptions = {},
@@ -173,7 +173,7 @@ export class LogalyzeService {
     const settings = (): ReturnType<SettingsController['get']> => this.settings.get()
     const workingDirectory = (): WorkingDirectoryService | undefined => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined
     const fetchSeam = options.fetch === undefined ? {} : { fetch: options.fetch }
-    this.supervisorDir = options.supervisorDir ?? join(dirname(store.path), 'supervisor')
+    this.supervisorDir = options.supervisorDir ?? join(dirname(store.path), 'domain')
     this.mrWorkspacesDir = options.mrWorkspacesDir ?? join(dirname(store.path), 'mr-workspaces')
     this.logWorkspacesDir = options.logWorkspacesDir ?? join(dirname(store.path), 'log-workspaces')
     this.clock = options.now ?? Date.now
@@ -248,7 +248,7 @@ export class LogalyzeService {
     return this.supervisorPromise
   }
 
-  /** Register the entry skill provider and `logalyzeApplications` service; called once from `apply()`. */
+  /** Register the entry skill provider and `supervisorApplications` service; called once from `apply()`. */
   registerSkill(): void {
     if (typeof this.ctx.provide === 'function') {
       const access: ApplicationAccess = {
@@ -256,9 +256,9 @@ export class LogalyzeService {
         resolve: async name => { await this.prepared(); return this.registry.resolve(name) },
         acquire: async ids => { await this.prepared(); return this.registry.acquire(ids) },
       }
-      this.ctx.effect(() => this.ctx.provide?.(LOGALYZE_APPLICATIONS_SERVICE, access), 'logalyze: application access')
+      this.ctx.effect(() => this.ctx.provide?.(SUPERVISOR_APPLICATIONS_SERVICE, access), 'supervisor: application access')
     }
-    this.ctx.effect(() => this.ctx.skills.registerProvider(this.skill.factory), 'logalyze: entry skill')
+    this.ctx.effect(() => this.ctx.skills.registerProvider(this.skill.factory), 'supervisor: entry skill')
   }
 
   /**
@@ -280,7 +280,7 @@ export class LogalyzeService {
     })
     const hasApps = (): boolean => this.registry.readyApps().length > 0
     const register = <V>(definition: ToolDefinition<V>, condition: (context: ToolActivationContext) => boolean, label: string): void => {
-      this.ctx.effect(() => this.ctx.tools.register(definition, { when: context => this.offers(context, condition) }), `logalyze: ${label} tool`)
+      this.ctx.effect(() => this.ctx.tools.register(definition, { when: context => this.offers(context, condition) }), `supervisor: ${label} tool`)
     }
     register(this.dispatcher.definition(), hasApps, 'dispatch')
     register(this.improver.definition(), () => this.settings.get().skillUpdates.enabled && this.registry.readyApps().some(ready => ready.writable && ready.app.skill !== undefined), 'skill improvement')
@@ -337,7 +337,7 @@ export class LogalyzeService {
   async boot(): Promise<void> {
     try {
       const domain = await this.supervisorDomain().catch((error: unknown) => {
-        this.ctx.logger?.error?.('logalyze: 打开监管存储域失败：%s', messageOf(error))
+        this.ctx.logger?.error?.('supervisor: 打开监管存储域失败：%s', messageOf(error))
         return undefined
       })
       await this.settings.load()
@@ -354,7 +354,7 @@ export class LogalyzeService {
             return undefined
           },
           now: this.clock,
-          onError: (error) => { this.ctx.logger?.warn?.('logalyze: 熔断通知失败：%s', messageOf(error)) },
+          onError: (error) => { this.ctx.logger?.warn?.('supervisor: 熔断通知失败：%s', messageOf(error)) },
         })
         this.issueMemory = new IssueMemory(domain.issues)
         this.issueSyncer = new IssueBitableSyncer({
@@ -399,7 +399,7 @@ export class LogalyzeService {
               },
               prompt: `${input.text}\n\n请向值班研发同步该 MR 监管状态，等待人工处理后再恢复；不要自动修改或强推代码。`,
             }).catch((error: unknown) => {
-              this.ctx.logger?.warn?.('logalyze: 审微飞书告警发送失败：%s', messageOf(error))
+              this.ctx.logger?.warn?.('supervisor: 审微飞书告警发送失败：%s', messageOf(error))
             })
           },
           now: this.clock,
@@ -441,10 +441,10 @@ export class LogalyzeService {
         })
       }
       await this.reports.boot().catch((error: unknown) => {
-        this.ctx.logger?.error?.('logalyze: 读取分析记录失败：%s', messageOf(error))
+        this.ctx.logger?.error?.('supervisor: 读取分析记录失败：%s', messageOf(error))
       })
       await this.legacy.load(Date.now()).catch((error: unknown) => {
-        this.ctx.logger?.error?.('logalyze: 读取旧版回传记录失败：%s', messageOf(error))
+        this.ctx.logger?.error?.('supervisor: 读取旧版回传记录失败：%s', messageOf(error))
       })
       await this.catalog.load()
       this.issueSyncer?.boot()

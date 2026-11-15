@@ -6,7 +6,7 @@
  * - 集成 `CircuitBreakerRegistry`（单 MR 日限、单仓库时限、CI 自修上限）并支持面板状态展示与一键解除熔断；
  * - 遵守自触发防护铁律与已关闭 MR（14 天工作区清理 / 60 天记录清理）留存策略。
  *
- * @module dsh-logalyze/mr/supervisor
+ * @module dsh-supervisor/mr/supervisor
  */
 
 import type { DshReposV8, MrDetail, MrInfo, MrStatus, RepoUser } from '../deps/repos-contract.ts'
@@ -207,7 +207,7 @@ export class MrSupervisor implements MrToolsRuntime {
       },
       onError: (error, key) => {
         this.lastError = `MR 会话唤醒失败 (${key})：${messageOf(error)}`
-        this.deps.logger?.error?.('logalyze: %s', this.lastError)
+        this.deps.logger?.error?.('supervisor: %s', this.lastError)
       },
       now: this.now,
     })
@@ -257,10 +257,10 @@ export class MrSupervisor implements MrToolsRuntime {
     }
     this.started = true
     await this.sweepRetention().catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: MR 留存清理失败：%s', messageOf(error))
+      this.deps.logger?.warn?.('supervisor: MR 留存清理失败：%s', messageOf(error))
     })
     await this.suspendIneligibleDeadlines().catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: 清理未启用仓库 MR 截止时间失败：%s', messageOf(error))
+      this.deps.logger?.warn?.('supervisor: 清理未启用仓库 MR 截止时间失败：%s', messageOf(error))
     })
     await this.resumeDormantPending()
     this.scheduleNextPoll(0)
@@ -281,7 +281,7 @@ export class MrSupervisor implements MrToolsRuntime {
     if (!settings.enabled) {
       this.debouncer.cancelAll()
       const suspendPromise = this.suspendPendingDeadlines().catch((error: unknown) => {
-        this.deps.logger?.warn?.('logalyze: 清理暂停 MR 截止时间失败：%s', messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 清理暂停 MR 截止时间失败：%s', messageOf(error))
       })
       this.trackFlushPromise(suspendPromise)
       return
@@ -292,7 +292,7 @@ export class MrSupervisor implements MrToolsRuntime {
       }
     }
     const reconcilePromise = this.reconcilePendingEligibility().catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: MR 恢复待办失败：%s', messageOf(error))
+      this.deps.logger?.warn?.('supervisor: MR 恢复待办失败：%s', messageOf(error))
     })
     this.trackFlushPromise(reconcilePromise)
     this.scheduleNextPoll(0)
@@ -822,11 +822,11 @@ export class MrSupervisor implements MrToolsRuntime {
       } catch (error) {
         const msg = `仓库 ${mrRepo.url} 轮询失败：${messageOf(error)}`
         repoErrors.push(msg)
-        this.deps.logger?.warn?.('logalyze: %s', msg)
+        this.deps.logger?.warn?.('supervisor: %s', msg)
       }
     }
     await this.sweepRetention().catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: MR 留存清理失败：%s', messageOf(error))
+      this.deps.logger?.warn?.('supervisor: MR 留存清理失败：%s', messageOf(error))
     })
     this.lastError = repoErrors.length === 0 ? undefined : repoErrors.join('；')
     this.deps.onChange?.()
@@ -1175,7 +1175,7 @@ export class MrSupervisor implements MrToolsRuntime {
       if (shouldFollowUp) {
         const follow = this.handleDebouncedFlush(key).catch((error: unknown) => {
           this.lastError = `MR 会话唤醒失败 (${key})：${messageOf(error)}`
-          this.deps.logger?.error?.('logalyze: %s', this.lastError)
+          this.deps.logger?.error?.('supervisor: %s', this.lastError)
         })
         this.trackFlushPromise(follow)
       }
@@ -1422,7 +1422,7 @@ export class MrSupervisor implements MrToolsRuntime {
       this.sessionToKey.set(result.sessionId, key)
       if (result.error !== undefined) {
         this.lastError = `MR ${key} 会话执行异常：${result.error}`
-        this.deps.logger?.warn?.('logalyze: %s', this.lastError)
+        this.deps.logger?.warn?.('supervisor: %s', this.lastError)
         await this.rollbackFailedTurnBatch({
           repo: initial.repo,
           mrNumber: initial.mrNumber,
@@ -1457,7 +1457,7 @@ export class MrSupervisor implements MrToolsRuntime {
       const abortedOrClosing = signal.aborted || this.closed
       if (!abortedOrClosing) {
         this.lastError = `MR ${key} 会话唤醒失败：${messageOf(error)}`
-        this.deps.logger?.error?.('logalyze: %s', this.lastError)
+        this.deps.logger?.error?.('supervisor: %s', this.lastError)
       }
       await this.rollbackFailedTurnBatch({
         repo: initial.repo,
@@ -1539,7 +1539,7 @@ export class MrSupervisor implements MrToolsRuntime {
     try {
       await this.deps.notifyHuman(input)
     } catch (error) {
-      this.deps.logger?.warn?.('logalyze: 人工通知发送失败：%s', messageOf(error))
+      this.deps.logger?.warn?.('supervisor: 人工通知发送失败：%s', messageOf(error))
     }
   }
 

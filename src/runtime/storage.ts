@@ -4,7 +4,7 @@
  *
  * 运行时不直接依赖 `@deepseek-ai/dsh-storage-domain` 包，结构契约与其完全对齐。
  *
- * @module dsh-logalyze/runtime/storage
+ * @module dsh-supervisor/runtime/storage
  */
 
 import { mkdir, readFile } from 'node:fs/promises'

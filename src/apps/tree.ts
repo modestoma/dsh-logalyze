@@ -3,7 +3,7 @@
  * by repository path. Nothing is followed through a symbolic link, so a link
  * committed to the repository cannot make a read leave the tree.
  *
- * @module dsh-logalyze/apps/tree
+ * @module dsh-supervisor/apps/tree
  */
 
 import { lstat, readdir } from 'node:fs/promises'

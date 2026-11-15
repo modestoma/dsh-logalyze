@@ -1,7 +1,7 @@
 /**
  * 按目录 URL 索引的应用描述与触发别名存储；仓库成员与分支归属仍由 dsh-repo 管理。
  *
- * @module dsh-logalyze/settings/applications
+ * @module dsh-supervisor/settings/applications
  */
 
 import { createHash } from 'node:crypto'

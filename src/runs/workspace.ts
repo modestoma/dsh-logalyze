@@ -5,7 +5,7 @@
  * 并把样例日志放进运行目录；
  * 子 Agent 结束后把检查过的改动写成 `changes.diff`。
  *
- * @module dsh-logalyze/runs/workspace
+ * @module dsh-supervisor/runs/workspace
  */
 
 import { mkdir } from 'node:fs/promises'

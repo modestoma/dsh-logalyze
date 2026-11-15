@@ -6,7 +6,7 @@
  * 仓库地址、分支、权限与镜像拉取均归 dsh-repo 管理；本模块在 dsh-repo 服务可用时同时注册
  * `LOG_ANALYSIS_FEATURE` 与 `MR_REVIEW_FEATURE` 两项开关。
  *
- * @module dsh-logalyze/apps/catalog
+ * @module dsh-supervisor/apps/catalog
  */
 
 import { LOG_ANALYSIS_FEATURE, MR_REVIEW_FEATURE } from '../deps/repos.ts'
@@ -93,12 +93,12 @@ export class CatalogFollower {
           this.deps.registry.configureMrRepos(toMrWire(mrSpecs))
           return this.deps.registry.syncUrls(this.deps.registry.configure(appSpecs))
         })
-        .catch((error: unknown) => { this.deps.error(`logalyze: 仓库清单变更后读取仓库失败：${messageOf(error)}`) })
+        .catch((error: unknown) => { this.deps.error(`supervisor: 仓库清单变更后读取仓库失败：${messageOf(error)}`) })
     })
     const stopHosts = service.hostOnChange(() => {
       if (!this.deps.active()) return
       void this.deps.registry.resyncAll().catch((error: unknown) => {
-        this.deps.error(`logalyze: 主机变更后读取仓库失败：${messageOf(error)}`)
+        this.deps.error(`supervisor: 主机变更后读取仓库失败：${messageOf(error)}`)
       })
     })
     return () => {

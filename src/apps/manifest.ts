@@ -1,7 +1,7 @@
 /**
  * 旧 SKILL 改进工具使用的 manifest 与目标文件检查；应用分析就绪不调用此检查。
  *
- * @module dsh-logalyze/apps/manifest
+ * @module dsh-supervisor/apps/manifest
  */
 
 import { parse as parseYaml } from 'yaml'

@@ -1,9 +1,9 @@
 /**
- * `/logalyze` 入口 SKILL：用户可以显式调用；开启自动加载且有可用应用时，
+ * `/supervisor` 入口 SKILL：用户可以显式调用；开启自动加载且有可用应用时，
  * 顶层 Agent 也能在任务匹配时自行加载。目录描述列出已就绪的应用，正文中的
  * 应用目录在每次加载时由已就绪仓库的应用描述生成。
  *
- * @module dsh-logalyze/skill/entry
+ * @module dsh-supervisor/skill/entry
  */
 
 import type { SkillDefinition, SkillProvider, SkillProviderControl } from '../host.ts'
@@ -11,11 +11,11 @@ import type { AppManifest } from '../settings/contract.ts'
 import type { BundledSkill } from './bundled.ts'
 import { DISPATCH_TOOL_NAME, IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from '../tool-names.ts'
 
-/** Entry skill name, addressed as `/logalyze`. */
-export const ENTRY_SKILL_NAME = 'logalyze'
+/** Entry skill name, addressed as `/supervisor`. */
+export const ENTRY_SKILL_NAME = 'supervisor'
 
 /** Skill provider name in `ctx.skills`. */
-export const SKILL_PROVIDER_NAME = 'dsh-logalyze'
+export const SKILL_PROVIDER_NAME = 'dsh-supervisor'
 
 /** DSH's precedence rank for packaged skill providers (`BUNDLED_SKILL_RANK`). */
 export const BUNDLED_SKILL_RANK = 600
@@ -94,12 +94,12 @@ ${renderCatalog(apps)}
 
 ## 步骤
 
-1. **读需求。** 从 \`/logalyze\` 之后的文字、消息附带的附件、消息里的下载 URL 中找出：要分析的现象、时间范围、关键标识（用户 id、订单号、请求 id 等）、日志位置。
+1. **读需求。** 从 \`/supervisor\` 之后的文字、消息附带的附件、消息里的下载 URL 中找出：要分析的现象、时间范围、关键标识（用户 id、订单号、请求 id 等）、日志位置。
 2. **确定应用。** 拆分单位是「日志来源 → 应用」。
    - 首轮消息是分析接口生成的（列出了应用 id 和日志编号表）时，应用已经确定，按其中的「分析要求」派发，不要再按日志内容判断。
    - 用户或调用方已经写明应用 id 时直接使用；该 id 不在上表中时，告诉用户这个应用未注册（列出可用的应用 id），然后结束，不要改用别的应用。要接入新应用，请管理员在「代码仓库 → 仓库」中添加它的仓库并打开「日志分析」。
    - 否则按名称、别名、描述和日志特征匹配。只有附件文件名或内容能区分时，可以只看日志开头几十行来判断，不要通读或解压整个日志。
-   - 用户没有输入 \`/logalyze\`、是你按任务匹配自行加载了本 SKILL，而日志明显不属于上表任何应用时，不要派发也不要追问，按普通方式完成用户的请求。
+   - 用户没有输入 \`/supervisor\`、是你按任务匹配自行加载了本 SKILL，而日志明显不属于上表任何应用时，不要派发也不要追问，按普通方式完成用户的请求。
    - 其余无法确定或同时匹配多个应用的情况，用 \`ask_user_question\`（不可用时直接在回复中提问并结束）让用户选择，不要猜。
    - 一个文件混有多个应用的输出时，把同一路径分别交给各应用，并在 \`filter\` 里写明区分方式（tag、进程名等）。
 3. **派发。** 一次调用 \`${DISPATCH_TOOL_NAME}\`，把所有任务放进 \`tasks\`（最多 ${maxAppsPerRequest} 个）：
@@ -145,7 +145,7 @@ export interface EntrySkillSource {
   maxAppsPerRequest(): number
   /** Whether SKILL improvement is enabled. */
   skillUpdates(): boolean
-  /** Whether top-level agents may load the skill without `/logalyze`. */
+  /** Whether top-level agents may load the skill without `/supervisor`. */
   readonly autoInvoke: boolean
   /**
    * Whether a lookup directory lies where children work (the repository
@@ -159,9 +159,9 @@ export interface EntrySkillSource {
 }
 
 /**
- * Build the skill provider serving `/logalyze` and the bundled guide skills.
+ * Build the skill provider serving `/supervisor` and the bundled guide skills.
  * The bundled skills are listed in every directory, including the snapshots
- * and workspaces children work in, where `/logalyze` is not listed.
+ * and workspaces children work in, where `/supervisor` is not listed.
  * @param source - live registry view and the bundled skills.
  * @returns a provider factory for `ctx.skills.registerProvider`, plus the
  *   hook to call after the usable applications may have changed; it
@@ -191,7 +191,7 @@ export function createEntrySkillProvider(source: EntrySkillSource): {
     return {
       name: ENTRY_SKILL_NAME,
       description: automatic ? describeApps(apps) : MANUAL_DESCRIPTION,
-      whenToUse: automatic ? '用户输入 /logalyze，或要分析、排查描述中所列应用的日志时使用。' : '仅在用户输入 /logalyze 时使用。',
+      whenToUse: automatic ? '用户输入 /supervisor，或要分析、排查描述中所列应用的日志时使用。' : '仅在用户输入 /supervisor 时使用。',
       invocation: { modelInvocable: automatic, userInvocable: true },
       source: 'bundled',
       provider: SKILL_PROVIDER_NAME,

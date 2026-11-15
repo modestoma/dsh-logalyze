@@ -15,7 +15,7 @@
  *   per-key lock so concurrent `upsertByAi` / `attachUrlsByAi` updates during
  *   remote HTTP calls always remain dirty for the next pass.
  *
- * @module dsh-logalyze/issues/bitable-sync
+ * @module dsh-supervisor/issues/bitable-sync
  */
 
 import { BITABLE_BATCH_MAX_RECORDS, parseBitableUrl } from '../deps/bitable.ts'
@@ -732,7 +732,7 @@ export class IssueBitableSyncer {
       }
       if (duplicateIssueRows > 0) {
         this.deps.logger?.warn?.(
-          'logalyze: 飞书多维表格中存在 %d 行重复「问题ID」，已按首条记录去重',
+          'supervisor: 飞书多维表格中存在 %d 行重复「问题ID」，已按首条记录去重',
           duplicateIssueRows,
         )
       }
@@ -773,7 +773,7 @@ export class IssueBitableSyncer {
     } catch (error) {
       const msg = `多维表格同步异常：${messageOf(error)}`
       this.lastError = msg
-      this.deps.logger?.warn?.('logalyze: %s', msg)
+      this.deps.logger?.warn?.('supervisor: %s', msg)
       return { ok: false, pulled: 0, pushed: 0, created: 0, updated: 0, error: msg }
     }
   }
@@ -1005,7 +1005,7 @@ export class IssueBitableSyncer {
     return { updated: 0, requeueForCreate: [], error: result.message }
   }
 
-  /** Build the panel overview snapshot included in `GET /logalyze/state`. */
+  /** Build the panel overview snapshot included in `GET /supervisor/state`. */
   panelState(): IssueOverviewWire {
     const settings = this.deps.getSettings()
     const lookup = this.deps.getBitable()

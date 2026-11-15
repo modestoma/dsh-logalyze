@@ -3,12 +3,12 @@
  * 每个请求先经宿主 `connection.requestRejection`（与 DSH `/api` 相同的
  * Host/Origin 校验和登录 cookie 鉴权）；写操作另做同源校验。
  *
- * @module dsh-logalyze/settings/routes
+ * @module dsh-supervisor/settings/routes
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
-import type { LogalyzeService } from '../service.ts'
+import type { SupervisorService } from '../service.ts'
 import { HttpError, mediaTypeOf, readBody, sendJson } from '../util/http.ts'
 import { SettingsError } from './controller.ts'
 import { APPLICATION_ROUTE, BREAKER_RESET_ROUTE, ISSUE_CHECK_ROUTE, ISSUE_SYNC_ROUTE, LOG_WATERMARK_ROUTE, OUTBOX_RETRY_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from './contract.ts'
@@ -87,7 +87,7 @@ function guarded(gate: HostRequestGate, methods: readonly string[], handler: Web
  * @param service - plugin runtime.
  * @returns disposer removing every route.
  */
-export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: LogalyzeService): () => void {
+export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: SupervisorService): () => void {
   const disposers = [
     server.register({
       kind: 'exact',
@@ -171,12 +171,12 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
  * @param ctx - plugin context.
  * @param service - plugin runtime.
  */
-export function mountSettingsRoutes(ctx: HostContext, service: LogalyzeService): void {
+export function mountSettingsRoutes(ctx: HostContext, service: SupervisorService): void {
   const attach = (webCtx: HostContext): void => {
     const server = webCtx.get?.('webServer') as HostWebServer | undefined
     const gate = webCtx.get?.('connection') as HostRequestGate | undefined
     if (server === undefined || gate === undefined) return
-    webCtx.effect(() => registerSettingsRoutes(server, gate, service), 'logalyze: settings routes')
+    webCtx.effect(() => registerSettingsRoutes(server, gate, service), 'supervisor: settings routes')
   }
   if (typeof ctx.inject === 'function') {
     ctx.inject(['webServer', 'connection'], attach)

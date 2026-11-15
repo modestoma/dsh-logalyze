@@ -3,7 +3,7 @@
  * - 区分外部 MR（只评审与回复讨论，不推送代码）与己方 MR（`self-fix`/`self-skill`，可修复 CI 与人类反馈）；
  * - 首审、增量重审、纯讨论回复、草稿转正、CI 失败与合并冲突均有清晰提示与工具约束。
  *
- * @module dsh-logalyze/mr/prompt
+ * @module dsh-supervisor/mr/prompt
  */
 
 import type { MrDetail, MrStatus } from '../deps/repos-contract.ts'

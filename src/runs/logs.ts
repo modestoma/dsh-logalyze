@@ -4,7 +4,7 @@
  * 把地址下载到运行目录、按编号向日志平台现取下载链接下载，一律以绝对路径
  * 交给子 Agent。平台的临时下载链接不进入模型可见的内容。
  *
- * @module dsh-logalyze/runs/logs
+ * @module dsh-supervisor/runs/logs
  */
 
 import { stat } from 'node:fs/promises'

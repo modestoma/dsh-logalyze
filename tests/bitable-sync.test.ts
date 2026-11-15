@@ -20,7 +20,7 @@ import type { HostContext, HostRequestGate, HostWebServer } from '../src/host.ts
 import { ISSUE_BITABLE_COLUMNS, IssueBitableSyncer } from '../src/issues/bitable-sync.ts'
 import { IssueMemory } from '../src/issues/memory.ts'
 import { computeIssueAiFingerprint, openSupervisorDomain } from '../src/runtime/domain.ts'
-import { LogalyzeService } from '../src/service.ts'
+import { SupervisorService } from '../src/service.ts'
 import {
   ISSUE_CHECK_ROUTE,
   ISSUE_SYNC_ROUTE,
@@ -642,7 +642,7 @@ describe('IssueBitableSyncer two-way synchronization', () => {
 
     const config = resolveConfig({ subagentProvider: 'custom-provider', autoInvoke: false })
     const bundled = loadBundledSkills(new URL('../skills/', import.meta.url))
-    const service = new LogalyzeService(
+    const service = new SupervisorService(
       ctx,
       config,
       new OverlayStore(join(dir, 'settings.json')),
@@ -677,8 +677,8 @@ describe('IssueBitableSyncer two-way synchronization', () => {
     const initial = await (await fetch(`${base}${STATE_ROUTE}`)).json() as StateWire
     expect(initial.issues?.bitableAvailable).toBe('missing')
     expect(initial.runtime).toEqual({
-      analyzeTokenRef: 'LOGALYZE_ANALYZE_TOKEN',
-      platformSecretRef: 'LOGALYZE_PLATFORM_CLIENT_SECRET',
+      analyzeTokenRef: 'SUPERVISOR_ANALYZE_TOKEN',
+      platformSecretRef: 'SUPERVISOR_PLATFORM_CLIENT_SECRET',
       subagentProvider: 'custom-provider',
       refreshWaitMs: 15000,
       autoInvoke: false,

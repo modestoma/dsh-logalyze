@@ -37,7 +37,7 @@ afterEach(async () => { await Promise.all(cleanups.splice(0).map(cleanup => clea
  * `services` add or replace context services (`dshRepos: undefined` removes it).
  */
 async function harness(services: Record<string, unknown> = {}): Promise<Harness> {
-  const { dir, cleanup } = await tempDir('logalyze-repos-')
+  const { dir, cleanup } = await tempDir('supervisor-repos-')
   const repos = new FakeRepos(dir)
   services = { dshRepos: repos, ...services }
   const routes = new Map<string, Handler>()
@@ -122,7 +122,7 @@ describe('plugin', () => {
       inject: (deps, callback) => { if (deps.includes('dshRepos')) injected.push(callback); return inject?.(deps, callback) },
     }
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
-    const ready = async (): Promise<boolean> => (await json<StateWire>(await fetch(`${h.base}/logalyze/state`))).repos[0]?.phase === 'ready'
+    const ready = async (): Promise<boolean> => (await json<StateWire>(await fetch(`${h.base}/supervisor/state`))).repos[0]?.phase === 'ready'
     await waitFor(ready)
     await new Promise(resolve => setTimeout(resolve, 50))
     expect(h.repos.acquires.map(call => call.repo)).toEqual([origin])
@@ -140,11 +140,11 @@ describe('plugin', () => {
     cleanups.push(h.dispose)
     h.repos.setCatalog([{ url: origin }])
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
-    expect(h.skills.map(skill => skill.name)).toEqual(['dsh-logalyze'])
+    expect(h.skills.map(skill => skill.name)).toEqual(['dsh-supervisor'])
     expect(h.tools.map(tool => tool.definition.name)).toEqual([
-      'logalyze_dispatch',
-      'logalyze_improve_skill',
-      'logalyze_show_skill',
+      'supervisor_dispatch',
+      'supervisor_improve_skill',
+      'supervisor_show_skill',
       'supervisor_mr_prepare',
       'supervisor_mr_publish_review',
       'supervisor_mr_reply_thread',
@@ -185,7 +185,7 @@ describe('plugin', () => {
     // Both log-analysis and mr-review features are registered with dsh-repo while the plugin runs.
     expect(h.repos.features.get('log-analysis')).toMatchObject({ id: 'log-analysis', title: '日志分析' })
     expect(h.repos.features.get('mr-review')).toMatchObject({ id: 'mr-review', title: 'MR 自动评审' })
-    expect(h.ctx.get?.('logalyzeApplications')).toBeDefined()
+    expect(h.ctx.get?.('supervisorApplications')).toBeDefined()
     // A repository the catalog lists as read-only is analyzed, but its SKILL cannot be improved.
     h.repos.catalog = h.repos.catalog.map(repo => ({ ...repo, access: 'read' }))
     h.repos.emitReposChange()
@@ -193,7 +193,7 @@ describe('plugin', () => {
     expect(await tool!.when?.(step())).toBe(true)
   })
 
-  it('mentions SKILL improvement in /logalyze unless it is turned off', async () => {
+  it('mentions SKILL improvement in /supervisor unless it is turned off', async () => {
     const { dir, cleanup } = await tempDir()
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'order-service'))
@@ -204,8 +204,8 @@ describe('plugin', () => {
       apply(h.ctx, { skillUpdates: { enabled } }, { overlayPath: join(dir, `settings-${enabled}.json`) })
       const [candidate] = await h.skills[0]!.list({})
       const content = (await h.skills[0]!.get(candidate!, {}))?.content
-      if (enabled) expect(content).toContain('先用 `logalyze_show_skill` 查看现有 SKILL 的相关内容')
-      else expect(content).not.toContain('logalyze_improve_skill')
+      if (enabled) expect(content).toContain('先用 `supervisor_show_skill` 查看现有 SKILL 的相关内容')
+      else expect(content).not.toContain('supervisor_improve_skill')
     }
   })
 
@@ -220,9 +220,9 @@ describe('plugin', () => {
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
     const step = { agent: { id: 'a', session: { header: { id: 'a' } } }, signal: new AbortController().signal }
     expect(await h.tools[0]!.when?.(step)).toBe(true)
-    const state = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
+    const state = await json<StateWire>(await fetch(`${h.base}/supervisor/state`))
     expect(state.repos).toMatchObject([{ url: origin, available: true, writable: true, error: expect.stringContaining('旧应用配置未迁移') }])
-    expect(h.tools.map(tool => tool.definition.name)).not.toContain('logalyze_init_repo')
+    expect(h.tools.map(tool => tool.definition.name)).not.toContain('supervisor_init_repo')
     expect(state.settings).not.toHaveProperty('repos')
   })
 
@@ -235,7 +235,7 @@ describe('plugin', () => {
     cleanups.push(h.dispose)
     h.repos.setCatalog([{ url: other }], [])
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
-    const state = async (): Promise<StateWire> => await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
+    const state = async (): Promise<StateWire> => await json<StateWire>(await fetch(`${h.base}/supervisor/state`))
     const step = { agent: { id: 'a', session: { header: { id: 'a' } } }, signal: new AbortController().signal }
     expect(await h.tools[0]!.when?.(step)).toBe(false)
     expect((await state()).repos).toEqual([])
@@ -254,7 +254,7 @@ describe('plugin', () => {
     expect(await h.tools[0]!.when?.(step)).toBe(false)
   })
 
-  it('refreshes repositories before rendering /logalyze, waiting at most refreshWaitMs', async () => {
+  it('refreshes repositories before rendering /supervisor, waiting at most refreshWaitMs', async () => {
     const { dir, cleanup } = await tempDir()
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'order-service'))
@@ -270,7 +270,7 @@ describe('plugin', () => {
     const [candidate] = await provider.list({})
     expect((await provider.get(candidate!, {}))?.content).not.toContain('PushedHint')
     // A sync still running from startup would be joined instead of fetching the new commit.
-    await waitFor(async () => (await json<StateWire>(await fetch(`${h.base}/logalyze/state`))).repos[0]?.phase === 'ready')
+    await waitFor(async () => (await json<StateWire>(await fetch(`${h.base}/supervisor/state`))).repos[0]?.phase === 'ready')
 
     await addHint('PushedHint')
     expect((await provider.get(candidate!, {}))?.content).not.toContain('`PushedHint`')
@@ -301,8 +301,8 @@ describe('plugin', () => {
       expect(listed?.invocation.modelInvocable).toBe(autoInvoke)
       if (autoInvoke) expect(listed?.description).toContain('订单服务（order-service')
       // Inside the repositories and the run directories' workspaces only the bundled guides are listed.
-      for (const cwd of [join(h.repos.root, '.snapshots', 'local', 'x'), join(dir, '.logalyze', 'runs', 'r1', 'init', 'repo')]) {
-        expect((await provider.list({ cwd })).map(skill => skill.name)).toEqual(['logalyze-kit', 'logalyze-improve', 'mr-reviewer', 'log-supervisor'])
+      for (const cwd of [join(h.repos.root, '.snapshots', 'local', 'x'), join(dir, '.supervisor', 'runs', 'r1', 'init', 'repo')]) {
+        expect((await provider.list({ cwd })).map(skill => skill.name)).toEqual(['supervisor-kit', 'supervisor-improve', 'mr-reviewer', 'log-supervisor'])
       }
     }
   })
@@ -321,13 +321,13 @@ describe('plugin', () => {
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
     const step = { agent: { id: 'a', session: { header: { id: 'a' } } }, signal: new AbortController().signal }
     await h.tools[0]!.when?.(step)
-    const initialState = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
+    const initialState = await json<StateWire>(await fetch(`${h.base}/supervisor/state`))
     expect(initialState.mrRepos).toEqual([
       { url: origin, branch: 'main', base: 'main', writable: true },
       { url: mrOnly, branch: 'release', targetBranch: 'release', base: 'develop', writable: false },
     ])
     const payload = { url: origin, description: '面板描述', aliases: ['orders-v2', '订单新版'] }
-    const put = (body: unknown, headers: Record<string, string> = {}) => fetch(`${h.base}/logalyze/applications`, { method: 'PUT', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) })
+    const put = (body: unknown, headers: Record<string, string> = {}) => fetch(`${h.base}/supervisor/applications`, { method: 'PUT', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) })
     const catalog = structuredClone(h.repos.catalog)
     h.rejection.value = 401
     expect((await put(payload)).status).toBe(401)
@@ -341,7 +341,7 @@ describe('plugin', () => {
     expect(h.repos.catalog).toEqual(catalog)
     expect((await put({ ...payload, aliases: ['order', 'ORDER'] })).status).toBe(400)
     h.repos.setCatalog([])
-    await waitFor(async () => (await json<StateWire>(await fetch(`${h.base}/logalyze/state`))).repos.length === 0)
+    await waitFor(async () => (await json<StateWire>(await fetch(`${h.base}/supervisor/state`))).repos.length === 0)
     expect((await put(payload)).status).toBe(400)
   })
 
@@ -353,10 +353,10 @@ describe('plugin', () => {
     const h = await harness()
     cleanups.push(h.dispose)
     apply(h.ctx, {}, { overlayPath })
-    const initial = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
+    const initial = await json<StateWire>(await fetch(`${h.base}/supervisor/state`))
     expect(initial).toMatchObject({ repos: [], overridden: [] })
 
-    const saved = await fetch(`${h.base}/logalyze/settings`, {
+    const saved = await fetch(`${h.base}/supervisor/settings`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ ...initial.settings, download: { ...initial.settings.download, allowedHosts: ['OSS.example.com'] } }),
@@ -365,19 +365,19 @@ describe('plugin', () => {
     const state = (await json<{ ok: true; state: StateWire }>(saved)).state
     expect(state.overridden).toEqual(['download'])
     expect(JSON.parse(await readFile(overlayPath, 'utf8'))).toEqual({ download: { ...initial.settings.download, allowedHosts: ['oss.example.com'] } })
-    const withRepos = await fetch(`${h.base}/logalyze/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...initial.settings, repos: [{ url: origin }] }) })
+    const withRepos = await fetch(`${h.base}/supervisor/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...initial.settings, repos: [{ url: origin }] }) })
     expect(withRepos.status).toBe(400)
 
-    const invalid = await fetch(`${h.base}/logalyze/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...initial.settings, maxAppsPerRequest: 0 }) })
+    const invalid = await fetch(`${h.base}/supervisor/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...initial.settings, maxAppsPerRequest: 0 }) })
     expect(invalid.status).toBe(400)
     expect((await json<{ error: string }>(invalid)).error).toMatch(/^maxAppsPerRequest: /)
 
-    const crossSite = await fetch(`${h.base}/logalyze/settings`, { method: 'PUT', headers: { origin: 'https://evil.example' } })
+    const crossSite = await fetch(`${h.base}/supervisor/settings`, { method: 'PUT', headers: { origin: 'https://evil.example' } })
     expect(crossSite.status).toBe(403)
-    expect((await fetch(`${h.base}/logalyze/sync`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status).toBe(404)
-    expect((await fetch(`${h.base}/logalyze/state`, { method: 'POST' })).status).toBe(405)
+    expect((await fetch(`${h.base}/supervisor/sync`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status).toBe(404)
+    expect((await fetch(`${h.base}/supervisor/state`, { method: 'POST' })).status).toBe(405)
 
-    const reset = await fetch(`${h.base}/logalyze/settings`, { method: 'DELETE' })
+    const reset = await fetch(`${h.base}/supervisor/settings`, { method: 'DELETE' })
     expect((await json<{ state: StateWire }>(reset)).state).toMatchObject({ repos: [], overridden: [] })
   })
 
@@ -389,8 +389,8 @@ describe('plugin', () => {
     const h = await harness()
     cleanups.push(h.dispose)
     apply(h.ctx, {}, { overlayPath })
-    await waitFor(async () => (await json<StateWire>(await fetch(`${h.base}/logalyze/state`))).overlayError !== undefined)
-    const state = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
+    await waitFor(async () => (await json<StateWire>(await fetch(`${h.base}/supervisor/state`))).overlayError !== undefined)
+    const state = await json<StateWire>(await fetch(`${h.base}/supervisor/state`))
     expect(state.overlayError).toMatch(/repos: 应用仓库已改在 dsh-repo 中配置/)
     expect(state.settings.maxAppsPerRequest).toBe(4)
   })
@@ -403,7 +403,7 @@ describe('plugin', () => {
     cleanups.push(h.dispose)
     h.repos.setCatalog([{ url: origin }])
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
-    const state = async (): Promise<StateWire> => await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
+    const state = async (): Promise<StateWire> => await json<StateWire>(await fetch(`${h.base}/supervisor/state`))
 
     await waitFor(async () => (await state()).repos[0]?.available === true)
     expect((await state()).dshRepo).toEqual({
@@ -421,8 +421,8 @@ describe('plugin', () => {
       mrReviewProblem: expect.stringContaining('服务版本 8'),
     })
     h.repos.mirrorUnset = false
-    expect((await fetch(`${h.base}/logalyze/hosts`, { method: 'POST' })).status).not.toBe(200)
-    expect((await fetch(`${h.base}/logalyze/token`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tokenEnv: 'GITLAB_TOKEN', value: 'x' }) })).status).toBe(400)
+    expect((await fetch(`${h.base}/supervisor/hosts`, { method: 'POST' })).status).not.toBe(200)
+    expect((await fetch(`${h.base}/supervisor/token`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tokenEnv: 'GITLAB_TOKEN', value: 'x' }) })).status).toBe(400)
 
     const head = await commitFile(origin, 'NOTES.md', 'v2\n')
     h.repos.emitHostsChange()
@@ -435,7 +435,7 @@ describe('plugin', () => {
     const h = await harness({ dshRepos: undefined })
     cleanups.push(h.dispose)
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
-    const current = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
+    const current = await json<StateWire>(await fetch(`${h.base}/supervisor/state`))
     expect(current.dshRepo).toEqual({ availability: 'missing' })
     expect(current.repos).toEqual([])
   })
@@ -447,7 +447,7 @@ describe('plugin', () => {
     cleanups.push(h.dispose)
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
     h.rejection.value = 401
-    const response = await fetch(`${h.base}/logalyze/state`)
+    const response = await fetch(`${h.base}/supervisor/state`)
     expect(response.status).toBe(401)
   })
 
@@ -460,7 +460,7 @@ describe('plugin', () => {
     cleanups.push(h.dispose)
     apply(h.ctx, {}, { overlayPath })
     await waitFor(() => false, 50).catch(() => undefined)
-    const state = await json<StateWire>(await fetch(`${h.base}/logalyze/state`))
+    const state = await json<StateWire>(await fetch(`${h.base}/supervisor/state`))
     expect(state.overlayError).toContain('内容不合法')
     expect(state.settings.maxAppsPerRequest).toBe(4)
   })

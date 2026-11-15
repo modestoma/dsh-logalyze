@@ -5,7 +5,7 @@
  * - 精确计算新提交、新人类讨论、草稿转正式、CI 失败（仅己方 MR）与合并冲突信号；
  * - 仅将已投递的人类评论与 Bot 自身生成的评论写入已读集合，绝不吞掉回合进行中到达的新人类评论。
  *
- * @module dsh-logalyze/mr/signals
+ * @module dsh-supervisor/mr/signals
  */
 
 import type { CommentInfo, MrDetail, MrDiscussion, MrInfo, MrStatus, RepoUser } from '../deps/repos-contract.ts'

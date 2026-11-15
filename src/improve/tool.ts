@@ -1,5 +1,5 @@
 /**
- * `logalyze_improve_skill`：用户在对话中同意改进某个应用的日志分析 SKILL 后，
+ * `supervisor_improve_skill`：用户在对话中同意改进某个应用的日志分析 SKILL 后，
  * 派一个改进子 Agent 把该应用的所有改进点一次改进完（需要时把问题整理为案例），
  * 再提交到新分支、创建合并请求供用户评审。父 Agent 只在用户于对话中同意后调用；
  * 推送前 dsh-repo 按它的写操作设置可能再请用户批准一次。只改进仓库清单中可写
@@ -20,9 +20,9 @@
  *
  * 其余规则：
  *
- * - 观象在新的运行目录 `.logalyze/runs/<runId>/improve-<序号>/repo/` 从应用最新
- *   同步提交创建工作区，推送分支为新的 `logalyze/skill-<应用 id>-<runId>`；改进
- *   子 Agent 以它为工作目录、首行 `/logalyze-improve`，
+ * - 观象在新的运行目录 `.supervisor/runs/<runId>/improve-<序号>/repo/` 从应用最新
+ *   同步提交创建工作区，推送分支由 `dsh-repo` 生成；改进
+ *   子 Agent 以它为工作目录、首行 `/supervisor-improve`，
  *   直接修改 `.agents/skills/<skill>/`，改动说明写在工作区之外的
  *   `improve-<序号>/reason.md`；超时（`dispatchTimeoutMs`）或调用被取消时停止它。
  * - 改动只能是 `.agents/skills/<skill>/` 下新增或修改的文件；依据分析时必须新增
@@ -30,7 +30,7 @@
  *   分支并创建合并请求，从不推送到已有分支或默认分支。
  * - 工作区、推送和合并请求经 `dshRepos` 服务完成。子会话中不提供本工具。
  *
- * @module dsh-logalyze/improve/tool
+ * @module dsh-supervisor/improve/tool
  */
 
 import { randomBytes } from 'node:crypto'
@@ -512,7 +512,7 @@ export class SkillImprover {
       exec,
       agent: parent,
       dir: repoDir,
-      message: `${title}\n\n${reason}\n\nProposed-by: 观象 Logalyze\n${commits.map(sha => `Analyzed-commit: ${sha}\n`).join('')}`,
+      message: `${title}\n\n${reason}\n\nProposed-by: 智能监管 Supervisor\n${commits.map(sha => `Analyzed-commit: ${sha}\n`).join('')}`,
       title,
       body: `${origin}。请评审${caseRequired ? '案例和 ' : ' '}SKILL 修改。\n\n${reason.slice(0, REASON_DESCRIPTION_CHARS)}`,
     })

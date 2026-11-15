@@ -5,7 +5,7 @@
  * - 超过最大尝试次数 `maxAttempts`（或抛出标记 `permanent: true` 的错误）转入 `dead` 死信状态，支持面板手动 `retryDead` / `retryAllDead`；
  * - 严格保证 `(taskId, logId)` 维度的 `revision` 单调性：同一 `(taskId, logId)` 串行投递且高版本优先，一旦存在更高 `revision` 已完成（`done`），旧 `revision` 自动跳过并丢弃，绝不倒退覆盖平台上的新报告。
  *
- * @module dsh-logalyze/runtime/outbox
+ * @module dsh-supervisor/runtime/outbox
  */
 
 import { messageOf } from '../util/errors.ts'

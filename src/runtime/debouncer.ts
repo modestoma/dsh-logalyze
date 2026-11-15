@@ -4,7 +4,7 @@
  * - **信号合并滑动窗口（`mode: 'sliding'`）**：用于 MR 新提交/新评论防抖（每次新信号顺延窗口，可选 `maxWaitMs` 硬上限防无限推迟）。
  * - 支持立即刷出（`flush` / `flushDue` / `flushAll`）、取消（`cancel` / `cancelAll`）、可注入时钟 `now` 与平滑关闭屏障 `drainAndClose()`。
  *
- * @module dsh-logalyze/runtime/debouncer
+ * @module dsh-supervisor/runtime/debouncer
  */
 
 /** Window advancement strategy. */

@@ -2,7 +2,7 @@
  * 报告目录的文件清单：逐个 `lstat`，不跟随符号链接，统计文件数与总大小，
  * 并给出每个文件的指纹（大小与修改时间）用来找出本轮新增或改动的文件。
  *
- * @module dsh-logalyze/report/files
+ * @module dsh-supervisor/report/files
  */
 
 import { lstat, readdir } from 'node:fs/promises'

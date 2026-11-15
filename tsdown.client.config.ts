@@ -1,6 +1,6 @@
 import { defineConfig } from 'tsdown'
 
-const PACKAGE_NAME = 'dsh-logalyze'
+const PACKAGE_NAME = 'dsh-supervisor'
 
 /**
  * Client half build: one closure-factory bundle registered through

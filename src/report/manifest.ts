@@ -6,7 +6,7 @@
  * 文件不能为空。数量与大小上限来自上传设置。入口 `report.md` 由观象按日志
  * 生成，目录根下的同名文件不在清单里（见 `./files.ts`）。
  *
- * @module dsh-logalyze/report/manifest
+ * @module dsh-supervisor/report/manifest
  */
 
 import { REPORT_EXTENSIONS, REPORT_PATH_MAX_BYTES, REPORT_PATH_MAX_SEGMENTS } from '../settings/contract.ts'

@@ -1,13 +1,13 @@
 /**
  * 分析入口共用的应用准备接口；调用方自行负责鉴权与租约释放。
  *
- * @module dsh-logalyze/apps/access
+ * @module dsh-supervisor/apps/access
  */
 
 import type { ReadyApp, RepoLease } from './registry.ts'
 
 /** Runtime service for catalog-based application preparation. */
-export const LOGALYZE_APPLICATIONS_SERVICE = 'logalyzeApplications'
+export const SUPERVISOR_APPLICATIONS_SERVICE = 'supervisorApplications'
 
 /** Only enabled, usable repositories accept new work. A held lease keeps its commit after catalog changes. */
 export interface ApplicationAccess {

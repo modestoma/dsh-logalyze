@@ -1,13 +1,13 @@
 /**
  * 分析记录的持久化：每次分析一个 JSON 文件
- * `$DSH_HOME/logalyze/analyses/<id>.json`，写入先落临时文件再改名；读到的
+ * `$DSH_HOME/supervisor/analyses/<id>.json`，写入先落临时文件再改名；读到的
  * 内容按 {@link analysisRecordSchema} 校验，不合格的文件记日志后跳过。
  *
  * 保留最近活动（接受请求或记录一轮）在 {@link REPORT_RETENTION_MS} 之内的记录，
  * 最多 {@link MAX_REPORT_RECORDS} 份；清理时删除记录文件和存储目录下的报告目录
  * `<id>/`，话题工作目录里的报告目录归话题所有，不删除。
  *
- * @module dsh-logalyze/report/store
+ * @module dsh-supervisor/report/store
  */
 
 import { createHash } from 'node:crypto'
@@ -140,10 +140,10 @@ export function analysisIdOf(key: string): string {
 /**
  * Default analysis store directory.
  * @param env - process environment.
- * @returns `$DSH_HOME/logalyze/analyses`.
+ * @returns `$DSH_HOME/supervisor/analyses`.
  */
 export function defaultAnalysesDir(env: NodeJS.ProcessEnv = process.env): string {
-  return join(resolveDshHome(env), 'logalyze', 'analyses')
+  return join(resolveDshHome(env), 'supervisor', 'analyses')
 }
 
 /** Reads and writes the analysis records of one directory. */
@@ -172,7 +172,7 @@ export class AnalysisStore {
         const record = analysisRecordSchema.parse(JSON.parse(await readFile(path, 'utf8')))
         if (`${record.id}.json` === name && !this.records.has(record.id)) this.records.set(record.id, record)
       } catch (error) {
-        this.warn(`logalyze: 跳过无法读取的回传记录 ${path}：${error instanceof Error ? error.message : String(error)}`)
+        this.warn(`supervisor: 跳过无法读取的回传记录 ${path}：${error instanceof Error ? error.message : String(error)}`)
       }
     }
   }
@@ -226,7 +226,7 @@ export class AnalysisStore {
         await rm(join(this.dir, `${id}.json`), { force: true })
         await rm(join(this.dir, id), { recursive: true, force: true })
       } catch (error) {
-        this.warn(`logalyze: 删除过期回传记录 ${id} 失败：${error instanceof Error ? error.message : String(error)}`)
+        this.warn(`supervisor: 删除过期回传记录 ${id} 失败：${error instanceof Error ? error.message : String(error)}`)
       }
     }
     return dropped

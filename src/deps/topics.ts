@@ -3,7 +3,7 @@
  * 本地声明；服务在运行时经 `ctx.get('feishuTopics')` 取得，版本不符或缺少
  * 话题状态与链接表方法（较早的版本 3）时不调用。
  *
- * @module dsh-logalyze/deps/topics
+ * @module dsh-supervisor/deps/topics
  */
 
 import type { TopicsAvailability } from '../settings/contract.ts'

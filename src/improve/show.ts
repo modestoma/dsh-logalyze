@@ -1,11 +1,11 @@
 /**
- * `logalyze_show_skill`：从 `dshRepos` 的只读快照读出某个可用应用的日志分析
+ * `supervisor_show_skill`：从 `dshRepos` 的只读快照读出某个可用应用的日志分析
  * SKILL（`.agents/skills/<skill>/`）在最新同步提交中的文件列表和一个文件的
  * 内容，默认是 `SKILL.md`。用户要纠正或改进 SKILL 时，顶层 Agent 先用它对照
  * 现有内容和用户讨论。不读取 SKILL 目录以外的文件，不跟随符号链接。
  * 子会话中不提供本工具。
  *
- * @module dsh-logalyze/improve/show
+ * @module dsh-supervisor/improve/show
  */
 
 import { z } from 'zod'

@@ -1,7 +1,7 @@
 /**
  * 绑定在已持有代码快照上的可选 DSH SKILL 发现与加载封装。
  *
- * @module dsh-logalyze/skill/snapshot
+ * @module dsh-supervisor/skill/snapshot
  */
 
 import type { Agent, SkillDefinition, SkillRegistry, SkillSummary } from '../host.ts'

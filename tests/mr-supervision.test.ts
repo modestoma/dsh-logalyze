@@ -29,7 +29,7 @@ import { resolveConfig } from '../src/config.ts'
 import { CircuitBreakerRegistry } from '../src/runtime/breaker.ts'
 import { openSupervisorDomain, supervisedMrKey } from '../src/runtime/domain.ts'
 import { createSupervisionPools } from '../src/runtime/pool.ts'
-import { LogalyzeService } from '../src/service.ts'
+import { SupervisorService } from '../src/service.ts'
 import type { StateWire } from '../src/settings/contract.ts'
 import { OverlayStore } from '../src/settings/overlay.ts'
 import { loadBundledSkills } from '../src/skill/bundled.ts'
@@ -303,7 +303,7 @@ async function createServiceHarness(options: {
   let baseUrl = ''
   const config = resolveConfig(options.mrConfig === undefined ? {} : { mrReview: options.mrConfig })
   const bundled = loadBundledSkills(new URL('../skills/', import.meta.url))
-  const service = new LogalyzeService(
+  const service = new SupervisorService(
     ctx,
     config,
     new OverlayStore(join(options.dir, 'settings.json')),
@@ -450,7 +450,7 @@ describe('MR signal helpers & bot normalization', () => {
 
 describe('MrSupervisor end-to-end stateful supervision loop', () => {
   it('runs initial review, prevents bot self-triggers, preserves mid-turn human comments, and reuses the same session on coalesced updates', async () => {
-    const { dir, cleanup } = await tempDir('logalyze-mr-e2e-')
+    const { dir, cleanup } = await tempDir('supervisor-mr-e2e-')
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'repo-origin'))
     const fakeV8 = new FakeReposV8(join(dir, 'repos'))
@@ -595,7 +595,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
   })
 
   it('skips polling a repository cleanly when currentBotUser fails (self-trigger iron law)', async () => {
-    const { dir, cleanup } = await tempDir('logalyze-mr-bot-err-')
+    const { dir, cleanup } = await tempDir('supervisor-mr-bot-err-')
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'repo'))
     const fakeV8 = new FakeReposV8(join(dir, 'repos'))
@@ -618,7 +618,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
   })
 
   it('handles self-fix CI retry cap, ownPushedShas suppression, merge conflict alert, and IssueMemory fix on merge', async () => {
-    const { dir, cleanup } = await tempDir('logalyze-mr-selffix-')
+    const { dir, cleanup } = await tempDir('supervisor-mr-selffix-')
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'repo'))
     const fakeV8 = new FakeReposV8(join(dir, 'repos'))
@@ -723,7 +723,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
   })
 
   it('trips per-MR circuit breaker when limit is reached, resets cleanly via HTTP route, and recovers pending state across restart', async () => {
-    const { dir, cleanup } = await tempDir('logalyze-mr-breaker-')
+    const { dir, cleanup } = await tempDir('supervisor-mr-breaker-')
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'repo'))
     const fakeV8 = new FakeReposV8(join(dir, 'repos'))
@@ -762,12 +762,12 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     await supervisor.flushDebouncedDue()
     expect(turnCount).toBe(1)
 
-    const stateBeforeReset = await fetch(`${h.baseUrl}/logalyze/state`).then(r => r.json() as Promise<StateWire>)
+    const stateBeforeReset = await fetch(`${h.baseUrl}/supervisor/state`).then(r => r.json() as Promise<StateWire>)
     const mrBreaker = stateBeforeReset.mrSupervision?.breakers.find(b => b.scope === 'mr' && b.tripped)
     expect(mrBreaker).toBeDefined()
 
-    // Reset via HTTP POST /logalyze/breakers/reset -> resumes blocked MR!
-    const resetRes = await fetch(`${h.baseUrl}/logalyze/breakers/reset`, {
+    // Reset via HTTP POST /supervisor/breakers/reset -> resumes blocked MR!
+    const resetRes = await fetch(`${h.baseUrl}/supervisor/breakers/reset`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ scope: mrBreaker!.scope, key: mrBreaker!.key }),
@@ -812,7 +812,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
   })
 
   it('does not re-queue in-flight delivered notes if a poll runs while a discussion turn is still executing', async () => {
-    const { dir, cleanup } = await tempDir('logalyze-mr-inflight-notes-')
+    const { dir, cleanup } = await tempDir('supervisor-mr-inflight-notes-')
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'repo'))
     const fakeV8 = new FakeReposV8(join(dir, 'repos'))
@@ -879,7 +879,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
   })
 
   it('halts retries when blocked by breaker or disabled settings and resumes dormant work after cooldown', async () => {
-    const { dir, cleanup } = await tempDir('logalyze-mr-breaker-dormant-')
+    const { dir, cleanup } = await tempDir('supervisor-mr-breaker-dormant-')
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'repo'))
     const fakeV8 = new FakeReposV8(join(dir, 'repos'))
@@ -925,7 +925,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     expect(dormantRec?.pendingSignals).toHaveLength(1)
 
     // Disable supervision via HTTP PUT while pending, then advance past 24h cooldown: still dormant while disabled
-    const disableRes = await fetch(`${h.baseUrl}/logalyze/settings`, {
+    const disableRes = await fetch(`${h.baseUrl}/supervisor/settings`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ mrReview: { enabled: false } }),
@@ -936,7 +936,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     expect(turnCount).toBe(1)
 
     // Re-enable supervision -> dormant pending signal recovers and runs Turn 2 without manual breaker reset
-    const enableRes = await fetch(`${h.baseUrl}/logalyze/settings`, {
+    const enableRes = await fetch(`${h.baseUrl}/supervisor/settings`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ mrReview: { enabled: true } }),
@@ -949,7 +949,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
   })
 
   it('transitions MR to merged without deadlocking when mrList returns open but mrGet returns merged', async () => {
-    const { dir, cleanup } = await tempDir('logalyze-mr-terminal-lock-')
+    const { dir, cleanup } = await tempDir('supervisor-mr-terminal-lock-')
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'repo'))
     const fakeV8 = new FakeReposV8(join(dir, 'repos'))
@@ -1005,7 +1005,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
   })
 
   it('anchors discovery cursor on listed updatedAt rather than poll completion clock', async () => {
-    const { dir, cleanup } = await tempDir('logalyze-mr-cursor-')
+    const { dir, cleanup } = await tempDir('supervisor-mr-cursor-')
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'repo'))
     const fakeV8 = new FakeReposV8(join(dir, 'repos'))
@@ -1055,7 +1055,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
   })
 
   it('preserves signals appended by a concurrent poll while executeMrTurn is fetching remote state', async () => {
-    const { dir, cleanup } = await tempDir('logalyze-mr-concurrent-signal-')
+    const { dir, cleanup } = await tempDir('supervisor-mr-concurrent-signal-')
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'repo'))
     const fakeV8 = new FakeReposV8(join(dir, 'repos'))
@@ -1131,7 +1131,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
   })
 
   it('resumes pending review after disabling and re-enabling supervision mid-debounce without new remote updates', async () => {
-    const { dir, cleanup } = await tempDir('logalyze-mr-disable-debounce-')
+    const { dir, cleanup } = await tempDir('supervisor-mr-disable-debounce-')
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'repo'))
     const fakeV8 = new FakeReposV8(join(dir, 'repos'))
@@ -1166,7 +1166,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     expect(domain.supervisedMrs.get(key46)?.dueAt).toBe(clockMs + 5000)
 
     // Disable supervision mid-debounce -> timer cancelled and durable deadline cleared.
-    const disableRes = await fetch(`${h.baseUrl}/logalyze/settings`, {
+    const disableRes = await fetch(`${h.baseUrl}/supervisor/settings`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ mrReview: { enabled: false } }),
@@ -1180,7 +1180,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     expect(turnCount).toBe(0)
 
     // Re-enable supervision without any new remote update -> queued review runs automatically.
-    const enableRes = await fetch(`${h.baseUrl}/logalyze/settings`, {
+    const enableRes = await fetch(`${h.baseUrl}/supervisor/settings`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ mrReview: { enabled: true } }),
@@ -1193,7 +1193,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
   })
 
   it('restores opened and push-only signal batches when sessionDriver returns an error or throws', async () => {
-    const { dir, cleanup } = await tempDir('logalyze-mr-note-free-rollback-')
+    const { dir, cleanup } = await tempDir('supervisor-mr-note-free-rollback-')
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'repo'))
     const fakeV8 = new FakeReposV8(join(dir, 'repos'))
@@ -2438,7 +2438,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
   })
 
   it('injects mrReview.customInstructions into MR prompt and sends breaker alert to mrReview.feishuChatId', async () => {
-    const { dir, cleanup } = await tempDir('logalyze-mr-custom-alert-')
+    const { dir, cleanup } = await tempDir('supervisor-mr-custom-alert-')
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'repo'))
     const fakeV8 = new FakeReposV8(join(dir, 'repos'))

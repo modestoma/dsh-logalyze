@@ -5,7 +5,7 @@
  * 3. `supervisor_log_submit`：1:1 槽位覆盖校验 + 证据路径真实性校验 + 附件快照，原子写入 `log_tasks` 修订并触发 `IssueMemory` 更新与 `OutboxRunner` 回传；
  * 4. `supervisor_log_push_mr`：携带调用者 `agent` / `callId` 经 `dshRepos.workspacePush` 提交 `fix_code` 或隔离工作区 `improve_skill` MR，回填 `IssueMemory.fixMrUrl` 并登记进「审微」MR 监管队列。
  *
- * @module dsh-logalyze/log/tools
+ * @module dsh-supervisor/log/tools
  */
 
 import { constants } from 'node:fs'
@@ -73,7 +73,7 @@ export interface LogWorkspaceManifest {
   readonly slots: readonly LogSlotManifestEntry[]
 }
 
-/** Runtime callbacks supplied to log supervision tools by `LogSupervisor` & `LogalyzeService`. */
+/** Runtime callbacks supplied to log supervision tools by `LogSupervisor` & `SupervisorService`. */
 export interface LogToolsRuntime {
   resolveApp(appOrAlias: string): ReadyApp
   readyApp(appId: string): ReadyApp

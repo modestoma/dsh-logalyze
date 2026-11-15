@@ -1,7 +1,7 @@
 /**
  * 飞书渠道插件 `feishuActions` 服务（v1）的运行时发现与版本校验辅助函数。
  *
- * @module dsh-logalyze/deps/actions
+ * @module dsh-supervisor/deps/actions
  */
 
 import type { ActionsAvailability } from '../settings/contract.ts'

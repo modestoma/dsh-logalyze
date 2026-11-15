@@ -246,12 +246,12 @@ describe('report tracking', () => {
     const outside = join(h.workDir, 'outside.md')
     await writeFile(outside, 'outside the report directory')
     await symlink(outside, join(reportDir, 'report.md'))
-    h.turn(1, { question: '/logalyze 分析', reply: '整批根因：内存溢出 ![图](report/chart.png) [日志](/var/log/app.log)' })
+    h.turn(1, { question: '/supervisor 分析', reply: '整批根因：内存溢出 ![图](report/chart.png) [日志](/var/log/app.log)' })
     await h.completed(2)
 
     const [first, second] = h.platform.revisions
     expect([first?.logId, second?.logId]).toEqual([logUuid(1), logUuid(2)])
-    expect(first?.key).toBe(`logalyze:${record.id}:L1:r1:g0`)
+    expect(first?.key).toBe(`supervisor:${record.id}:L1:r1:g0`)
     expect([...first!.sizes.keys()].sort()).toEqual(['chart.png', 'logs/L1.md', 'report.md'])
     const entry = h.platform.entryOf(first!)
     expect(entry).toContain('## 本日志结论\n\n根因 A，见 ![图](chart.png)')
@@ -270,7 +270,7 @@ describe('report tracking', () => {
     await writeFile(join(reportDir, 'detail.md'), '# 细节')
     h.turn(2, { question: '<feishu_quote>x</feishu_quote>为什么会溢出？', reply: '因为缓存没有上限。' })
     await h.completed(4)
-    expect(h.platform.revisions[2]?.key).toBe(`logalyze:${record.id}:L1:r2:g0`)
+    expect(h.platform.revisions[2]?.key).toBe(`supervisor:${record.id}:L1:r2:g0`)
     expect(h.platform.entryOf(h.platform.revisions[2]!)).toContain('## 追问 1\n\n> 为什么会溢出？\n\n因为缓存没有上限。\n\n**本轮文件**\n\n- [detail.md](detail.md)')
     expect(h.topics.links).toHaveLength(linkCalls)
 
@@ -346,7 +346,7 @@ describe('report tracking', () => {
     await writeFile(join(h.workDir, 'report', 'a.txt'), 'new')
     expect(h.tracker.retry(record.id)).toBe(true)
     await h.completed(2)
-    expect(h.platform.revisions[1]?.key).toBe(`logalyze:${record.id}:L1:r1:g1`)
+    expect(h.platform.revisions[1]?.key).toBe(`supervisor:${record.id}:L1:r1:g1`)
     expect(h.platform.revisions[1]?.files.get('a.txt')?.toString('utf8')).toBe('new')
   })
 
@@ -390,7 +390,7 @@ describe('report tracking', () => {
     h.platform.fail('create', 409)
     h.turn(1, { reply: '结论' })
     await h.completed(1)
-    expect(h.platform.revisions[0]?.key).toBe(`logalyze:${record.id}:L1:r1:g1`)
+    expect(h.platform.revisions[0]?.key).toBe(`supervisor:${record.id}:L1:r1:g1`)
     expect(h.store.get(record.id)?.logs[0]?.generation).toBe(1)
   })
 

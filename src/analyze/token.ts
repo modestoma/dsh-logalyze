@@ -3,7 +3,7 @@
  * `analyzeTokenRef`）和日志平台的 client_secret（`platformSecretRef`）。面板只能
  * 看到是否已配置和来源，看不到值。
  *
- * @module dsh-logalyze/analyze/token
+ * @module dsh-supervisor/analyze/token
  */
 
 import { z } from 'zod'
@@ -49,7 +49,7 @@ export class StoredCredential {
     try {
       return (await this.credentials()?.resolve(this.ref))?.value
     } catch (error) {
-      this.warn(`logalyze: 读取${this.label} ${this.ref} 失败：${messageOf(error)}`)
+      this.warn(`supervisor: 读取${this.label} ${this.ref} 失败：${messageOf(error)}`)
       return undefined
     }
   }

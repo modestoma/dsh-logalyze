@@ -1,7 +1,7 @@
 /**
  * 智能监管中心共享运行时原语导出（存储域、并发池、防抖器、熔断器、幂等 Outbox）。
  *
- * @module dsh-logalyze/runtime
+ * @module dsh-supervisor/runtime
  */
 
 export * from './storage.ts'

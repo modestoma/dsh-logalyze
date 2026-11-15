@@ -5,7 +5,7 @@
  * 报告目录的路径，检查调用方打不开的链接，并为回复没有引用的本轮新文件补一段
  * 「本轮文件」。只做字符串处理，不读写文件。
  *
- * @module dsh-logalyze/report/render
+ * @module dsh-supervisor/report/render
  */
 
 import { posix } from 'node:path'

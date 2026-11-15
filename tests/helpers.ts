@@ -23,7 +23,7 @@ export function git(cwd: string, ...args: string[]): string {
 }
 
 /** A temporary directory removed by the returned cleanup. */
-export async function tempDir(prefix = 'logalyze-'): Promise<{ dir: string; cleanup: () => Promise<void> }> {
+export async function tempDir(prefix = 'supervisor-'): Promise<{ dir: string; cleanup: () => Promise<void> }> {
   const dir = await mkdtemp(join(tmpdir(), prefix))
   // A git process a disposed plugin left running may still be writing; retry until it exits.
   return { dir, cleanup: () => rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }) }

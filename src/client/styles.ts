@@ -1,11 +1,11 @@
 /**
- * 「观象」页面样式。使用 DSH 语义 token（`--dsw-alias-*`）并带中性回退，
+ * 「智能监管」页面样式。使用 DSH 语义 token（`--dsw-alias-*`）并带中性回退，
  * 页面随当前主题变化。
  *
- * @module dsh-logalyze/client/styles
+ * @module dsh-supervisor/client/styles
  */
 
-const STYLE_ATTRIBUTE = 'data-dsh-logalyze-css'
+const STYLE_ATTRIBUTE = 'data-dsh-supervisor-css'
 
 const CSS = `
 .lz-page{width:100%;height:100%;min-width:0;min-height:0;overflow:auto;scrollbar-gutter:stable;background:var(--dsw-alias-bg-base,#fff)}
