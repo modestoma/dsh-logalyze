@@ -925,9 +925,19 @@ describe('OutboxRunner', () => {
     const internalPool = (runner as unknown as { pool: { queuedCount: number } }).pool
     expect(internalPool.queuedCount).toBe(1)
 
+    // A later `processDue()` started after `log-1` already entered `'uploading'` must still join its in-flight pass.
+    let lateSettled = false
+    const latePass = runner.processDue().then((res) => {
+      lateSettled = true
+      return res
+    })
+    await new Promise(resolve => setTimeout(resolve, 15))
+    expect(lateSettled).toBe(false)
+
     firstGate.resolve()
-    const summaries = await Promise.all(passes)
-    const totalDelivered = summaries.reduce((acc, item) => acc + item.delivered, 0)
+    const [lateSummary, ...summaries] = await Promise.all([latePass, ...passes])
+    expect(lateSettled).toBe(true)
+    const totalDelivered = summaries.reduce((acc, item) => acc + item.delivered, lateSummary.delivered)
     expect(totalDelivered).toBe(2)
     expect(delivered).toEqual(['log-1:rev1', 'log-2:rev1'])
 

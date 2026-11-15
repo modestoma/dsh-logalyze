@@ -18,6 +18,17 @@ describe('configuration', () => {
       dailyMrTurnLimit: 12,
       repoHourlyTurnLimit: 30,
     })
+    expect(defaultsOf(config).logSupervision).toEqual({
+      enabled: false,
+      pollIntervalMs: 60_000,
+      batchSizeThreshold: 5,
+      maxBatchSize: 20,
+      batchWindowMs: 300_000,
+      maxConcurrentBatches: 4,
+      appHourlyBatchLimit: 15,
+      deliveryMode: 'quiet-until-done',
+      maxUnpackBytes: 512 * 1024 * 1024,
+    })
   })
 
   it('normalizes allowed hosts and rejects schemes', () => {

@@ -28,3 +28,15 @@ export const MR_RESOLVE_THREAD_TOOL_NAME = 'supervisor_mr_resolve_thread'
 
 /** Records a reviewed/fixed checkpoint and optional bot-pushed commit SHA. */
 export const MR_CHECKPOINT_TOOL_NAME = 'supervisor_mr_checkpoint'
+
+/** Prepares or refreshes log analysis materials (<workDir>/logs, repos/<app>, scratch) and pre-searches IssueMemory. */
+export const LOG_PREPARE_TOOL_NAME = 'supervisor_log_prepare'
+
+/** Searches local IssueMemory for matching historical issues and human conclusions. */
+export const ISSUE_SEARCH_TOOL_NAME = 'supervisor_issue_search'
+
+/** Submits or revises structured per-log conclusions, enqueues idempotent platform report uploads, and updates IssueMemory. */
+export const LOG_SUBMIT_TOOL_NAME = 'supervisor_log_submit'
+
+/** Pushes code-fix or knowledge/SKILL changes to a new branch, opens an MR via dshRepos, and registers it in MrSupervisor. */
+export const LOG_PUSH_MR_TOOL_NAME = 'supervisor_log_push_mr'

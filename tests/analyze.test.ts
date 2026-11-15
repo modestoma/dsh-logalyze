@@ -42,7 +42,7 @@ afterEach(async () => { await Promise.all(cleanups.splice(0).map(cleanup => clea
 /** Platform metadata as the client returns it. */
 function platformLog(log: FakeLog): PlatformLog {
   return {
-    product_code: null, product_sn: null, hw_version: null, sw_version: null, component_version: null, log_type: null, file_size_bytes: null, created_at: null, detail_url: null,
+    product_code: null, product_sn: null, hw_version: null, sw_version: null, component_version: null, log_type: null, file_size_bytes: null, created_at: null, archived_at: null, detail_url: null,
     ...log,
   }
 }

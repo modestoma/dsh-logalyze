@@ -325,8 +325,10 @@ export class OutboxRunner {
   private async runDuePass(at: number): Promise<OutboxProcessSummary> {
     const duePairs = new Map<string, { readonly taskId: string; readonly logId: string }>()
     for (const [, record] of this.table.entries()) {
-      if (record.status !== 'pending' || record.nextRetryAt > at) continue
       const pairKey = targetLockKey(record.taskId, record.logId)
+      const isDuePending = record.status === 'pending' && record.nextRetryAt <= at
+      const isInFlightUploading = record.status === 'uploading' && this.activePairPasses.has(pairKey)
+      if (!isDuePending && !isInFlightUploading) continue
       if (!duePairs.has(pairKey)) {
         duePairs.set(pairKey, { taskId: record.taskId, logId: record.logId })
       }

@@ -17,6 +17,10 @@ export const REPORT_UPLOAD_ROUTE = '/logalyze/reports/upload'
 export const TOKEN_ROUTE = '/logalyze/token'
 /** POST：body `{ scope, key }` 重置（un-trip）指定的熔断器，恢复受阻的 MR/日志自动监管。 */
 export const BREAKER_RESET_ROUTE = '/logalyze/breakers/reset'
+/** POST：body `{ action: 'rewind' | 'pause' | 'resume', cursorTime? }` 控制日志平台自动轮询水位线。 */
+export const LOG_WATERMARK_ROUTE = '/logalyze/log-supervision/watermark'
+/** POST：body `{ key? }` 立即重试指定或全部处于 dead 状态的平台报告回传任务。 */
+export const OUTBOX_RETRY_ROUTE = '/logalyze/outbox/retry'
 
 /**
  * POST：日志平台分析接口（Bearer 令牌鉴权，不走 DSH 登录）。它在 DSH 的
@@ -151,6 +155,33 @@ export interface MrReviewSettings {
   repoHourlyTurnLimit: number
 }
 
+/** Feishu delivery mode for automatic log-supervision batches. */
+export type LogDeliveryMode = 'quiet-until-done' | 'topic-on-start'
+
+/** Automatic log-platform polling, window batching, and action-gated supervision policy. */
+export interface LogSupervisionSettings {
+  /** Whether automatic log-platform polling and batch dispatch are active. */
+  enabled: boolean
+  /** Polling interval across archived platform logs, in milliseconds. */
+  pollIntervalMs: number
+  /** Batch size trigger threshold (immediate dispatch when reached). */
+  batchSizeThreshold: number
+  /** Maximum number of logs included in a single dispatched batch. */
+  maxBatchSize: number
+  /** Maximum wait window from the first log arrival before forcing dispatch, in milliseconds. */
+  batchWindowMs: number
+  /** Maximum concurrent log supervision tasks running at once (`logPool`). */
+  maxConcurrentBatches: number
+  /** Per-application rolling hourly batch cap before tripping `log:<appId>` circuit breaker. */
+  appHourlyBatchLimit: number
+  /** Target Feishu group chat (`oc_…`) for automatic batch topics/cards; omitted runs headless. */
+  feishuChatId?: string
+  /** Feishu delivery mode (`quiet-until-done` default or `topic-on-start`). */
+  deliveryMode: LogDeliveryMode
+  /** Maximum cumulative uncompressed bytes allowed per unpacked log archive slot. */
+  maxUnpackBytes: number
+}
+
 /** The settings the Web panel can override; every field is required on the wire. */
 export interface EditableSettings {
   /** Minimum age of a repository's last read of its application description before loading `/logalyze` reads it again, in milliseconds; 0 reads on every load. */
@@ -167,10 +198,12 @@ export interface EditableSettings {
   analyze: AnalyzeSettings
   /** MR automatic supervision and incremental review. */
   mrReview: MrReviewSettings
+  /** Automatic log-platform supervision, window batching, and outbox delivery. */
+  logSupervision: LogSupervisionSettings
 }
 
 /** Keys of {@link EditableSettings}, in panel order. */
-export const EDITABLE_KEYS = ['fetchIntervalMs', 'maxAppsPerRequest', 'dispatchTimeoutMs', 'download', 'skillUpdates', 'analyze', 'mrReview'] as const satisfies readonly (keyof EditableSettings)[]
+export const EDITABLE_KEYS = ['fetchIntervalMs', 'maxAppsPerRequest', 'dispatchTimeoutMs', 'download', 'skillUpdates', 'analyze', 'mrReview', 'logSupervision'] as const satisfies readonly (keyof EditableSettings)[]
 
 /** One editable key. */
 export type EditableKey = (typeof EDITABLE_KEYS)[number]
@@ -411,6 +444,67 @@ export interface MrSupervisionWire {
   breakers: BreakerStatusWire[]
 }
 
+/** Log-platform polling watermark summary shown in the Web panel. */
+export interface LogWatermarkWire {
+  cursorTime?: string
+  backfillFrom?: string
+  backfillTo?: string
+  paused: boolean
+  lastPollAt?: number
+  lastError?: string
+  consecutiveFailures: number
+}
+
+/** One aggregated batch still waiting in `pending_batches`. */
+export interface PendingLogBatchWire {
+  key: string
+  appId: string
+  productCode?: string
+  componentCode: string
+  errorCode?: string
+  count: number
+  windowOpenedAt: number
+}
+
+/** Recent log supervision task summary shown in the Web panel. */
+export interface LogTaskSummaryWire {
+  taskId: string
+  source: 'platform' | 'feishu'
+  appId: string
+  appName?: string
+  errorCode?: string
+  status: 'running' | 'completed' | 'failed' | 'interrupted'
+  inputCount: number
+  revisionCount: number
+  latestSummary?: string
+  sessionId?: string
+  feishuLaunchKey?: string
+  createdAt?: number
+  updatedAt?: number
+}
+
+/** Dead-letter platform upload entry awaiting manual retry in the Web panel. */
+export interface OutboxDeadWire {
+  key: string
+  taskId: string
+  revision: number
+  logId: string
+  attempts: number
+  lastError?: string
+}
+
+/** Log supervision overview in {@link StateWire}. */
+export interface LogSupervisionWire {
+  enabled: boolean
+  running: number
+  watermark: LogWatermarkWire
+  pendingBatches: PendingLogBatchWire[]
+  tasks: LogTaskSummaryWire[]
+  outboxPendingCount: number
+  outboxDead: OutboxDeadWire[]
+  breakers: BreakerStatusWire[]
+}
+
 /** `GET /logalyze/state` response. */
 export interface StateWire {
   /** Effective settings: cordis.yml values with panel overrides applied. */
@@ -430,6 +524,8 @@ export interface StateWire {
   analyze: AnalyzeWire
   /** Live state of stateful MR supervision and breakers. */
   mrSupervision?: MrSupervisionWire
+  /** Live state of stateful log supervision, pending batches, outbox, and app breakers. */
+  logSupervision?: LogSupervisionWire
 }
 
 /** Successful mutation response. */

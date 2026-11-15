@@ -4,7 +4,7 @@
  * @module dsh-logalyze/client/api
  */
 
-import { APPLICATION_ROUTE, BREAKER_RESET_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
+import { APPLICATION_ROUTE, BREAKER_RESET_ROUTE, LOG_WATERMARK_ROUTE, OUTBOX_RETRY_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
 import type { ApplicationMetadata, BreakerStatusWire, EditableSettings, MutationError, MutationOk, StateWire } from '../settings/contract.ts'
 
 /**
@@ -103,4 +103,14 @@ export async function saveApplication(url: string, metadata: ApplicationMetadata
 /** Reset a tripped or active supervision circuit breaker and resume blocked work. */
 export async function resetBreaker(scope: BreakerStatusWire['scope'], key: string): Promise<StateWire> {
   return (await request<MutationOk>(BREAKER_RESET_ROUTE, { method: 'POST', body: JSON.stringify({ scope, key }) })).state
+}
+
+/** Pause, resume, or rewind the automatic log-platform polling watermark. */
+export async function updateLogWatermark(payload: { action: 'pause' | 'resume' | 'rewind'; cursorTime?: string }): Promise<StateWire> {
+  return (await request<MutationOk>(LOG_WATERMARK_ROUTE, { method: 'POST', body: JSON.stringify(payload) })).state
+}
+
+/** Retry one or all dead-letter platform outbox uploads immediately. */
+export async function retryOutboxDead(key?: string): Promise<StateWire> {
+  return (await request<MutationOk>(OUTBOX_RETRY_ROUTE, { method: 'POST', body: JSON.stringify(key === undefined ? {} : { key }) })).state
 }

@@ -8,8 +8,8 @@
  */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
-import type { AnalysisWire, AnalyzeWire, ApplicationMetadata, BreakerStatusWire, EditableKey, EditableSettings, LegacyReportWire, MrSupervisionWire, PlatformClientAuth, ReportStatus, RepoStatusWire, StateWire, SupervisedMrWire, TokenStatusWire, UploadPhase } from '../settings/contract.ts'
-import { clearToken, fetchState, messageOf, resetBreaker, resetSettings, retryReport, saveApplication, saveSettings, saveToken } from './api.ts'
+import type { AnalysisWire, AnalyzeWire, ApplicationMetadata, BreakerStatusWire, EditableKey, EditableSettings, LegacyReportWire, LogDeliveryMode, LogSupervisionWire, MrSupervisionWire, PlatformClientAuth, ReportStatus, RepoStatusWire, StateWire, SupervisedMrWire, TokenStatusWire, UploadPhase } from '../settings/contract.ts'
+import { clearToken, fetchState, messageOf, resetBreaker, resetSettings, retryOutboxDead, retryReport, saveApplication, saveSettings, saveToken, updateLogWatermark } from './api.ts'
 import { CHAT_ID_PATTERN } from '../settings/contract.ts'
 
 /** Sidebar label and page title. */
@@ -19,10 +19,11 @@ const KB = 1024
 const MB = 1024 * 1024
 const MINUTE = 60 * 1000
 
-type TabId = 'repos' | 'mr' | 'download' | 'analyze' | 'advanced'
+type TabId = 'repos' | 'log' | 'mr' | 'download' | 'analyze' | 'advanced'
 
 const TABS: readonly { id: TabId; label: string }[] = [
   { id: 'repos', label: '应用仓库' },
+  { id: 'log', label: '日志监管' },
   { id: 'mr', label: 'MR 评审' },
   { id: 'download', label: '日志下载' },
   { id: 'analyze', label: '分析接口' },
@@ -67,6 +68,16 @@ interface Draft {
   mrMaxAutoFix: string
   mrDailyTurnLimit: string
   mrRepoHourlyLimit: string
+  logEnabled: boolean
+  logPollIntervalSec: string
+  logBatchSizeThreshold: string
+  logMaxBatchSize: string
+  logBatchWindowMin: string
+  logMaxConcurrentBatches: string
+  logAppHourlyBatchLimit: string
+  logFeishuChatId: string
+  logDeliveryMode: LogDeliveryMode
+  logMaxUnpackMb: string
 }
 
 function trimNumber(value: number): string {
@@ -110,6 +121,16 @@ function toDraft(settings: EditableSettings): Draft {
     mrMaxAutoFix: String(settings.mrReview.maxAutoFixAttempts),
     mrDailyTurnLimit: String(settings.mrReview.dailyMrTurnLimit),
     mrRepoHourlyLimit: String(settings.mrReview.repoHourlyTurnLimit),
+    logEnabled: settings.logSupervision.enabled,
+    logPollIntervalSec: trimNumber(settings.logSupervision.pollIntervalMs / 1000),
+    logBatchSizeThreshold: String(settings.logSupervision.batchSizeThreshold),
+    logMaxBatchSize: String(settings.logSupervision.maxBatchSize),
+    logBatchWindowMin: trimNumber(settings.logSupervision.batchWindowMs / MINUTE),
+    logMaxConcurrentBatches: String(settings.logSupervision.maxConcurrentBatches),
+    logAppHourlyBatchLimit: String(settings.logSupervision.appHourlyBatchLimit),
+    logFeishuChatId: settings.logSupervision.feishuChatId ?? '',
+    logDeliveryMode: settings.logSupervision.deliveryMode,
+    logMaxUnpackMb: trimNumber(settings.logSupervision.maxUnpackBytes / MB),
   }
 }
 
@@ -138,6 +159,11 @@ function fromDraft(draft: Draft): EditableSettings {
   if (!Number.isInteger(maxFiles)) throw new Error('改进文件数上限必须是整数')
   const defaultChatId = draft.analyzeDefaultChatId.trim()
   if (defaultChatId !== '' && !CHAT_ID_PATTERN.test(defaultChatId)) throw new Error('默认群必须是飞书群的 chat_id（oc_ 开头）')
+  const logFeishuChatId = draft.logFeishuChatId.trim()
+  if (logFeishuChatId !== '' && !CHAT_ID_PATTERN.test(logFeishuChatId)) throw new Error('日志监管目标群必须是飞书群的 chat_id（oc_ 开头）')
+  const logBatchSizeThreshold = integer(draft.logBatchSizeThreshold, '攒批触发条数')
+  const logMaxBatchSize = integer(draft.logMaxBatchSize, '单批日志上限')
+  if (logBatchSizeThreshold > logMaxBatchSize) throw new Error('攒批触发条数不能大于单批日志上限')
   return {
     fetchIntervalMs: Math.round(positive(draft.fetchIntervalMin, '更新间隔', true) * MINUTE),
     maxAppsPerRequest: maxApps,
@@ -185,6 +211,18 @@ function fromDraft(draft: Draft): EditableSettings {
       maxAutoFixAttempts: integer(draft.mrMaxAutoFix, 'CI 自动修复上限', true),
       dailyMrTurnLimit: integer(draft.mrDailyTurnLimit, '单 MR 日唤醒上限'),
       repoHourlyTurnLimit: integer(draft.mrRepoHourlyLimit, '单仓库小时唤醒上限'),
+    },
+    logSupervision: {
+      enabled: draft.logEnabled,
+      pollIntervalMs: Math.round(positive(draft.logPollIntervalSec, '日志轮询间隔') * 1000),
+      batchSizeThreshold: logBatchSizeThreshold,
+      maxBatchSize: logMaxBatchSize,
+      batchWindowMs: Math.round(positive(draft.logBatchWindowMin, '攒批等待窗口', true) * MINUTE),
+      maxConcurrentBatches: integer(draft.logMaxConcurrentBatches, '日志并发上限'),
+      appHourlyBatchLimit: integer(draft.logAppHourlyBatchLimit, '单应用小时批次数上限'),
+      ...logFeishuChatId === '' ? {} : { feishuChatId: logFeishuChatId },
+      deliveryMode: draft.logDeliveryMode,
+      maxUnpackBytes: Math.round(positive(draft.logMaxUnpackMb, '单日志解压上限') * MB),
     },
   }
 }
@@ -284,7 +322,7 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
   }, [syncing, reload])
 
   useEffect(() => {
-    if (tab !== 'analyze' && tab !== 'mr') return
+    if (tab !== 'analyze' && tab !== 'mr' && tab !== 'log') return
     const timer = setInterval(() => { void reload(false) }, 5000)
     return () => { clearInterval(timer) }
   }, [tab, reload])
@@ -363,6 +401,18 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
       {state.overlayError === undefined ? null : <div className="lz__notice lz__notice--error">面板设置文件未生效：{state.overlayError}。保存一次会用当前内容覆盖它。</div>}
       <div className="lz__body" role="tabpanel">
         <div hidden={tab !== 'repos'}><ReposTab state={state} openRepoSettings={openRepoSettings} busy={busy} onSave={saveApp} /></div>
+        {tab === 'log'
+          ? <LogSupervisionTab
+              draft={draft}
+              setDraft={setDraft}
+              supervision={state.logSupervision}
+              overridden={state.overridden}
+              busy={busy}
+              onResetBreaker={(scope, key) => { void run(() => resetBreaker(scope, key), '已解除熔断并恢复等待任务', false) }}
+              onUpdateWatermark={(payload) => { void run(() => updateLogWatermark(payload), '已更新日志轮询水位线', false) }}
+              onRetryOutbox={(key) => { void run(() => retryOutboxDead(key), '已重新入队死信报告', false) }}
+            />
+          : null}
         {tab === 'mr'
           ? <MrReviewTab
               draft={draft}
@@ -1031,6 +1081,204 @@ function MrReviewTab({
             <input className="lz__input" placeholder="忽略标签名，例如 no-ai-review" value={labelInput} onChange={(event) => { setLabelInput(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') addLabel() }} />
             <button type="button" className="lz__btn" disabled={labelInput.trim() === ''} onClick={addLabel}>添加忽略标签</button>
           </div>
+        </div>
+      </section>
+    </>
+  )
+}
+
+const LOG_TASK_STATUS_LABEL: Readonly<Record<'running' | 'completed' | 'failed' | 'interrupted', { pill: string; text: string }>> = {
+  running: { pill: 'lz__pill--warn', text: '分析中' },
+  completed: { pill: 'lz__pill--ok', text: '已完成' },
+  failed: { pill: 'lz__pill--bad', text: '失败' },
+  interrupted: { pill: 'lz__pill--warn', text: '已中断' },
+}
+
+function LogSupervisionTab({
+  draft,
+  setDraft,
+  supervision,
+  overridden,
+  busy,
+  onResetBreaker,
+  onUpdateWatermark,
+  onRetryOutbox,
+}: TabProps & {
+  supervision: LogSupervisionWire | undefined
+  overridden: readonly EditableKey[]
+  busy: boolean
+  onResetBreaker: (scope: BreakerStatusWire['scope'], key: string) => void
+  onUpdateWatermark: (payload: { action: 'pause' | 'resume' | 'rewind'; cursorTime?: string }) => void
+  onRetryOutbox: (key?: string) => void
+}): JSX.Element {
+  const [rewindTime, setRewindTime] = useState('')
+  const wm = supervision?.watermark
+  const batches = supervision?.pendingBatches ?? []
+  const tasks = supervision?.tasks ?? []
+  const dead = supervision?.outboxDead ?? []
+  const breakers = supervision?.breakers ?? []
+  return (
+    <>
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">观象轮询水位线与运行状态</h2>
+        <div className="lz__list">
+          <div className="lz__row lz__row--top">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">
+                <span className={`lz__pill ${supervision?.enabled && !wm?.paused ? 'lz__pill--ok' : 'lz__pill--warn'}`}>
+                  <span className="lz__dot" />
+                  {!supervision?.enabled ? '自动轮询未开启' : wm?.paused ? '水位线已暂停' : '自动轮询运行中'}
+                </span>
+                <span className="lz__tag">运行中批次 {supervision?.running ?? 0}</span>
+                <span className="lz__tag">待发车组 {batches.length}</span>
+                <span className="lz__tag">回传队列 {supervision?.outboxPendingCount ?? 0}</span>
+              </div>
+              <div className="lz__rowSummary">
+                {wm?.cursorTime === undefined ? '尚未初始化 archived_at 水位线（首次开启轮询时从当前时刻开始）。' : `当前水位线：${wm.cursorTime}`}
+                {wm?.lastPollAt === undefined ? '' : ` · 上次轮询：${formatTime(wm.lastPollAt)}`}
+                {wm?.lastError === undefined ? '' : ` · 异常（连续 ${wm.consecutiveFailures} 次）：${wm.lastError}`}
+              </div>
+              <div className="lz__addRow lz__addRow--flush">
+                <input
+                  className="lz__input lz__mono"
+                  placeholder="回拨 ISO 时间，例如 2026-11-10T00:00:00Z"
+                  value={rewindTime}
+                  onChange={(event) => { setRewindTime(event.target.value) }}
+                />
+                <button
+                  type="button"
+                  className="lz__btn"
+                  disabled={busy || rewindTime.trim() === ''}
+                  onClick={() => { onUpdateWatermark({ action: 'rewind', cursorTime: rewindTime.trim() }) }}
+                >
+                  回拨补跑
+                </button>
+                <button
+                  type="button"
+                  className="lz__btn lz__btn--ghost"
+                  disabled={busy}
+                  onClick={() => { onUpdateWatermark({ action: wm?.paused ? 'resume' : 'pause' }) }}
+                >
+                  {wm?.paused ? '恢复轮询' : '暂停轮询'}
+                </button>
+              </div>
+            </div>
+          </div>
+          {breakers.map(item => (
+            <div key={`${item.scope}:${item.key}`} className="lz__row">
+              <div className="lz__rowText">
+                <div className="lz__rowLabel">
+                  <span className="lz__tag">{BREAKER_SCOPE_LABEL[item.scope]}</span>
+                  <span className="lz__mono">{item.key}</span>
+                  <span className={`lz__pill ${item.tripped ? 'lz__pill--bad' : 'lz__pill--ok'}`}>
+                    <span className="lz__dot" />
+                    {item.tripped ? '已熔断' : '计数中'}（{item.count}/{item.limit}）
+                  </span>
+                </div>
+                {item.reason === undefined ? null : <div className="lz__rowSummary">{item.reason}</div>}
+              </div>
+              <div className="lz__rowCtl">
+                <button type="button" className="lz__btn lz__btn--ghost" disabled={busy} onClick={() => { onResetBreaker(item.scope, item.key) }}>解除熔断</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">平台报告死信队列（{dead.length}）</h2>
+        <div className="lz__list">
+          {dead.length === 0
+            ? <div className="lz__emptyRow">当前没有进入死信状态的平台报告回传任务。</div>
+            : (
+                <>
+                  <div className="lz__row">
+                    <div className="lz__rowText">
+                      <div className="lz__rowLabel">批量重试死信回传</div>
+                      <div className="lz__rowSummary">将所有处于 dead 状态的报告修订重置为 pending 并立即尝试回传。</div>
+                    </div>
+                    <div className="lz__rowCtl">
+                      <button type="button" className="lz__btn" disabled={busy} onClick={() => { onRetryOutbox(undefined) }}>全部重试</button>
+                    </div>
+                  </div>
+                  {dead.map(item => (
+                    <div key={item.key} className="lz__row">
+                      <div className="lz__rowText">
+                        <div className="lz__rowLabel">
+                          <span className="lz__mono">{item.logId}</span>
+                          <span className="lz__tag">task {item.taskId.slice(0, 8)} · rev {item.revision}</span>
+                          <span className="lz__tag">尝试 {item.attempts} 次</span>
+                        </div>
+                        {item.lastError === undefined ? null : <div className="lz__rowError">{item.lastError}</div>}
+                      </div>
+                      <div className="lz__rowCtl">
+                        <button type="button" className="lz__btn lz__btn--ghost" disabled={busy} onClick={() => { onRetryOutbox(item.key) }}>重试</button>
+                      </div>
+                    </div>
+                  ))}
+                </>
+              )}
+        </div>
+      </section>
+
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">近期日志监管任务（{tasks.length}）</h2>
+        <div className="lz__list">
+          {tasks.length === 0 ? <div className="lz__emptyRow">暂无日志监管任务记录。</div> : null}
+          {tasks.map((task) => {
+            const st = LOG_TASK_STATUS_LABEL[task.status]
+            return (
+              <div key={task.taskId} className="lz__row lz__row--top">
+                <div className="lz__rowText">
+                  <div className="lz__rowLabel">
+                    <span className="lz__mono">{task.appName ?? task.appId}</span>
+                    <span className={`lz__pill ${st.pill}`}><span className="lz__dot" />{st.text}</span>
+                    <span className="lz__tag">{task.source}</span>
+                    <span className="lz__tag">{task.inputCount} 份日志</span>
+                    <span className="lz__tag">{task.revisionCount} 个修订</span>
+                  </div>
+                  <div className="lz__rowSummary">
+                    <span className="lz__mono">{task.taskId}</span>
+                    {task.errorCode === undefined ? '' : ` · 错误码 ${task.errorCode}`}
+                    {task.latestSummary === undefined ? '' : ` · ${task.latestSummary}`}
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </section>
+
+      <section className="lz__sec">
+        <h2 className="lz__secTitle">日志自动监管与攒批策略 <Overridden keys={overridden} name="logSupervision" /></h2>
+        <div className="lz__list">
+          <div className="lz__row">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">启用日志平台自动轮询监管（观象）</div>
+              <div className="lz__rowSummary">按 archived_at 水位线增量拉取已归档 FDS 日志，按 (product, component, error_code) 攒批触发诊断与可选修复建议。</div>
+            </div>
+            <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="启用日志平台自动轮询" checked={draft.logEnabled} onChange={(event) => { setDraft({ ...draft, logEnabled: event.target.checked }) }} /></div>
+          </div>
+          <TextRow label="飞书投递目标群" summary="自动批次结果卡与话题发到此群（oc_ 开头）；留空则无头运行。" placeholder="oc_xxx" value={draft.logFeishuChatId} onChange={(value) => { setDraft({ ...draft, logFeishuChatId: value }) }} />
+          <div className="lz__row">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">飞书投递模式</div>
+              <div className="lz__rowSummary">静默分析（推荐）：分析与回传完成后发一张结论卡并绑定话题；开局建话题：发车即建话题流式可见。</div>
+            </div>
+            <div className="lz__rowCtl">
+              <select className="lz__input" aria-label="飞书投递模式" value={draft.logDeliveryMode} onChange={(event) => { setDraft({ ...draft, logDeliveryMode: event.target.value === 'topic-on-start' ? 'topic-on-start' : 'quiet-until-done' }) }}>
+                <option value="quiet-until-done">静默分析、产出即建话题</option>
+                <option value="topic-on-start">开局建话题流式可见</option>
+              </select>
+            </div>
+          </div>
+          <NumberRow label="平台轮询间隔" unit="秒" value={draft.logPollIntervalSec} onChange={(value) => { setDraft({ ...draft, logPollIntervalSec: value }) }} />
+          <NumberRow label="攒批触发条数" summary="同组日志累计达到该条数时立即发车（不超过单批上限）。" unit="份" value={draft.logBatchSizeThreshold} onChange={(value) => { setDraft({ ...draft, logBatchSizeThreshold: value }) }} />
+          <NumberRow label="单批日志上限" unit="份" value={draft.logMaxBatchSize} onChange={(value) => { setDraft({ ...draft, logMaxBatchSize: value }) }} />
+          <NumberRow label="攒批等待窗口" summary="首条日志进入窗口后的最长等待时间（0 表示立即发车）。" unit="分钟" value={draft.logBatchWindowMin} onChange={(value) => { setDraft({ ...draft, logBatchWindowMin: value }) }} />
+          <NumberRow label="日志并发上限" summary="同时运行的日志监管任务最大数量（logPool）。" unit="个" value={draft.logMaxConcurrentBatches} onChange={(value) => { setDraft({ ...draft, logMaxConcurrentBatches: value }) }} />
+          <NumberRow label="单应用小时批次数上限" summary="超过后该应用进入 throttled 熔断，不影响其他应用。" unit="批" value={draft.logAppHourlyBatchLimit} onChange={(value) => { setDraft({ ...draft, logAppHourlyBatchLimit: value }) }} />
+          <NumberRow label="单日志安全解压上限" unit="MB" value={draft.logMaxUnpackMb} onChange={(value) => { setDraft({ ...draft, logMaxUnpackMb: value }) }} />
         </div>
       </section>
     </>

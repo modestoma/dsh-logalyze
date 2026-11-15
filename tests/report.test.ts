@@ -38,7 +38,7 @@ const REQUEST: AnalyzeRequest = {
 }
 
 function platformLog(log: FakeLog): PlatformLog {
-  return { product_code: null, product_sn: null, hw_version: null, sw_version: null, component_version: null, log_type: null, file_size_bytes: null, created_at: null, detail_url: null, ...log }
+  return { product_code: null, product_sn: null, hw_version: null, sw_version: null, component_version: null, log_type: null, file_size_bytes: null, created_at: null, archived_at: null, detail_url: null, ...log }
 }
 
 /** A new analysis of the given logs under one key. */

@@ -84,6 +84,24 @@ const mrReviewSchema = z.object({
   repoHourlyTurnLimit: z.number().int().min(1).max(500).default(30),
 }).strict()
 
+const logSupervisionBaseSchema = z.object({
+  enabled: z.boolean().default(false),
+  pollIntervalMs: durationMs(1000).default(60 * 1000),
+  batchSizeThreshold: z.number().int().min(1).max(50).default(5),
+  maxBatchSize: z.number().int().min(1).max(50).default(20),
+  batchWindowMs: durationMs(0).default(5 * 60 * 1000),
+  maxConcurrentBatches: z.number().int().min(1).max(16).default(4),
+  appHourlyBatchLimit: z.number().int().min(1).max(500).default(15),
+  feishuChatId: z.string().trim().regex(CHAT_ID_PATTERN, '目标群必须是飞书群的 chat_id（oc_ 开头）').optional(),
+  deliveryMode: z.enum(['quiet-until-done', 'topic-on-start']).default('quiet-until-done'),
+  maxUnpackBytes: z.number().int().min(1024).max(Number.MAX_SAFE_INTEGER).default(512 * MIB),
+}).strict()
+
+const logSupervisionSchema = logSupervisionBaseSchema.refine(
+  value => value.batchSizeThreshold <= value.maxBatchSize,
+  { path: ['batchSizeThreshold'], message: '攒批触发条数不能大于单批上限' },
+)
+
 /**
  * The former `repos` key: application repositories are now the dsh-repo
  * catalog repositories with the log analysis feature turned on, so any value
@@ -103,6 +121,7 @@ export const editableFields = {
   skillUpdates: skillUpdatesSchema.prefault({}),
   analyze: analyzeSchema.prefault({}),
   mrReview: mrReviewSchema.prefault({}),
+  logSupervision: logSupervisionSchema.prefault({}),
 }
 
 /** A complete editable settings payload, as the panel saves it. */
@@ -157,6 +176,7 @@ export const overlaySchema = z.object({
   skillUpdates: skillUpdatesSchema.optional(),
   analyze: analyzeSchema.optional(),
   mrReview: mrReviewSchema.optional(),
+  logSupervision: logSupervisionSchema.optional(),
 }).strict()
 
 /** Validated panel overlay. */

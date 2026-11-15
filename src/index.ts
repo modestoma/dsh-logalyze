@@ -29,6 +29,8 @@ export type * from './settings/contract.ts'
 export type * from './deps/repos-contract.ts'
 export type * from './deps/actions-contract.ts'
 export * from './runtime/index.ts'
+export * from './issues/memory.ts'
+export * from './log/index.ts'
 export * from './mr/index.ts'
 export type { ApplicationAccess } from './apps/access.ts'
 export type { LeasedApp, ReadyApp, RepoLease } from './apps/registry.ts'
@@ -85,6 +87,12 @@ export function apply(ctx: HostContext, config?: unknown, options: LogalyzePlugi
   ctx.inject?.([FEISHU_TOPICS_SERVICE], () => {
     void service.topicsAvailable().catch((error: unknown) => {
       ctx.logger?.error?.('logalyze: 核对分析报告失败：%s', messageOf(error))
+    })
+  })
+  // Retry deferred follow-up action button cards whenever the Feishu actions service appears.
+  ctx.inject?.([FEISHU_ACTIONS_SERVICE], () => {
+    void service.actionsAvailable().catch((error: unknown) => {
+      ctx.logger?.error?.('logalyze: 补发飞书动作按钮卡片失败：%s', messageOf(error))
     })
   })
   // Whenever dsh-repo's service appears, including after it reloads: register
