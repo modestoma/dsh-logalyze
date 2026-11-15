@@ -5,7 +5,7 @@
  * - 严格遵守自触发防护铁律：`supervisor_mr_publish_review` 仅记录 Bot 自身刚发表的评论 ID
  *   与本轮已投递人类评论（`deliveredNoteIds`），绝不抓取回合进行中到达的新人类评论。
  *
- * @module dsh-logalyze/mr/tools
+ * @module dsh-supervisor/mr/tools
  */
 
 import { z } from 'zod'

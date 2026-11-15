@@ -1,9 +1,9 @@
 /**
- * 旧版回传命令留下的报告记录（`$DSH_HOME/logalyze/reports/<id>.json`）：
+ * 旧版回传命令留下的报告记录（`$DSH_HOME/supervisor/reports/<id>.json`）：
  * 只读出面板展示需要的字段，不再上传；最近活动超过
  * {@link REPORT_RETENTION_MS} 的记录在加载时删除。
  *
- * @module dsh-logalyze/report/legacy
+ * @module dsh-supervisor/report/legacy
  */
 
 import { readdir, readFile, rm } from 'node:fs/promises'
@@ -28,10 +28,10 @@ const legacySchema = z.object({
 /**
  * Directory of the former report records.
  * @param env - process environment.
- * @returns `$DSH_HOME/logalyze/reports`.
+ * @returns `$DSH_HOME/supervisor/reports`.
  */
 export function legacyReportsDir(env: NodeJS.ProcessEnv = process.env): string {
-  return join(resolveDshHome(env), 'logalyze', 'reports')
+  return join(resolveDshHome(env), 'supervisor', 'reports')
 }
 
 /** Reports of the former command upload, shown until they expire. */
@@ -71,7 +71,7 @@ export class LegacyReports {
         const { sections: _sections, ...wire } = record
         kept.push(wire)
       } catch (error) {
-        this.warn(`logalyze: 跳过无法读取的旧版回传记录 ${path}：${error instanceof Error ? error.message : String(error)}`)
+        this.warn(`supervisor: 跳过无法读取的旧版回传记录 ${path}：${error instanceof Error ? error.message : String(error)}`)
       }
     }
     this.records = kept.sort((left, right) => right.acceptedAt - left.acceptedAt)

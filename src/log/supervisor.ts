@@ -5,7 +5,7 @@
  * - 强并发隔离 & 单应用小时级熔断：`logPool`（默认 4）与 `log:<appId>` 滑动窗口限流（触发时推送飞书告警且不阻塞其他应用）；
  * - 兼容全自动（`quiet-until-done` 两阶段静默诊断 / `topic-on-start` 直播话题）与飞书手工 ZIP/URL 会话，驱动 `OutboxRunner` 幂等回传与 `feishuActions` 半自动「修代码 / 改 SKILL」闭环。
  *
- * @module dsh-logalyze/log/supervisor
+ * @module dsh-supervisor/log/supervisor
  */
 
 import { randomBytes } from 'node:crypto'
@@ -111,6 +111,8 @@ export interface LogSupervisorDeps {
   readonly registry: RepoRegistry
   readonly repos: ReposClient
   readonly workspacesRoot: string
+  /** Optional legacy workspaces root (from `$DSH_HOME/logalyze/log-workspaces`) eligible for retention cleanup. */
+  readonly legacyWorkspacesRoot?: string
   readonly sessionDriver: LogSessionDriver
   readonly getSettings: () => LogSupervisionSettings
   readonly getPlatformSettings: () => PlatformSettings
@@ -223,7 +225,7 @@ export class LogSupervisor {
       deliver: (record, signal) => this.deliverOutboxRecord(record, signal),
       onDead: (_key, record) => {
         deps.logger?.warn?.(
-          'logalyze: 日志报告回传进入死信（task=%s rev=%d logId=%s）：%s',
+          'supervisor: 日志报告回传进入死信（task=%s rev=%d logId=%s）：%s',
           record.taskId,
           record.revision,
           record.logId,
@@ -231,7 +233,7 @@ export class LogSupervisor {
         )
       },
       onError: (error) => {
-        deps.logger?.warn?.('logalyze: OutboxRunner 后台执行异常：%s', messageOf(error))
+        deps.logger?.warn?.('supervisor: OutboxRunner 后台执行异常：%s', messageOf(error))
       },
     })
 
@@ -378,7 +380,7 @@ export class LogSupervisor {
     await this.reconcilePendingActions()
     await this.reconcilePendingBatches()
     await this.sweepRetention().catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: 日志任务留存清理失败：%s', messageOf(error))
+      this.deps.logger?.warn?.('supervisor: 日志任务留存清理失败：%s', messageOf(error))
     })
 
     if (this.closed) return
@@ -387,7 +389,7 @@ export class LogSupervisor {
     this.outboxRunner.start(OUTBOX_POLL_INTERVAL_MS)
     this.trackBackground(
       this.outboxRunner.processDue().catch((error: unknown) => {
-        this.deps.logger?.warn?.('logalyze: 启动回传队列补传失败：%s', messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 启动回传队列补传失败：%s', messageOf(error))
       }),
     )
     if (this.autoPollTimer) {
@@ -432,14 +434,14 @@ export class LogSupervisor {
     }
     for (const key of this.deps.pendingBatches.keys()) {
       void this.evaluateBatchKey(key).catch((error: unknown) => {
-        this.deps.logger?.warn?.('logalyze: 评估待发批次 %s 失败：%s', key, messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 评估待发批次 %s 失败：%s', key, messageOf(error))
       })
     }
     void this.reconcilePendingTopics().catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: 补发静默摘要卡片失败：%s', messageOf(error))
+      this.deps.logger?.warn?.('supervisor: 补发静默摘要卡片失败：%s', messageOf(error))
     })
     void this.reconcilePendingActions().catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: 补发后续动作按钮卡片失败：%s', messageOf(error))
+      this.deps.logger?.warn?.('supervisor: 补发后续动作按钮卡片失败：%s', messageOf(error))
     })
     if (this.autoPollTimer) {
       this.scheduleNextPoll(this.nextPollDelayMs())
@@ -485,7 +487,7 @@ export class LogSupervisor {
     const taskId = this.findTaskIdByLaunchKey(state.key)
     if (taskId === undefined) return
     const p = this.applyTopicState(taskId, state).catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: 同步日志话题状态失败（%s）：%s', taskId, messageOf(error))
+      this.deps.logger?.warn?.('supervisor: 同步日志话题状态失败（%s）：%s', taskId, messageOf(error))
     })
     this.trackBackground(p)
   }
@@ -508,7 +510,7 @@ export class LogSupervisor {
     const latestRev = task.revisions.at(-1)
     if (latestRev === undefined || latestRev.actionCardKey !== undefined || latestRev.actionCardSkipped) return
     const p = this.maybeProposeActionsForRevision(latestTaskId, latestRev.revision, sessionId).catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: 飞书日志诊断推荐操作卡片发送失败（%s）：%s', latestTaskId, messageOf(error))
+      this.deps.logger?.warn?.('supervisor: 飞书日志诊断推荐操作卡片发送失败（%s）：%s', latestTaskId, messageOf(error))
     })
     this.trackBackground(p)
   }
@@ -779,7 +781,7 @@ export class LogSupervisor {
       if (this.closed) return
       const run = this.sweepRetention()
         .catch((error: unknown) => {
-          this.deps.logger?.warn?.('logalyze: 定期日志任务留存清理失败：%s', messageOf(error))
+          this.deps.logger?.warn?.('supervisor: 定期日志任务留存清理失败：%s', messageOf(error))
         })
         .finally(() => {
           if (!this.closed && this.autoPollTimer) {
@@ -844,7 +846,7 @@ export class LogSupervisor {
       if (this.closed) return
       const run = this.reconcilePendingActions()
         .catch((error: unknown) => {
-          this.deps.logger?.warn?.('logalyze: 重试投递飞书动作按钮卡片异常：%s', messageOf(error))
+          this.deps.logger?.warn?.('supervisor: 重试投递飞书动作按钮卡片异常：%s', messageOf(error))
         })
         .finally(() => {
           if (!this.closed && this.hasPendingActionDeliveries()) {
@@ -897,21 +899,21 @@ export class LogSupervisor {
     const settings = this.deps.getSettings()
     if (!settings.enabled) return
     await this.reconcilePendingTopics().catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: 轮询前补发静默摘要卡片失败：%s', messageOf(error))
+      this.deps.logger?.warn?.('supervisor: 轮询前补发静默摘要卡片失败：%s', messageOf(error))
     })
     if (!isEpochCurrent()) return
     await this.reconcilePendingActions().catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: 轮询前补发后续动作按钮卡片失败：%s', messageOf(error))
+      this.deps.logger?.warn?.('supervisor: 轮询前补发后续动作按钮卡片失败：%s', messageOf(error))
     })
     if (!isEpochCurrent()) return
     await this.sweepRetention().catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: 轮询前清理过期日志任务失败：%s', messageOf(error))
+      this.deps.logger?.warn?.('supervisor: 轮询前清理过期日志任务失败：%s', messageOf(error))
     })
     if (!isEpochCurrent()) return
     const wm = this.readWatermark()
     if (wm.paused) return
     await this.reconcilePendingBatches().catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: 轮询前复查待发批次失败：%s', messageOf(error))
+      this.deps.logger?.warn?.('supervisor: 轮询前复查待发批次失败：%s', messageOf(error))
     })
     if (!isEpochCurrent()) return
     if (platformProblem(this.deps.getPlatformSettings()) !== undefined) return
@@ -1010,7 +1012,7 @@ export class LogSupervisor {
           return
         }
       }
-      this.deps.logger?.warn?.('logalyze: 单轮日志拉取达到页数上限 %d，将在下周期继续回填', MAX_POLL_PAGES)
+      this.deps.logger?.warn?.('supervisor: 单轮日志拉取达到页数上限 %d，将在下周期继续回填', MAX_POLL_PAGES)
     } catch (error) {
       if (!isEpochCurrent()) return
       const errMsg = messageOf(error)
@@ -1028,7 +1030,7 @@ export class LogSupervisor {
         return true
       })
       if (committed) {
-        this.deps.logger?.warn?.('logalyze: 增量拉取平台日志失败（第 %d 次）：%s', failures, errMsg)
+        this.deps.logger?.warn?.('supervisor: 增量拉取平台日志失败（第 %d 次）：%s', failures, errMsg)
       }
     }
   }
@@ -1044,12 +1046,12 @@ export class LogSupervisor {
       [app.id, app.name, ...app.aliases].some(value => applicationKey(value) === key),
     )
     if (matches.length === 0) {
-      this.deps.logger?.warn?.('logalyze: 收到未知 component_code=%s，已跳过自动入队', componentCode)
+      this.deps.logger?.warn?.('supervisor: 收到未知 component_code=%s，已跳过自动入队', componentCode)
       return undefined
     }
     if (matches.length > 1) {
       this.deps.logger?.warn?.(
-        'logalyze: component_code=%s 同时匹配多个应用（%s），请通过面板别名消除歧义',
+        'supervisor: component_code=%s 同时匹配多个应用（%s），请通过面板别名消除歧义',
         componentCode,
         matches.map(m => m.app.id).join(', '),
       )
@@ -1084,7 +1086,7 @@ export class LogSupervisor {
 
       const componentCode = normalizeOptional(item.component_code)
       if (componentCode === undefined) {
-        this.deps.logger?.warn?.('logalyze: 日志 %s 缺少 component_code，已跳过', item.log_id)
+        this.deps.logger?.warn?.('supervisor: 日志 %s 缺少 component_code，已跳过', item.log_id)
         continue
       }
       const app = this.resolveAppByComponent(componentCode)
@@ -1153,7 +1155,7 @@ export class LogSupervisor {
       this.batchTimers.delete(bKey)
       if (this.closed) return
       void this.evaluateBatchKey(bKey).catch((error: unknown) => {
-        this.deps.logger?.warn?.('logalyze: 批次窗口定时发车失败（%s）：%s', bKey, messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 批次窗口定时发车失败（%s）：%s', bKey, messageOf(error))
       })
     }, delayMs)
     timer.unref?.()
@@ -1364,7 +1366,7 @@ export class LogSupervisor {
       }
     }).catch((error: unknown) => {
       if (!this.closed) {
-        this.deps.logger?.warn?.('logalyze: 平台日志批次任务执行异常（%s）：%s', taskId, messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 平台日志批次任务执行异常（%s）：%s', taskId, messageOf(error))
       }
     })
     this.trackBackground(runPromise)
@@ -1494,7 +1496,7 @@ export class LogSupervisor {
           feishuChatId: cur.feishuChatId ?? chatId,
           updatedAt: this.now(),
         }))
-        this.deps.logger?.warn?.('logalyze: 发起直播飞书话题异常，降级为无头后台诊断（%s）：%s', taskId, messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 发起直播飞书话题异常，降级为无头后台诊断（%s）：%s', taskId, messageOf(error))
         await this.runHeadlessBatch(taskId, signal)
         return
       }
@@ -1518,7 +1520,7 @@ export class LogSupervisor {
           updatedAt: this.now(),
         }))
         this.deps.logger?.warn?.(
-          'logalyze: 发起直播飞书话题暂不可用（%s），降级为无头后台诊断（%s）：%s',
+          'supervisor: 发起直播飞书话题暂不可用（%s），降级为无头后台诊断（%s）：%s',
           res.code,
           taskId,
           res.message,
@@ -1746,7 +1748,7 @@ export class LogSupervisor {
         if (task.feishuLaunchKey === undefined) {
           this.launchKeyToTaskId.delete(launchKey)
         }
-        this.deps.logger?.warn?.('logalyze: 投递静默完成飞书卡片异常（%s）：%s', taskId, messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 投递静默完成飞书卡片异常（%s）：%s', taskId, messageOf(error))
         return
       }
 
@@ -1754,7 +1756,7 @@ export class LogSupervisor {
         if (task.feishuLaunchKey === undefined) {
           this.launchKeyToTaskId.delete(launchKey)
         }
-        this.deps.logger?.warn?.('logalyze: 投递静默完成飞书卡片失败（%s）：%s', taskId, launched.message)
+        this.deps.logger?.warn?.('supervisor: 投递静默完成飞书卡片失败（%s）：%s', taskId, launched.message)
         return
       }
 
@@ -2003,13 +2005,13 @@ export class LogSupervisor {
         })
       } catch (error) {
         this.actionRetryFailures = Math.min(this.actionRetryFailures + 1, 10)
-        this.deps.logger?.warn?.('logalyze: 投递动作按钮卡片异常（%s）：%s', cardKey, messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 投递动作按钮卡片异常（%s）：%s', cardKey, messageOf(error))
         this.scheduleActionRetry()
         return
       }
 
       if (!posted.ok) {
-        this.deps.logger?.warn?.('logalyze: 投递动作按钮卡片失败（%s）：%s', cardKey, posted.message)
+        this.deps.logger?.warn?.('supervisor: 投递动作按钮卡片失败（%s）：%s', cardKey, posted.message)
         if (posted.code === 'invalid' || posted.code === 'unrouted-session') {
           await this.updateTask(taskId, cur => ({
             ...cur,
@@ -2081,7 +2083,7 @@ export class LogSupervisor {
           await actions.supersede(cardKey, `已更新至修订 rev ${curLatest.revision}`)
         } catch (error) {
           this.actionRetryFailures = Math.min(this.actionRetryFailures + 1, 10)
-          this.deps.logger?.warn?.('logalyze: 作废旧动作按钮卡片失败（%s）：%s', cardKey, messageOf(error))
+          this.deps.logger?.warn?.('supervisor: 作废旧动作按钮卡片失败（%s）：%s', cardKey, messageOf(error))
           this.scheduleActionRetry()
           return
         }
@@ -2113,7 +2115,7 @@ export class LogSupervisor {
 
     if (this.deps.notifyThrottle !== undefined) {
       await this.deps.notifyThrottle({ appId, appName, ...(chatId === undefined ? {} : { chatId }), text }).catch((error: unknown) => {
-        this.deps.logger?.warn?.('logalyze: 限流告警回调失败：%s', messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 限流告警回调失败：%s', messageOf(error))
       })
     }
 
@@ -2133,7 +2135,7 @@ export class LogSupervisor {
         },
         prompt: `${text}\n\n请向值班成员简要同步该熔断状态，等待人工在 Web 面板确认后解除；不要自行重试拉取或重复建卡。`,
       }).catch((error: unknown) => {
-        this.deps.logger?.warn?.('logalyze: 飞书限流告警卡片发送失败：%s', messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 飞书限流告警卡片发送失败：%s', messageOf(error))
       })
     }
   }
@@ -2210,7 +2212,7 @@ export class LogSupervisor {
 
     if (enqueuedKeys.length > 0) {
       const kick = this.outboxRunner.processDue().catch((error: unknown) => {
-        this.deps.logger?.warn?.('logalyze: 触发 OutboxRunner 回传失败：%s', messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 触发 OutboxRunner 回传失败：%s', messageOf(error))
       })
       this.trackBackground(kick)
     }
@@ -2221,7 +2223,7 @@ export class LogSupervisor {
         params.revision.revision,
         pendingActionTarget.sessionId,
       ).catch((error: unknown) => {
-        this.deps.logger?.warn?.('logalyze: 投递后续动作按钮卡片失败（%s）：%s', params.taskId, messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 投递后续动作按钮卡片失败（%s）：%s', params.taskId, messageOf(error))
       })
       this.trackBackground(kickActions)
     }
@@ -2340,7 +2342,7 @@ export class LogSupervisor {
       extraLinkHeader: '分析报告',
       rows,
     }).catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: 更新飞书报告链接表失败（%s）：%s', taskId, messageOf(error))
+      this.deps.logger?.warn?.('supervisor: 更新飞书报告链接表失败（%s）：%s', taskId, messageOf(error))
     })
   }
 
@@ -2374,7 +2376,7 @@ export class LogSupervisor {
     for (const taskId of candidateIds) {
       if (this.closed) return
       await this.pruneExpiredTask(taskId).catch((error: unknown) => {
-        this.deps.logger?.warn?.('logalyze: 清理过期日志任务失败（%s）：%s', taskId, messageOf(error))
+        this.deps.logger?.warn?.('supervisor: 清理过期日志任务失败（%s）：%s', taskId, messageOf(error))
       })
     }
   }
@@ -2475,7 +2477,9 @@ export class LogSupervisor {
     }
     if (task.workDir !== undefined && task.workDir.trim() !== '') {
       const resolvedWorkDir = resolve(task.workDir)
-      const inRoot = isInside(resolvedWorkDir, root) && resolvedWorkDir !== root
+      const legacyRoot = this.deps.legacyWorkspacesRoot === undefined ? undefined : resolve(this.deps.legacyWorkspacesRoot)
+      const inRoot = (isInside(resolvedWorkDir, root) && resolvedWorkDir !== root)
+        || (legacyRoot !== undefined && isInside(resolvedWorkDir, legacyRoot) && resolvedWorkDir !== legacyRoot)
       const isIsolatedFeishuTaskDir = task.source === 'feishu'
         && basename(resolvedWorkDir) === taskId
         && basename(dirname(resolvedWorkDir)) === 'tasks'

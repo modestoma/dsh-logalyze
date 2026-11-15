@@ -1,5 +1,5 @@
 ---
-name: logalyze-kit
+name: supervisor-kit
 description: 配置智能监管（观象）的应用描述与触发别名，了解仓库接入和可选 SKILL 的发现方式。
 ---
 

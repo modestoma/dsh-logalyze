@@ -57,7 +57,7 @@ describe('platform client', () => {
     const basic = client({ clientAuth: 'basic' })
     await basic.client.findLogs([logUuid(1)])
     const request = platform.calls('token')[0]!
-    expect(request.headers.authorization).toBe(`Basic ${Buffer.from('logalyze:client-secret').toString('base64')}`)
+    expect(request.headers.authorization).toBe(`Basic ${Buffer.from('supervisor:client-secret').toString('base64')}`)
     expect(new URLSearchParams(request.body).has('client_secret')).toBe(false)
 
     const wrong = client()

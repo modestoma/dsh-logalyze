@@ -4,7 +4,7 @@
  * 用于回合结束后的非阻塞持久化动作提议卡（如「🔧 修复代码并提 MR」「📚 改进 SKILL / 沉淀案例」），
  * 运行时通过 `ctx.get('feishuActions')` 按需发现，不直接依赖 `dsh_channels` 包。
  *
- * @module dsh-logalyze/deps/actions-contract
+ * @module dsh-supervisor/deps/actions-contract
  */
 
 /** Name the Feishu channel plugin provides the actions service under. */

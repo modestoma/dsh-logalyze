@@ -5,7 +5,7 @@
  *   创建无头评审会话或唤醒既有的飞书话题/MR 会话，并监听 `session/event` 的 `turn/end`
  *   等待本轮执行自然结束，不做忙等轮询。
  *
- * @module dsh-logalyze/mr/session-driver
+ * @module dsh-supervisor/mr/session-driver
  */
 
 import { randomUUID } from 'node:crypto'

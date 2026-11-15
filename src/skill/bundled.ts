@@ -1,24 +1,26 @@
 /**
- * 观象随包提供的指导 SKILL，正文是包内的 `skills/<name>/SKILL.md`，插件加载时
+ * 智能监管随包提供的指导 SKILL，正文是包内的 `skills/<name>/SKILL.md`，插件加载时
  * 读取并校验，文件缺失或不合法时加载失败：
  *
- * - `/logalyze-kit` 接入指南：仓库功能开关、描述与别名设置和可选 SKILL。
- * - `/logalyze-improve` 改进指南：怎样把一次分析中 SKILL 没有覆盖的问题整理为
+ * - `/supervisor-kit` 接入指南：仓库功能开关、描述与别名设置和可选 SKILL。
+ * - `/supervisor-improve` 改进指南：怎样把一次分析中 SKILL 没有覆盖的问题整理为
  *   案例并改进 SKILL。SKILL 改进子 Agent 用首行手势加载它。
+ * - `/mr-reviewer` 审微 MR 评审与修复工作流规范。
+ * - `/log-supervisor` 观象统一日志分析与闭环工作流规范。
  *
  * 开发者也可以在自己的仓库里输入 `/<name>` 使用它们。
  *
- * @module dsh-logalyze/skill/bundled
+ * @module dsh-supervisor/skill/bundled
  */
 
 import { readFileSync } from 'node:fs'
 import { parse as parseYaml } from 'yaml'
 
-/** Onboarding kit skill name, addressed as `/logalyze-kit`. */
-export const KIT_SKILL_NAME = 'logalyze-kit'
+/** Onboarding kit skill name, addressed as `/supervisor-kit`. */
+export const KIT_SKILL_NAME = 'supervisor-kit'
 
-/** SKILL improvement guide name, addressed as `/logalyze-improve`. */
-export const IMPROVE_SKILL_NAME = 'logalyze-improve'
+/** SKILL improvement guide name, addressed as `/supervisor-improve`. */
+export const IMPROVE_SKILL_NAME = 'supervisor-improve'
 
 /** MR incremental reviewer guide name, addressed as `/mr-reviewer`. */
 export const MR_REVIEWER_SKILL_NAME = 'mr-reviewer'

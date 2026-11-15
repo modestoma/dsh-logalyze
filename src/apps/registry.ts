@@ -3,7 +3,7 @@
  * 仓库缺少 manifest 或 SKILL 属于正常状态；仅当应用 id 重复冲突时标记不可用。
  * 已移除或关闭「日志分析」的仓库拒绝新租借，已持有的快照租约保持固定提交不变。
  *
- * @module dsh-logalyze/apps/registry
+ * @module dsh-supervisor/apps/registry
  */
 
 import { z } from 'zod'

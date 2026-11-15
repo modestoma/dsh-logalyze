@@ -4,7 +4,7 @@
  * - MR 自动评审的行级评论与增量感知方法要求 `version === 8`，遇到 v7 时给出明确升级提示；
  * - 同时向 `dsh-repo` 注册两项仓库功能开关：`LOG_ANALYSIS_FEATURE`（`log-analysis`）与 `MR_REVIEW_FEATURE`（`mr-review`）。
  *
- * @module dsh-logalyze/deps/repos
+ * @module dsh-supervisor/deps/repos
  */
 
 import type { MrRepoStatusWire, RepoSpec, ReposWire } from '../settings/contract.ts'

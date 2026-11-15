@@ -10,7 +10,7 @@
  * - 失败统一抛 {@link PlatformError}：`retryable` 表示网络错误、超时、429 和 5xx，
  *   重试可能成功；其余（凭据无效、4xx、响应字段不符）重试无益。
  *
- * @module dsh-logalyze/platform/client
+ * @module dsh-supervisor/platform/client
  */
 
 import { z } from 'zod'

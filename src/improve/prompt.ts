@@ -1,12 +1,12 @@
 /**
- * SKILL 改进子 Agent 的首条消息。首行的 `/logalyze-improve` 由 DSH 的 skill
+ * SKILL 改进子 Agent 的首条消息。首行的 `/supervisor-improve` 由 DSH 的 skill
  * 手势确定性注入观象自带的改进指南（怎样写案例、怎样改 SKILL）；其余部分只
  * 给出本次运行的信息：应用、改进的依据（本会话中该应用的若干次分析的问题、
  * 结论与 SKILL 不足记录，以及用户的反馈）、日志、工作区与运行目录和文件数上限。
  * 同一应用的所有改进点在这一个子 Agent 中一次完成。子 Agent 的工作目录是可写
  * 工作区，它直接修改其中的 SKILL 目录。
  *
- * @module dsh-logalyze/improve/prompt
+ * @module dsh-supervisor/improve/prompt
  */
 
 import { skillDir } from '../apps/manifest.ts'
@@ -86,7 +86,7 @@ function originOf(analyses: readonly ImproveAnalysis[]): string {
 /**
  * Render the improvement child's first message.
  * @param input - application, the basis of the improvement, and writable directory.
- * @returns prompt text whose first line is the `/logalyze-improve` gesture.
+ * @returns prompt text whose first line is the `/supervisor-improve` gesture.
  */
 export function renderImprovePrompt(input: ImprovePromptInput): string {
   const { app, commit, analyses, feedback, logs, workDir, maxFiles, caseRequired, date } = input

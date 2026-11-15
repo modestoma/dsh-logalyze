@@ -1,7 +1,7 @@
 /**
  * 观象日志监管模块（`log`）公共导出。
  *
- * @module dsh-logalyze/log
+ * @module dsh-supervisor/log
  */
 
 export * from './prompt.ts'

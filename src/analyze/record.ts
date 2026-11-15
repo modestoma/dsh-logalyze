@@ -2,7 +2,7 @@
  * 被接受的分析请求到分析记录的转换：日志按请求顺序编号 L1…Ln，保存首轮
  * 消息、根卡片和报告用到的日志平台元数据。
  *
- * @module dsh-logalyze/analyze/record
+ * @module dsh-supervisor/analyze/record
  */
 
 import { analysisIdOf } from '../report/store.ts'

@@ -134,15 +134,15 @@ async function harness(services: Record<string, unknown>, config: Record<string,
     await cleanup()
   })
   const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`
-  const state = async (): Promise<StateWire> => await (await fetch(`${base}/logalyze/state`)).json() as StateWire
+  const state = async (): Promise<StateWire> => await (await fetch(`${base}/supervisor/state`)).json() as StateWire
   return { base, routes, warn, state }
 }
 
 /** A harness whose analyze route is on, with both credentials stored and the platform configured. */
 async function readyHarness(platform: FakePlatform, topics: FakeTopics, analyze: Record<string, unknown> = {}): Promise<RouteHarness & { credentials: ReturnType<typeof fakeCredentials> }> {
   const credentials = fakeCredentials()
-  credentials.stored.set('LOGALYZE_ANALYZE_TOKEN', 'secret-token')
-  credentials.stored.set('LOGALYZE_PLATFORM_CLIENT_SECRET', platform.secret)
+  credentials.stored.set('SUPERVISOR_ANALYZE_TOKEN', 'secret-token')
+  credentials.stored.set('SUPERVISOR_PLATFORM_CLIENT_SECRET', platform.secret)
   const h = await harness({ credentials, feishuTopics: topics }, { analyze: { enabled: true, platform: platform.settings(), ...analyze } })
   await waitFor(async () => (await h.state()).repos[0]?.phase === 'ready')
   return { ...h, credentials }
@@ -156,7 +156,7 @@ async function startPlatform(): Promise<FakePlatform> {
 }
 
 function post(base: string, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
-  return fetch(`${base}/open-api/logalyze`, {
+  return fetch(`${base}/open-api/supervisor`, {
     method: 'POST',
     headers: { 'authorization': 'Bearer secret-token', 'idempotency-key': 'req-1', 'content-type': 'application/json', ...headers },
     body: typeof body === 'string' ? body : JSON.stringify(body),
@@ -185,7 +185,7 @@ describe('analyze contract', () => {
     if (parsed.ok) return
     expect(parsed.error).toMatch(/^请求参数不合法：/)
     for (const field of ['triggerId', 'logIds.0', '(body)']) expect(parsed.error).toContain(field)
-    const retired = parseAnalyzeRequest({ ...REQUEST, prompt: '/logalyze', app: 'order-service' }, undefined, 10)
+    const retired = parseAnalyzeRequest({ ...REQUEST, prompt: '/supervisor', app: 'order-service' }, undefined, 10)
     expect(retired.ok === false && retired.error).toContain('prompt 已不再支持（提示词由观象按日志生成，补充说明放在 instructions）')
     expect(retired.ok === false && retired.error).toContain('app 已不再支持')
     const removed = parseAnalyzeRequest({ ...REQUEST, requesterUserId: 'u_alice' }, undefined, 10)
@@ -320,7 +320,7 @@ describe('analysis topic', () => {
 
   it('writes the first prompt with the log table, the caller notes, and the report rules, without download links', () => {
     const prompt = analysisPrompt(record(), UPLOAD)
-    expect(prompt.split('\n')[0]).toBe('/logalyze')
+    expect(prompt.split('\n')[0]).toBe('/supervisor')
     expect(prompt).toContain('- 应用：订单服务（id: `order-service`，由日志的 component_code `order` 对应）')
     expect(prompt).toContain('| L1 | device-1.tar.gz | SN1 | H1 | 2.0.1 | 1.4.0 | crash | 2 KiB | 2026-11-10T08:00:00Z |')
     expect(prompt).toContain('## 调用方说明\n\n> 重点看支付回调')
@@ -352,13 +352,13 @@ describe('analysis topic', () => {
 describe('analyze route', () => {
   it('is not registered without feishuTopics', async () => {
     const h = await harness({ credentials: fakeCredentials() }, { analyze: { enabled: true } })
-    expect(h.routes.has('/open-api/logalyze')).toBe(false)
+    expect(h.routes.has('/open-api/supervisor')).toBe(false)
     expect((await h.state()).analyze).toEqual({
-      route: '/open-api/logalyze',
-      tokenEnv: 'LOGALYZE_ANALYZE_TOKEN',
-      token: { tokenEnv: 'LOGALYZE_ANALYZE_TOKEN', configured: false, writable: true },
-      secretEnv: 'LOGALYZE_PLATFORM_CLIENT_SECRET',
-      secret: { tokenEnv: 'LOGALYZE_PLATFORM_CLIENT_SECRET', configured: false, writable: true },
+      route: '/open-api/supervisor',
+      tokenEnv: 'SUPERVISOR_ANALYZE_TOKEN',
+      token: { tokenEnv: 'SUPERVISOR_ANALYZE_TOKEN', configured: false, writable: true },
+      secretEnv: 'SUPERVISOR_PLATFORM_CLIENT_SECRET',
+      secret: { tokenEnv: 'SUPERVISOR_PLATFORM_CLIENT_SECRET', configured: false, writable: true },
       platformProblem: expect.stringContaining('缺少接口地址、令牌地址、client_id'),
       topics: 'missing',
       actions: 'missing',
@@ -369,8 +369,8 @@ describe('analyze route', () => {
 
   it('is not registered for an incompatible provider', async () => {
     const h = await harness({ feishuTopics: { version: 3, launch: () => undefined } })
-    expect(h.routes.has('/open-api/logalyze')).toBe(false)
-    expect(h.warn).toHaveBeenCalledWith(expect.stringContaining('版本与观象不兼容'))
+    expect(h.routes.has('/open-api/supervisor')).toBe(false)
+    expect(h.warn).toHaveBeenCalledWith(expect.stringContaining('版本与智能监管不兼容'))
     expect((await h.state()).analyze.topics).toBe('incompatible')
   })
 
@@ -380,7 +380,7 @@ describe('analyze route', () => {
     expect(off.status).toBe(404)
     expect(await errorOf(off)).toContain('「分析接口」')
     const state = await h.state()
-    const saved = await fetch(`${h.base}/logalyze/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...state.settings, analyze: { ...state.settings.analyze, enabled: true } }) })
+    const saved = await fetch(`${h.base}/supervisor/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...state.settings, analyze: { ...state.settings.analyze, enabled: true } }) })
     expect(((await saved.json()) as { state: StateWire }).state.overridden).toEqual(['analyze'])
     expect((await post(h.base, REQUEST)).status).toBe(503)
   })
@@ -392,17 +392,17 @@ describe('analyze route', () => {
 
     const unset = await post(h.base, REQUEST)
     expect(unset.status).toBe(503)
-    expect(await errorOf(unset)).toContain('LOGALYZE_ANALYZE_TOKEN')
+    expect(await errorOf(unset)).toContain('SUPERVISOR_ANALYZE_TOKEN')
 
-    const putCredential = (tokenEnv: string, value: string): Promise<Response> => fetch(`${h.base}/logalyze/token`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tokenEnv, value }) })
+    const putCredential = (tokenEnv: string, value: string): Promise<Response> => fetch(`${h.base}/supervisor/token`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tokenEnv, value }) })
     expect((await putCredential('DEEPSEEK_API_KEY', 'x')).status).toBe(400)
-    const saved = await putCredential('LOGALYZE_ANALYZE_TOKEN', 'secret-token')
+    const saved = await putCredential('SUPERVISOR_ANALYZE_TOKEN', 'secret-token')
     expect(saved.status).toBe(200)
     expect(await saved.text()).not.toContain('secret-token')
-    const secret = await putCredential('LOGALYZE_PLATFORM_CLIENT_SECRET', 'client-secret')
-    expect(((await secret.json()) as { state: StateWire }).state.analyze.secret).toEqual({ tokenEnv: 'LOGALYZE_PLATFORM_CLIENT_SECRET', configured: true, source: 'file', writable: true })
+    const secret = await putCredential('SUPERVISOR_PLATFORM_CLIENT_SECRET', 'client-secret')
+    expect(((await secret.json()) as { state: StateWire }).state.analyze.secret).toEqual({ tokenEnv: 'SUPERVISOR_PLATFORM_CLIENT_SECRET', configured: true, source: 'file', writable: true })
 
-    expect((await fetch(`${h.base}/open-api/logalyze`)).status).toBe(405)
+    expect((await fetch(`${h.base}/open-api/supervisor`)).status).toBe(405)
     const wrong = await post(h.base, REQUEST, { authorization: 'Bearer nope' })
     expect(wrong.status).toBe(401)
     expect(wrong.headers.get('www-authenticate')).toBe('Bearer')
@@ -417,9 +417,9 @@ describe('analyze route', () => {
     expect(await errorOf(unconfigured)).toContain('日志平台未配置')
     expect(topics.specs).toEqual([])
 
-    const cleared = await fetch(`${h.base}/logalyze/token`, { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tokenEnv: 'LOGALYZE_ANALYZE_TOKEN' }) })
+    const cleared = await fetch(`${h.base}/supervisor/token`, { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tokenEnv: 'SUPERVISOR_ANALYZE_TOKEN' }) })
     expect(cleared.status).toBe(200)
-    expect([...credentials.stored.keys()]).toEqual(['LOGALYZE_PLATFORM_CLIENT_SECRET'])
+    expect([...credentials.stored.keys()]).toEqual(['SUPERVISOR_PLATFORM_CLIENT_SECRET'])
   })
 
   it('reads the logs from the platform, launches the topic, and replays the same key', async () => {
@@ -505,7 +505,7 @@ describe('analyze route', () => {
     expect(await errorOf(missing)).toContain('默认群')
 
     const state = await h.state()
-    const put = (analyze: Record<string, unknown>): Promise<Response> => fetch(`${h.base}/logalyze/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...state.settings, analyze: { ...state.settings.analyze, ...analyze } }) })
+    const put = (analyze: Record<string, unknown>): Promise<Response> => fetch(`${h.base}/supervisor/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...state.settings, analyze: { ...state.settings.analyze, ...analyze } }) })
     expect((await put({ defaultChatId: 'ou_user' })).status).toBe(400)
     expect((await put({ defaultChatId: 'oc_default', maxLogs: 1 })).status).toBe(200)
     const tooMany = await post(h.base, noChat)

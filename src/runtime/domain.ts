@@ -10,7 +10,7 @@
  * 6. `supervised_mrs`：受监管的 PR/MR 会话与增量游标状态
  * 7. `circuit_breakers`：单应用/单仓库滑动窗口风暴熔断状态
  *
- * @module dsh-logalyze/runtime/domain
+ * @module dsh-supervisor/runtime/domain
  */
 
 import { z } from 'zod'

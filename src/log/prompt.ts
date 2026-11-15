@@ -1,7 +1,7 @@
 /**
  * 观象日志监管提示词、动作提议卡片构造与单日志报告 Markdown 渲染。
  *
- * @module dsh-logalyze/log/prompt
+ * @module dsh-supervisor/log/prompt
  */
 
 import type { ProposedAction } from '../deps/actions-contract.ts'

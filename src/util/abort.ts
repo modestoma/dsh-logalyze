@@ -1,7 +1,7 @@
 /**
  * Cancellation helpers for waits that must not outlive their caller.
  *
- * @module dsh-logalyze/util/abort
+ * @module dsh-supervisor/util/abort
  */
 
 /**

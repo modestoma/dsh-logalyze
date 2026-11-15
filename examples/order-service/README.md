@@ -9,7 +9,7 @@ src/                                   应用代码，子 Agent 对照它定位�
 sample-logs/order-service.log          一份示例日志（促销商品没有 SKU 导致 NullPointerException）
 ```
 
-本地试用：把本目录复制出来初始化为 git 仓库，再在「观象」面板中添加它的绝对路径作为仓库地址（远程仓库填 https 地址）。
+本地试用：把本目录复制出来初始化为 git 仓库，再在「智能监管」面板中添加它的绝对路径作为仓库地址（远程仓库填 https 地址）。
 
 ```sh
 cp -r examples/order-service /tmp/order-service && cd /tmp/order-service
@@ -19,5 +19,5 @@ git init -q && git add -A && git commit -qm init
 然后在对话中输入：
 
 ```
-/logalyze 订单服务昨晚 21 点下单报 500，日志在 /tmp/order-service/sample-logs/order-service.log
+/supervisor 订单服务昨晚 21 点下单报 500，日志在 /tmp/order-service/sample-logs/order-service.log
 ```

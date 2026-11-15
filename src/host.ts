@@ -6,7 +6,7 @@
  * `packages/subagent/subagent`、`packages/session/working-directory`、
  * `packages/credentials/credentials`）。
  *
- * @module dsh-logalyze/host
+ * @module dsh-supervisor/host
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'

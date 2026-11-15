@@ -5,7 +5,7 @@
  * - 熔断期内拦截自动唤醒；冷却时间到期后自动恢复放行并清空旧窗口；
  * - 支持管理面板一键手动 `reset(key)` 解除熔断。
  *
- * @module dsh-logalyze/runtime/breaker
+ * @module dsh-supervisor/runtime/breaker
  */
 
 import type { CircuitBreakerRecord } from './domain.ts'

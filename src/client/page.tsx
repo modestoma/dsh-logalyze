@@ -9,7 +9,7 @@
  * 顶部状态条与底部保存条统一联动一份面板草稿，仓库启停归 dsh-repo 管理，
  * 应用描述与触发别名按仓库独立保存，已知问题库支持一键与飞书多维表格双向同步及映射自检。
  *
- * @module dsh-logalyze/client/page
+ * @module dsh-supervisor/client/page
  */
 
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
@@ -334,7 +334,7 @@ function Overridden({ keys, name }: { keys: readonly EditableKey[]; name: Editab
 }
 
 /** Page props supplied by the client entry. */
-export interface LogalyzePageProps {
+export interface SupervisorPageProps {
   /** Opens dsh-repo's page on the Plugins panel; absent hides the link. */
   readonly openRepoSettings?: (() => void) | undefined
 }
@@ -344,11 +344,11 @@ export interface LogalyzePageProps {
  * @param props - navigation supplied by the client entry.
  * @returns the page.
  */
-export function LogalyzePage({ openRepoSettings }: LogalyzePageProps): JSX.Element {
+export function SupervisorPage({ openRepoSettings }: SupervisorPageProps): JSX.Element {
   return (
     <section className="lz-page" aria-label={PANEL_TITLE}>
       <div className="lz-page__content">
-        <LogalyzePanel openRepoSettings={openRepoSettings} />
+        <SupervisorPanel openRepoSettings={openRepoSettings} />
       </div>
     </section>
   )
@@ -357,10 +357,10 @@ export function LogalyzePage({ openRepoSettings }: LogalyzePageProps): JSX.Eleme
 /**
  * The `main` slot component, bound to a way of opening dsh-repo's settings.
  * @param openRepoSettings - opens dsh-repo's page on the Plugins panel, or undefined while that panel is unavailable.
- * @returns component rendering {@link LogalyzePage}.
+ * @returns component rendering {@link SupervisorPage}.
  */
-export function boundLogalyzePage(openRepoSettings: () => (() => void) | undefined): () => JSX.Element {
-  return () => <LogalyzePage openRepoSettings={openRepoSettings()} />
+export function boundSupervisorPage(openRepoSettings: () => (() => void) | undefined): () => JSX.Element {
+  return () => <SupervisorPage openRepoSettings={openRepoSettings()} />
 }
 
 type Notice = { kind: 'ok' | 'error'; text: string } | undefined
@@ -419,7 +419,7 @@ const UPLOAD_PHASE: Readonly<Record<UploadPhase, { pill: string; text: string }>
  * @param props - navigation supplied by the client entry.
  * @returns the panel.
  */
-export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Element {
+export function SupervisorPanel({ openRepoSettings }: SupervisorPageProps): JSX.Element {
   const [state, setState] = useState<StateWire | undefined>()
   const [loadError, setLoadError] = useState<string | undefined>()
   const [draft, setDraft] = useState<Draft | undefined>()
@@ -846,7 +846,7 @@ function LogReposSection({
   openRepoSettings,
   busy,
   onSave,
-}: LogalyzePageProps & {
+}: SupervisorPageProps & {
   state: StateWire
   busy: boolean
   onSave: (url: string, metadata: ApplicationMetadata) => Promise<ApplicationMetadata>
@@ -1693,7 +1693,7 @@ function AdvancedTab({
           </div>
           <div className="lz__row">
             <div className="lz__rowText">
-              <div className="lz__rowLabel">允许自然语言自动触发 /logalyze（autoInvoke）</div>
+              <div className="lz__rowLabel">允许自然语言自动触发 /supervisor（autoInvoke）</div>
               <div className="lz__rowSummary">由 cordis.yml 控制；启用时相关分析请求可自动激活入口 SKILL。</div>
             </div>
             <div className="lz__rowCtl"><span className="lz__tag">{runtime?.autoInvoke === false ? '关闭' : '开启'}</span></div>
@@ -1720,7 +1720,7 @@ function AdvancedTab({
       <section className="lz__sec">
         <h2 className="lz__secTitle">仓库同步与派发控制</h2>
         <div className="lz__list">
-          <NumberRow label="更新间隔" summary="输入 /logalyze 时，距上次读取超过该时间的仓库会先重新读取应用描述；0 表示每次都读取。" unit="分钟" value={draft.fetchIntervalMin} overridden={overridden.includes('fetchIntervalMs')} onChange={(value) => { setDraft({ ...draft, fetchIntervalMin: value }) }} />
+          <NumberRow label="更新间隔" summary="输入 /supervisor 时，距上次读取超过该时间的仓库会先重新读取应用描述；0 表示每次都读取。" unit="分钟" value={draft.fetchIntervalMin} overridden={overridden.includes('fetchIntervalMs')} onChange={(value) => { setDraft({ ...draft, fetchIntervalMin: value }) }} />
           <NumberRow label="单次应用数上限" summary="一次派发最多同时分析的应用数，不应超过 DSH 的活动子 Agent 上限（默认 8）。" unit="个" value={draft.maxAppsPerRequest} overridden={overridden.includes('maxAppsPerRequest')} onChange={(value) => { setDraft({ ...draft, maxAppsPerRequest: value }) }} />
           <NumberRow label="派发超时" summary="等待全部子 Agent 的最长时间，超时后停止仍在运行的子 Agent。" unit="分钟" value={draft.dispatchTimeoutMin} overridden={overridden.includes('dispatchTimeoutMs')} onChange={(value) => { setDraft({ ...draft, dispatchTimeoutMin: value }) }} />
         </div>
@@ -1747,7 +1747,7 @@ function AdvancedTab({
           <div className="lz__row">
             <div className="lz__rowText">
               <div className="lz__rowLabel">恢复 cordis.yml 配置</div>
-              <div className="lz__rowSummary">删除面板保存的全部设置（$DSH_HOME/logalyze/settings.json 中的覆盖值）。</div>
+              <div className="lz__rowSummary">删除面板保存的全部设置（$DSH_HOME/supervisor/settings.json 中的覆盖值）。</div>
             </div>
             <div className="lz__rowCtl"><button type="button" className="lz__btn lz__btn--danger" disabled={busy || overridden.length === 0} onClick={onReset}>恢复</button></div>
           </div>

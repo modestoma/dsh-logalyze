@@ -6,7 +6,7 @@
  * - MR 自动评审所需的增量查询、行级评审与讨论线程接口（`mrCompare` / `mrDiscussions` /
  *   `mrReview` / `mrDiscussionReply` / `mrDiscussionResolve` / `currentBotUser`）要求 `version: 8`。
  *
- * @module dsh-logalyze/deps/repos-contract
+ * @module dsh-supervisor/deps/repos-contract
  */
 
 /** Base `dshRepos` contract versions compatible with repository catalog, snapshots, and workspaces. */

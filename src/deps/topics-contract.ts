@@ -4,7 +4,7 @@
  * package. The plugin provides the service under `feishuTopics` and emits
  * {@link FEISHU_TOPICS_STATUS_EVENT}; both are looked up at run time.
  *
- * @module dsh-logalyze/deps/topics-contract
+ * @module dsh-supervisor/deps/topics-contract
  */
 
 /** The contract version this plugin speaks. Version 3 replaced `requesterUserId` with {@link TopicLaunchSpec.requester}; version 2 dropped the `workspace` parameter. */

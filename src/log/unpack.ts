@@ -5,7 +5,7 @@
  * - 严格防护 Zip-Bomb（流式解压字节上限 `maxBytes` 与条目上限 `maxEntries`，超限立即中止，不爆内存）；
  * - 单槽位损坏仅把该槽位标记为 `corrupted` 并写入 `CORRUPTED.txt`，不阻断同批次其他日志槽位。
  *
- * @module dsh-logalyze/log/unpack
+ * @module dsh-supervisor/log/unpack
  */
 
 import { constants, createReadStream } from 'node:fs'

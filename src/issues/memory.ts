@@ -4,7 +4,7 @@
  * - 序列化分配稳定可复用的 `ISS-<app-slug>-NNNN` 编号，支持同批内新建问题标题去重；
  * - 所有 AI 写入严格经 {@link IssuesTable.upsertByAi}，绝不覆盖人工字段。
  *
- * @module dsh-logalyze/issues/memory
+ * @module dsh-supervisor/issues/memory
  */
 
 import { createHash } from 'node:crypto'

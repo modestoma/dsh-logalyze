@@ -1,7 +1,7 @@
 /**
  * HTTP helpers shared by the settings routes and the analyze route.
  *
- * @module dsh-logalyze/util/http
+ * @module dsh-supervisor/util/http
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'

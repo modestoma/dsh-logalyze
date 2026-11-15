@@ -2,7 +2,7 @@
  * 插件配置：cordis.yml 中的 `config`（经 Standard Schema 在加载时校验）与
  * Web 面板覆盖共用同一套字段校验。
  *
- * @module dsh-logalyze/config
+ * @module dsh-supervisor/config
  */
 
 import { homedir } from 'node:os'
@@ -156,29 +156,29 @@ const configSchema = z.object({
    * Credential reference (environment-variable name) whose value is the
    * analyze API's bearer token.
    */
-  analyzeTokenRef: z.string().trim().regex(TOKEN_ENV_PATTERN, '令牌名称只能包含字母、数字和下划线，且不能以数字开头').default('LOGALYZE_ANALYZE_TOKEN'),
+  analyzeTokenRef: z.string().trim().regex(TOKEN_ENV_PATTERN, '令牌名称只能包含字母、数字和下划线，且不能以数字开头').default('SUPERVISOR_ANALYZE_TOKEN'),
   /**
    * Credential reference (environment-variable name) whose value is the log
    * platform's OAuth2 client secret.
    */
-  platformSecretRef: z.string().trim().regex(TOKEN_ENV_PATTERN, '凭据名称只能包含字母、数字和下划线，且不能以数字开头').default('LOGALYZE_PLATFORM_CLIENT_SECRET'),
+  platformSecretRef: z.string().trim().regex(TOKEN_ENV_PATTERN, '凭据名称只能包含字母、数字和下划线，且不能以数字开头').default('SUPERVISOR_PLATFORM_CLIENT_SECRET'),
   /** Registered `ctx.subagents` provider the children start on. */
   subagentProvider: z.string().trim().min(1).default('spawn'),
   /**
-   * How long loading `/logalyze` waits for the repository refresh before it
+   * How long loading `/supervisor` waits for the repository refresh before it
    * renders the catalog it already has, in milliseconds; the refresh keeps
    * running. 0 never waits.
    */
   refreshWaitMs: durationMs(0).default(15 * 1000),
   /**
-   * Whether top-level agents may load the entry skill without `/logalyze`
+   * Whether top-level agents may load the entry skill without `/supervisor`
    * when a task matches the usable applications its description lists.
    */
   autoInvoke: z.boolean().default(true),
 }).strict().refine(config => config.platformSecretRef !== config.analyzeTokenRef, { path: ['platformSecretRef'], message: '日志平台 client_secret 与分析接口令牌不能用同一个凭据名称' })
 
 /** Validated plugin configuration. */
-export type LogalyzeConfig = z.output<typeof configSchema>
+export type SupervisorConfig = z.output<typeof configSchema>
 
 /** Standard Schema the Cordis loader validates `config` with before `apply()`. */
 export const pluginConfigSchema = configSchema.prefault({})
@@ -222,9 +222,9 @@ export function describeIssue(error: z.ZodError): string {
  * @returns validated configuration.
  * @throws when the configuration is invalid.
  */
-export function resolveConfig(raw: unknown): LogalyzeConfig {
+export function resolveConfig(raw: unknown): SupervisorConfig {
   const parsed = pluginConfigSchema.safeParse(raw ?? {})
-  if (!parsed.success) throw new Error(`logalyze: 配置不合法：${describeIssue(parsed.error)}`)
+  if (!parsed.success) throw new Error(`supervisor: 配置不合法：${describeIssue(parsed.error)}`)
   return parsed.data
 }
 
@@ -243,7 +243,7 @@ export function resolveDshHome(env: NodeJS.ProcessEnv = process.env): string {
  * @param config - validated plugin configuration.
  * @returns complete editable settings, sharing nothing with `config`.
  */
-export function defaultsOf(config: LogalyzeConfig): EditableSettings {
+export function defaultsOf(config: SupervisorConfig): EditableSettings {
   // Parsing without `strict` drops the other configuration keys and copies every value.
   return z.object(editableFields).parse(config)
 }

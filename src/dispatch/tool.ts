@@ -1,10 +1,10 @@
 /**
- * `logalyze_dispatch` 派发工具：校验应用与日志，下载 URL 日志，按应用并行
+ * `supervisor_dispatch` 派发工具：校验应用与日志，下载 URL 日志，按应用并行
  * 启动子 Agent（工作目录为应用仓库），等待全部结束后一次返回各应用结论。
  *
  * - 应用 id 必须与注册表一一对应且仓库可用，否则整次调用被拒绝、不启动任何子 Agent。
  * - 日志一律以绝对路径交给子 Agent；URL 先下载到本次运行目录
- *   `<父会话目录>/.logalyze/runs/<runId>/<序号>-<应用 id>/`，该目录也是子 Agent
+ *   `<父会话目录>/.supervisor/runs/<runId>/<序号>-<应用 id>/`，该目录也是子 Agent
  *   解压日志的可写目录。分析接口话题里的日志编号（`{ ref: "L1" }`）按本话题的
  *   分析记录找到日志平台的 log_id，派发时现取临时下载链接下载到同一目录；
  *   链接不进入模型可见的内容。
@@ -17,7 +17,7 @@
  *   提交开始。
  * - 子会话（委派深度大于 0）中不提供本工具。
  *
- * @module dsh-logalyze/dispatch/tool
+ * @module dsh-supervisor/dispatch/tool
  */
 
 import { mkdir } from 'node:fs/promises'
@@ -240,7 +240,7 @@ export class Dispatcher {
     return {
       name: DISPATCH_TOOL_NAME,
       description: '观象：把日志分析任务派发给在对应应用代码仓库中工作的子 Agent，并等待全部完成后返回各应用的结论。'
-        + '仅在 /logalyze 入口 SKILL 的流程中使用；一次调用包含所有任务。',
+        + '仅在 /supervisor 入口 SKILL 的流程中使用；一次调用包含所有任务。',
       parameters: DISPATCH_PARAMETERS,
       output: {
         schema: OUTPUT_SCHEMA,

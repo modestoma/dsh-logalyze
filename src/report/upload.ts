@@ -7,7 +7,7 @@
  * 链接过期、上传中断或完成时缺文件，都用同一个键重试即可。文件不跟随符号
  * 链接读取，大小与清单不符（上传期间被改动）时本次失败。
  *
- * @module dsh-logalyze/report/upload
+ * @module dsh-supervisor/report/upload
  */
 
 import { constants } from 'node:fs'

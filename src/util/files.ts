@@ -3,7 +3,7 @@
  * 状态文件的原子替换。Agent 可写目录里的一切都按不可信输入处理：不跟随符号
  * 链接，只接受普通文件、UTF-8 文本和大小上限。
  *
- * @module dsh-logalyze/util/files
+ * @module dsh-supervisor/util/files
  */
 
 import { randomBytes } from 'node:crypto'

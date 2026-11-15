@@ -89,7 +89,7 @@ async function waitForStarts(started: Started[], count: number): Promise<void> {
   expect(started).toHaveLength(count)
 }
 
-describe('logalyze_dispatch', () => {
+describe('supervisor_dispatch', () => {
   it('starts one child per task in the app repository and returns every result', async () => {
     const { project, dispatcher, started, parent, registry, repos } = await setup()
     const { url, commit } = registry.status()[0]!
@@ -109,7 +109,7 @@ describe('logalyze_dispatch', () => {
     const prompt = child?.spec.prompt[0]?.text as string
     expect(prompt).not.toMatch(/^\/log-analysis/u)
     expect(prompt).toContain('没有适用 SKILL 时直接分析日志与代码')
-    const workDir = join(project, 'sample-logs', '.logalyze', 'runs')
+    const workDir = join(project, 'sample-logs', '.supervisor', 'runs')
     expect(prompt).toContain(`- \`${log}\``)
     expect(prompt).toContain(`（下载自 http://127.0.0.1:${port}/bucket/app.tar.gz?sig=x）；只看本应用相关部分：tag=order`)
     expect(prompt).toContain(workDir)
@@ -156,7 +156,7 @@ describe('logalyze_dispatch', () => {
     expect(value.results[1]?.skillGap).toBeUndefined()
     const text = renderDispatchValue(value)[0]?.text
     expect(text).toContain(`SKILL 不足（记录在 ${join(workDir, 'skill-gap.md')}）：SKILL 没写 traceId 字段 靠 grep 找到的`)
-    expect(text).toContain('在汇总回复末尾的「SKILL 改进建议」中用一两句说明，并问用户是否改进。本回合不要调用 logalyze_improve_skill（工具会拒绝）；用户同意后再调用，app 为 order-service。')
+    expect(text).toContain('在汇总回复末尾的「SKILL 改进建议」中用一两句说明，并问用户是否改进。本回合不要调用 supervisor_improve_skill（工具会拒绝）；用户同意后再调用，app 为 order-service。')
   })
 
   it('does not ask children of read-only repositories to record SKILL gaps', async () => {

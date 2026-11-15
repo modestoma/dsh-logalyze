@@ -1,7 +1,7 @@
 /**
  * 子 Agent 首条消息：代码快照、日志与可选 SKILL 使用方式。
  *
- * @module dsh-logalyze/dispatch/prompt
+ * @module dsh-supervisor/dispatch/prompt
  */
 
 import { skillDir } from '../apps/manifest.ts'

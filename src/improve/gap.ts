@@ -6,7 +6,7 @@
  * 运行目录对 Agent 可写，记录按不可信输入读取：只接受普通文件、UTF-8 文本和
  * 大小上限。
  *
- * @module dsh-logalyze/improve/gap
+ * @module dsh-supervisor/improve/gap
  */
 
 import { join } from 'node:path'

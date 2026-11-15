@@ -2,35 +2,35 @@
  * 设置面板与 Host 路由共用的路由常量和 JSON 结构。浏览器端 bundle 也会
  * 编译本文件，因此这里只放类型和常量，不 import 任何 Node 模块。
  *
- * @module dsh-logalyze/settings/contract
+ * @module dsh-supervisor/settings/contract
  */
 
 /** GET：面板所需的全部状态（生效设置、默认值、仓库与应用）。 */
-export const STATE_ROUTE = '/logalyze/state'
+export const STATE_ROUTE = '/supervisor/state'
 /** PUT：保存可编辑设置；DELETE：清除面板覆盖、恢复 cordis.yml 默认值。应用仓库不在这里编辑，来自 dsh-repo 的仓库清单。 */
-export const SETTINGS_ROUTE = '/logalyze/settings'
+export const SETTINGS_ROUTE = '/supervisor/settings'
 /** PUT：更新某个已开启「日志分析」仓库的应用描述与触发别名。 */
-export const APPLICATION_ROUTE = '/logalyze/applications'
+export const APPLICATION_ROUTE = '/supervisor/applications'
 /** POST：body `{ id }` 立即把一次分析的报告重新上传到它的每份日志，不论上次是否成功。 */
-export const REPORT_UPLOAD_ROUTE = '/logalyze/reports/upload'
+export const REPORT_UPLOAD_ROUTE = '/supervisor/reports/upload'
 /** PUT：body `{ tokenEnv, value }` 把凭据存入 DSH 凭据库；DELETE：body `{ tokenEnv }` 删除已存的值。只接受分析接口令牌和日志平台 client_secret 的名称。 */
-export const TOKEN_ROUTE = '/logalyze/token'
+export const TOKEN_ROUTE = '/supervisor/token'
 /** POST：body `{ scope, key }` 重置（un-trip）指定的熔断器，恢复受阻的 MR/日志自动监管。 */
-export const BREAKER_RESET_ROUTE = '/logalyze/breakers/reset'
+export const BREAKER_RESET_ROUTE = '/supervisor/breakers/reset'
 /** POST：body `{ action: 'rewind' | 'pause' | 'resume', cursorTime? }` 控制日志平台自动轮询水位线。 */
-export const LOG_WATERMARK_ROUTE = '/logalyze/log-supervision/watermark'
+export const LOG_WATERMARK_ROUTE = '/supervisor/log-supervision/watermark'
 /** POST：body `{ key? }` 立即重试指定或全部处于 dead 状态的平台报告回传任务。 */
-export const OUTBOX_RETRY_ROUTE = '/logalyze/outbox/retry'
+export const OUTBOX_RETRY_ROUTE = '/supervisor/outbox/retry'
 /** POST：手动触发一轮「已知问题库 ↔ 飞书多维表格」双向同步。 */
-export const ISSUE_SYNC_ROUTE = '/logalyze/issues/sync'
+export const ISSUE_SYNC_ROUTE = '/supervisor/issues/sync'
 /** POST：body `{ bitableUrl?, table? }` 对指定（或已保存）飞书多维表格执行字段映射自检。 */
-export const ISSUE_CHECK_ROUTE = '/logalyze/issues/check'
+export const ISSUE_CHECK_ROUTE = '/supervisor/issues/check'
 
 /**
  * POST：日志平台分析接口（Bearer 令牌鉴权，不走 DSH 登录）。它在 DSH 的
  * `/api` 命名空间之外，网关可以把它和需要登录的 DSH 接口分开暴露。
  */
-export const ANALYZE_ROUTE = '/open-api/logalyze'
+export const ANALYZE_ROUTE = '/open-api/supervisor'
 
 /** One application repository: a dsh-repo catalog repository with the log analysis feature turned on. */
 export interface RepoSpec {
@@ -58,7 +58,7 @@ export interface DownloadSettings {
 
 /** Application SKILL improvement: children record SKILL gaps, and after the user agrees an improvement child drafts a case and SKILL changes that are submitted as a merge request. */
 export interface SkillUpdateSettings {
-  /** Whether children are told to record SKILL gaps and top-level agents are offered `logalyze_improve_skill`. */
+  /** Whether children are told to record SKILL gaps and top-level agents are offered `supervisor_improve_skill`. */
   enabled: boolean
   /** Most files one improvement may add or change. */
   maxFiles: number
@@ -204,7 +204,7 @@ export interface LogSupervisionSettings {
 
 /** The settings the Web panel can override; every field is required on the wire. */
 export interface EditableSettings {
-  /** Minimum age of a repository's last read of its application description before loading `/logalyze` reads it again, in milliseconds; 0 reads on every load. */
+  /** Minimum age of a repository's last read of its application description before loading `/supervisor` reads it again, in milliseconds; 0 reads on every load. */
   fetchIntervalMs: number
   /** Maximum number of child analyses one dispatch may start. */
   maxAppsPerRequest: number
@@ -552,7 +552,7 @@ export interface IssueItemWire {
   syncDirty: boolean
 }
 
-/** Column mapping diagnostic entry produced by `POST /logalyze/issues/check`. */
+/** Column mapping diagnostic entry produced by `POST /supervisor/issues/check`. */
 export interface BitableColumnCheckWire {
   name: string
   role: 'ai' | 'human'
@@ -605,7 +605,7 @@ export interface RuntimeInfoWire {
   autoInvoke: boolean
 }
 
-/** `GET /logalyze/state` response. */
+/** `GET /supervisor/state` response. */
 export interface StateWire {
   /** Effective settings: cordis.yml values with panel overrides applied. */
   settings: EditableSettings

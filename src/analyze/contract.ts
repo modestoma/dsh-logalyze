@@ -1,7 +1,7 @@
 /**
  * 日志平台分析接口的请求与响应。
  *
- * `POST /open-api/logalyze`（DSH Web 服务器上），带
+ * `POST /open-api/supervisor`（DSH Web 服务器上），带
  * `Authorization: Bearer <令牌>`、`Idempotency-Key` 请求头和 JSON 请求体：
  * 发起方类型与标识、触发时间、目标群（可省略，用设置面板的默认群）、同一
  * 应用同一错误码的一批日志平台 `logIds` 和可选的调用方说明。观象按 log_id
@@ -9,7 +9,7 @@
  * `202`，分析随后在卡片下的话题里流式进行；每轮结束后每份日志各自收到一份
  * 报告修订（见 `../report/`）。
  *
- * @module dsh-logalyze/analyze/contract
+ * @module dsh-supervisor/analyze/contract
  */
 
 import { createHash } from 'node:crypto'

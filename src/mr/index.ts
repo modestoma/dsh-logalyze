@@ -1,7 +1,7 @@
 /**
  * 审微有状态 MR 自动评审模块导出。
  *
- * @module dsh-logalyze/mr
+ * @module dsh-supervisor/mr
  */
 
 export * from './signals.ts'

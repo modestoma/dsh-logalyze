@@ -3,7 +3,7 @@
  * （每份日志一行，链接到日志详情页，回传后第二列补「分析报告」）、首轮消息、
  * 幂等键与指纹，以及服务结果到 HTTP 响应的映射。
  *
- * @module dsh-logalyze/analyze/topics
+ * @module dsh-supervisor/analyze/topics
  */
 
 import type { TopicCardLinks, TopicLaunchResult, TopicLaunchSpec, TopicRequester } from '../deps/topics-contract.ts'

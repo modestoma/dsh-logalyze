@@ -3,7 +3,7 @@
  * `analyzeTokenRef`）和日志平台的 client_secret（`platformSecretRef`）。面板只能
  * 看到是否已配置和来源，看不到值。
  *
- * @module dsh-logalyze/analyze/token
+ * @module dsh-supervisor/analyze/token
  */
 
 import { z } from 'zod'
@@ -23,17 +23,21 @@ const tokenSetSchema = tokenClearSchema.extend({ value: tokenValue }).strict()
 
 /** One credential in DSH's credential store. */
 export class StoredCredential {
+  private migrating: Promise<void> | undefined
+
   /**
    * @param ref - credential reference (`analyzeTokenRef` or `platformSecretRef`).
    * @param label - what the credential is, in messages (e.g. `分析接口令牌`).
    * @param credentials - DSH's credential store, looked up per use.
    * @param warn - receives credential store failures.
+   * @param legacyRef - optional legacy credential reference to migrate from (`LOGALYZE_*`).
    */
   constructor(
     readonly ref: string,
     private readonly label: string,
     private readonly credentials: () => HostCredentials | undefined,
     private readonly warn: (message: string) => void,
+    private readonly legacyRef?: string,
   ) {}
 
   /** @returns whether the composition has a credential store. */
@@ -41,15 +45,48 @@ export class StoredCredential {
     return this.credentials() !== undefined
   }
 
+  private async ensureMigrated(store: HostCredentials): Promise<void> {
+    if (this.legacyRef === undefined || this.legacyRef === this.ref) return
+    if (this.migrating !== undefined) {
+      await this.migrating
+      return
+    }
+    this.migrating = (async () => {
+      try {
+        const info = await store.describe(this.ref)
+        if (info.configured || !info.writable) return
+        const legacyInfo = await store.describe(this.legacyRef!).catch(() => undefined)
+        if (legacyInfo?.configured !== true || legacyInfo.source !== 'file') return
+        const legacy = await store.resolve(this.legacyRef!)
+        if (legacy === undefined || legacy.source !== 'file') return
+        await store.set(this.ref, legacy.value)
+        await store.unset(this.legacyRef!).catch(() => undefined)
+      } catch {
+        // Best-effort migration only; reads still fall back to legacyRef when available.
+      }
+    })().finally(() => {
+      this.migrating = undefined
+    })
+    await this.migrating
+  }
+
   /**
    * Resolve the value, read per use.
    * @returns the value, or undefined when it is not configured or cannot be read.
    */
   async value(): Promise<string | undefined> {
+    const store = this.credentials()
+    if (store === undefined) return undefined
     try {
-      return (await this.credentials()?.resolve(this.ref))?.value
+      const primary = await store.resolve(this.ref)
+      if (primary !== undefined) return primary.value
+      if (this.legacyRef === undefined || this.legacyRef === this.ref) return undefined
+      await this.ensureMigrated(store)
+      const afterMigrate = await store.resolve(this.ref)
+      if (afterMigrate !== undefined) return afterMigrate.value
+      return (await store.resolve(this.legacyRef))?.value
     } catch (error) {
-      this.warn(`logalyze: 读取${this.label} ${this.ref} 失败：${messageOf(error)}`)
+      this.warn(`supervisor: 读取${this.label} ${this.ref} 失败：${messageOf(error)}`)
       return undefined
     }
   }
@@ -59,7 +96,19 @@ export class StoredCredential {
     const store = this.credentials()
     if (store === undefined) return undefined
     try {
+      await this.ensureMigrated(store)
       const info = await store.describe(this.ref)
+      if (!info.configured && this.legacyRef !== undefined && this.legacyRef !== this.ref) {
+        const legacyInfo = await store.describe(this.legacyRef).catch(() => undefined)
+        if (legacyInfo?.configured === true) {
+          return {
+            tokenEnv: this.ref,
+            configured: true,
+            ...legacyInfo.source === undefined ? {} : { source: legacyInfo.source },
+            writable: info.writable,
+          }
+        }
+      }
       return { tokenEnv: this.ref, configured: info.configured, ...info.source === undefined ? {} : { source: info.source }, writable: info.writable }
     } catch (error) {
       return { tokenEnv: this.ref, configured: false, writable: false, error: messageOf(error) }
@@ -94,5 +143,8 @@ export class StoredCredential {
     if (store === undefined) throw new SettingsError(`当前 DSH 组合没有凭据服务（@deepseek-ai/dsh-credentials-local），无法保存${this.label}`)
     if (value === undefined) await store.unset(tokenEnv)
     else await store.set(tokenEnv, value)
+    if (this.legacyRef !== undefined && this.legacyRef !== this.ref) {
+      await store.unset(this.legacyRef).catch(() => undefined)
+    }
   }
 }

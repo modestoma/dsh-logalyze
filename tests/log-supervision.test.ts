@@ -36,7 +36,7 @@ import { PlatformClient } from '../src/platform/client.ts'
 import { CircuitBreakerRegistry } from '../src/runtime/breaker.ts'
 import { openSupervisorDomain, outboxPlatformKey } from '../src/runtime/domain.ts'
 import { createSupervisionPools } from '../src/runtime/pool.ts'
-import { LogalyzeService } from '../src/service.ts'
+import { SupervisorService } from '../src/service.ts'
 import type { StateWire } from '../src/settings/contract.ts'
 import { OverlayStore } from '../src/settings/overlay.ts'
 import { loadBundledSkills } from '../src/skill/bundled.ts'
@@ -625,7 +625,7 @@ describe('IssueMemory search, humanConclusion preservation, and batch dedup', ()
 // 3. End-to-End LogSupervision: Poller, Batching, Breaker, Outbox, Feishu & Self-MR Loop
 // ---------------------------------------------------------------------------
 
-describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
+describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
   async function createFullHarness(options: {
     readonly clockStart?: number
     readonly deliveryMode?: 'quiet-until-done' | 'topic-on-start'
@@ -693,10 +693,10 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
       ['feishuTopics', fakeTopics],
       ['feishuActions', fakeActions],
       ['credentials', {
-        resolve: async (name: string) => name === 'LOGALYZE_PLATFORM_CLIENT_SECRET' ? { value: fakePlatform.secret, source: 'env' } : undefined,
+        resolve: async (name: string) => name === 'SUPERVISOR_PLATFORM_CLIENT_SECRET' ? { value: fakePlatform.secret, source: 'env' } : undefined,
         set: async () => undefined,
         unset: async () => undefined,
-        describe: async (name: string) => ({ configured: name === 'LOGALYZE_PLATFORM_CLIENT_SECRET', writable: false }),
+        describe: async (name: string) => ({ configured: name === 'SUPERVISOR_PLATFORM_CLIENT_SECRET', writable: false }),
       }],
     ])
 
@@ -790,7 +790,7 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     }
 
     const bundled = loadBundledSkills(new URL('../skills/', import.meta.url))
-    const service = new LogalyzeService(ctx, config, store, { bundled }, {
+    const service = new SupervisorService(ctx, config, store, { bundled }, {
       analysesDir: join(dir, 'analyses'),
       legacyReportsDir: join(dir, 'legacy'),
       supervisorDir: options.supervisorDir ?? join(dir, 'supervisor'),

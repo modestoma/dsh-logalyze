@@ -19,7 +19,7 @@
  * - 启动时和每接受一次新分析时按存储的保留规则清理旧记录；正在上传或更新的
  *   记录这次不清理。
  *
- * @module dsh-logalyze/report/tracker
+ * @module dsh-supervisor/report/tracker
  */
 
 import { lstat, mkdir, readFile } from 'node:fs/promises'
@@ -279,7 +279,7 @@ export class ReportTracker {
         const buffer = this.buffers.get(header.id) ?? { questions: [], reply: '' }
         this.buffers.delete(header.id)
         void this.turnEnded(header.id, event.data as TurnEndData, buffer).catch((error: unknown) => {
-          this.deps.warn(`logalyze: 记录分析轮次失败：${messageOf(error)}`)
+          this.deps.warn(`supervisor: 记录分析轮次失败：${messageOf(error)}`)
         })
         return
       }
@@ -360,7 +360,7 @@ export class ReportTracker {
       try {
         text = await readFile(join(dir, path), 'utf8')
       } catch (error) {
-        this.deps.warn(`logalyze: 读取日志结论 ${join(dir, path)} 失败：${messageOf(error)}`)
+        this.deps.warn(`supervisor: 读取日志结论 ${join(dir, path)} 失败：${messageOf(error)}`)
         continue
       }
       const cut = text.length <= MAX_CONCLUSION_CHARS ? text : `${text.slice(0, MAX_CONCLUSION_CHARS - 1)}…`
@@ -376,7 +376,7 @@ export class ReportTracker {
     try {
       return await listReport(dir)
     } catch (error) {
-      this.deps.warn(`logalyze: 读取报告目录 ${dir} 失败：${messageOf(error)}`)
+      this.deps.warn(`supervisor: 读取报告目录 ${dir} 失败：${messageOf(error)}`)
       return { files: {}, sizes: {}, count: 0, bytes: 0, refused: [] }
     }
   }
@@ -451,7 +451,7 @@ export class ReportTracker {
       if (updated !== undefined) await this.deps.store.put(updated)
     })
     const settled = next.catch((error: unknown) => {
-      this.deps.warn(`logalyze: 更新分析记录失败：${messageOf(error)}`)
+      this.deps.warn(`supervisor: 更新分析记录失败：${messageOf(error)}`)
     })
     this.locks.set(id, settled)
     await settled
@@ -467,7 +467,7 @@ export class ReportTracker {
     if (force) this.forced.add(id)
     if (this.workers.has(id)) return
     const work = this.work(id).catch((error: unknown) => {
-      this.deps.warn(`logalyze: 上传报告失败：${messageOf(error)}`)
+      this.deps.warn(`supervisor: 上传报告失败：${messageOf(error)}`)
     }).finally(() => { this.workers.delete(id) })
     this.workers.set(id, work)
   }
@@ -579,7 +579,7 @@ export class ReportTracker {
       try {
         const reportUrl = await uploadRevision(this.deps.platform, {
           logId: log.logId,
-          key: `logalyze:${record.id}:${ref}:r${record.revision}:g${log.generation}`,
+          key: `supervisor:${record.id}:${ref}:r${record.revision}:g${log.generation}`,
           entry,
           dir: prepared.dir,
           files: manifest.files,
@@ -613,7 +613,7 @@ export class ReportTracker {
       result = { ok: false as const, code: 'update-failed' as const, message: messageOf(error) }
     }
     if (!result.ok) {
-      this.deps.warn(`logalyze: 根卡片补充分析报告链接失败：${result.message}`)
+      this.deps.warn(`supervisor: 根卡片补充分析报告链接失败：${result.message}`)
       return
     }
     const shown = new Set(record.logs.filter(log => log.reportUrl !== undefined).map(log => log.ref))

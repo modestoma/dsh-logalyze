@@ -1,6 +1,6 @@
 # 01. 跨插件契约设计：`dsh_channels`（`feishuActions` / `feishuBitable`）& `dsh-repo` v8 评审感知
 
-本文档定义 `dsh-supervisor`（落地于 `dsh-logalyze`）所依赖的三项跨插件底层公开契约。全部契约均保持**领域无关（Domain-Agnostic）**，不引入任何耦合“日志分析”或特定业务流程的私有概念。
+本文档定义 `dsh-supervisor` 所依赖的三项跨插件底层公开契约。全部契约均保持**领域无关（Domain-Agnostic）**，不引入任何耦合“日志分析”或特定业务流程的私有概念。
 
 ---
 

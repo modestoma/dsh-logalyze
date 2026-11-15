@@ -1,8 +1,8 @@
 /**
  * 运行目录：派发、SKILL 改进和接入起草在调用方会话目录下的
- * `.logalyze/runs/<runId>/` 中工作，并只在顶层 Agent 中提供。
+ * `.supervisor/runs/<runId>/` 中工作，并只在顶层 Agent 中提供。
  *
- * @module dsh-logalyze/runs/run-dir
+ * @module dsh-supervisor/runs/run-dir
  */
 
 import { randomBytes } from 'node:crypto'
@@ -10,7 +10,7 @@ import { isAbsolute, relative, sep } from 'node:path'
 import type { Agent, ToolRunContext, WorkingDirectoryService } from '../host.ts'
 
 /** Path segments of the run directories below a base directory. */
-export const RUNS_SEGMENTS = ['.logalyze', 'runs'] as const
+export const RUNS_SEGMENTS = ['.supervisor', 'runs'] as const
 
 /**
  * Whether a session is a delegated child, where this plugin's tools are not offered.
@@ -61,7 +61,7 @@ export function isInside(child: string, parent: string): boolean {
  * Whether a path lies in a run directory, where improvement and drafting
  * children work in their workspaces.
  * @param path - absolute path.
- * @returns whether the path has a `.logalyze/runs/` segment pair.
+ * @returns whether the path has a `.supervisor/runs/` segment pair.
  */
 export function inRunDirectory(path: string): boolean {
   const segments = path.split(sep)
@@ -72,7 +72,7 @@ export function inRunDirectory(path: string): boolean {
 export interface RunBase {
   /** The agent's effective working directory; relative log paths resolve against it. */
   readonly effectiveDir: string
-  /** Directory holding `.logalyze/runs/`: the effective directory when it lies in the project directory, else the project directory. */
+  /** Directory holding `.supervisor/runs/`: the effective directory when it lies in the project directory, else the project directory. */
   readonly baseDir: string
 }
 
