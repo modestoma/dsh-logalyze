@@ -847,6 +847,7 @@ export class IssueBitableSyncer {
         ...(assigneeChanged ? { assignee: nextAssignee } : {}),
         bitableRecordId: remote.recordId,
         bitableTableKey: tableKey,
+        ...(bindingChanged ? { syncDirty: true } : {}),
       })
       if (conclusionChanged || statusChanged || assigneeChanged) {
         pulled += 1

@@ -594,8 +594,8 @@ export function LogalyzePanel({ openRepoSettings }: LogalyzePageProps): JSX.Elem
               onCheckMapping={() => {
                 void run(
                   () => checkIssuesBitable({
-                    ...optionalText(draft.issueBitableUrl, 'bitableUrl'),
-                    ...optionalText(draft.issueTable, 'table'),
+                    bitableUrl: draft.issueBitableUrl.trim(),
+                    table: draft.issueTable.trim(),
                   }),
                   '已完成多维表格字段映射自检',
                   false,

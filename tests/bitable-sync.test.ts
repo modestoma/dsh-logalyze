@@ -563,18 +563,31 @@ describe('IssueBitableSyncer two-way synchronization', () => {
     expect(afterDeleteRes).toEqual({ ok: true, pulled: 0, pushed: 1, created: 1, updated: 0 })
     expect(tblA.records).toHaveLength(2)
 
-    // Switch target to tblB -> must update ISS-sw-1 into rec_b_existing AND create ISS-sw-2 in tblB, even though both had syncDirty=false!
+    // Switch target to tblB -> if push fails after pull rebinds rec_b_existing, syncDirty must stay true for retry!
     currentSettings = {
       enabled: true,
       bitableUrl: 'https://mi.feishu.cn/base/appSwitch?table=tblB',
       syncIntervalMs: 60_000,
     }
     syncer.notifyConfigChanged()
+    vi.spyOn(bitable, 'updateRecords').mockResolvedValueOnce({
+      ok: false,
+      code: 'rate-limited',
+      message: 'rate limited during switch',
+    })
+    const failedSwitchRes = await syncer.syncNow()
+    expect(failedSwitchRes.ok).toBe(false)
+    expect(failedSwitchRes.pulled).toBe(1)
+    expect(domain.issues.get('ISS-sw-1')?.humanStatus).toBe('已解决')
+    expect(domain.issues.get('ISS-sw-1')?.bitableTableKey).toBe('appSwitch:tblB')
+    expect(domain.issues.get('ISS-sw-1')?.syncDirty).toBe(true)
+
     const switchRes = await syncer.syncNow()
-    expect(switchRes).toEqual({ ok: true, pulled: 1, pushed: 2, created: 1, updated: 1 })
+    expect(switchRes).toEqual({ ok: true, pulled: 0, pushed: 2, created: 1, updated: 1 })
     const tblB = bitable.getTable('appSwitch', 'tblB')
     expect(tblB.records).toHaveLength(2)
-    expect(domain.issues.get('ISS-sw-1')?.humanStatus).toBe('已解决')
+    expect(tblB.records.find(r => r.recordId === 'rec_b_existing')?.fields['AI 诊断结论']).toBe('诊断1')
+    expect(domain.issues.get('ISS-sw-1')?.syncDirty).toBe(false)
     expect(domain.issues.get('ISS-sw-1')?.bitableTableKey).toBe('appSwitch:tblB')
     expect(domain.issues.get('ISS-sw-2')?.bitableTableKey).toBe('appSwitch:tblB')
   })
@@ -694,7 +707,8 @@ describe('IssueBitableSyncer two-way synchronization', () => {
         ...initial.settings,
         issueSync: {
           enabled: true,
-          bitableUrl: 'https://mi.feishu.cn/base/appGood',
+          bitableUrl: 'https://mi.feishu.cn/base/appGood?table=tblGood',
+          table: 'tblMissing',
           syncIntervalMs: 60_000,
         },
       }),
@@ -711,12 +725,37 @@ describe('IssueBitableSyncer two-way synchronization', () => {
     const badCheckRes = await fetch(`${base}${ISSUE_CHECK_ROUTE}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ bitableUrl: 'https://mi.feishu.cn/base/appMissingId' }),
+      body: JSON.stringify({ bitableUrl: 'https://mi.feishu.cn/base/appMissingId', table: '' }),
     })
     expect(badCheckRes.status).toBe(200)
     const badCheckState = ((await badCheckRes.json()) as { ok: true; state: StateWire }).state
     expect(badCheckState.issues?.lastCheck?.ok).toBe(false)
     expect(badCheckState.issues?.lastCheck?.missingRequired).toEqual(['问题ID'])
+
+    // Passing explicit empty table overrides saved `table: 'tblMissing'` when checking draft configuration.
+    const clearedTableCheckRes = await fetch(`${base}${ISSUE_CHECK_ROUTE}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ bitableUrl: 'https://mi.feishu.cn/base/appGood?table=tblGood', table: '' }),
+    })
+    expect(clearedTableCheckRes.status).toBe(200)
+    const clearedTableState = ((await clearedTableCheckRes.json()) as { ok: true; state: StateWire }).state
+    expect(clearedTableState.issues?.lastCheck?.ok).toBe(true)
+    expect(clearedTableState.issues?.lastCheck?.resolvedTableId).toBe('tblGood')
+
+    const clearSavedTableRes = await fetch(`${base}${SETTINGS_ROUTE}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        ...initial.settings,
+        issueSync: {
+          enabled: true,
+          bitableUrl: 'https://mi.feishu.cn/base/appGood',
+          syncIntervalMs: 60_000,
+        },
+      }),
+    })
+    expect(clearSavedTableRes.status).toBe(200)
 
     const goodCheckRes = await fetch(`${base}${ISSUE_CHECK_ROUTE}`, {
       method: 'POST',
