@@ -8,6 +8,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { z } from 'zod'
+import { parseBitableUrl } from './deps/bitable.ts'
 import { CHAT_ID_PATTERN, TOKEN_ENV_PATTERN } from './settings/contract.ts'
 import type { EditableKey, EditableSettings } from './settings/contract.ts'
 
@@ -82,6 +83,21 @@ const mrReviewSchema = z.object({
   maxAutoFixAttempts: z.number().int().min(0).max(10).default(2),
   dailyMrTurnLimit: z.number().int().min(1).max(200).default(12),
   repoHourlyTurnLimit: z.number().int().min(1).max(500).default(30),
+  customInstructions: z.string().trim().max(4000, '附加评审要求最多 4000 个字符').transform(value => (value === '' ? undefined : value)).optional(),
+  feishuChatId: z.string().trim()
+    .transform(value => (value === '' ? undefined : value))
+    .pipe(z.string().regex(CHAT_ID_PATTERN, 'MR 通知群必须是飞书群的 chat_id（oc_ 开头）').optional())
+    .optional(),
+}).strict()
+
+const issueSyncSchema = z.object({
+  enabled: z.boolean().default(true),
+  bitableUrl: z.string().trim()
+    .transform(value => (value === '' ? undefined : value))
+    .pipe(z.string().max(2048, '飞书多维表格地址过长').refine(value => parseBitableUrl(value) !== undefined, '飞书多维表格地址不合法：请填写 https://…/base/<token> 或 https://…/wiki/<token>').optional())
+    .optional(),
+  table: z.string().trim().max(200, '数据表名称或 ID 最多 200 个字符').transform(value => (value === '' ? undefined : value)).optional(),
+  syncIntervalMs: durationMs(5000).default(5 * 60 * 1000),
 }).strict()
 
 const logSupervisionBaseSchema = z.object({
@@ -122,6 +138,7 @@ export const editableFields = {
   analyze: analyzeSchema.prefault({}),
   mrReview: mrReviewSchema.prefault({}),
   logSupervision: logSupervisionSchema.prefault({}),
+  issueSync: issueSyncSchema.prefault({}),
 }
 
 /** A complete editable settings payload, as the panel saves it. */
@@ -177,6 +194,7 @@ export const overlaySchema = z.object({
   analyze: analyzeSchema.optional(),
   mrReview: mrReviewSchema.optional(),
   logSupervision: logSupervisionSchema.optional(),
+  issueSync: issueSyncSchema.optional(),
 }).strict()
 
 /** Validated panel overlay. */

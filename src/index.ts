@@ -15,6 +15,7 @@ import { mountAnalyzeRoute } from './analyze/server.ts'
 import { LOGALYZE_APPLICATIONS_SERVICE } from './apps/access.ts'
 import { resolveConfig } from './config.ts'
 import { FEISHU_ACTIONS_SERVICE, FEISHU_ACTIONS_VERSION, lookupActions } from './deps/actions.ts'
+import { FEISHU_BITABLE_SERVICE, FEISHU_BITABLE_VERSION, lookupBitable, parseBitableUrl } from './deps/bitable.ts'
 import { DSH_REPOS_SERVICE, LOG_ANALYSIS_FEATURE, lookupRepos, lookupReposV8, MR_REVIEW_FEATURE } from './deps/repos.ts'
 import { FEISHU_TOPICS_SERVICE } from './deps/topics.ts'
 import type { HostContext } from './host.ts'
@@ -28,8 +29,10 @@ import { messageOf } from './util/errors.ts'
 export type * from './settings/contract.ts'
 export type * from './deps/repos-contract.ts'
 export type * from './deps/actions-contract.ts'
+export type * from './deps/bitable-contract.ts'
 export * from './runtime/index.ts'
 export * from './issues/memory.ts'
+export * from './issues/bitable-sync.ts'
 export * from './log/index.ts'
 export * from './mr/index.ts'
 export type { ApplicationAccess } from './apps/access.ts'
@@ -38,12 +41,16 @@ export {
   DSH_REPOS_SERVICE,
   FEISHU_ACTIONS_SERVICE,
   FEISHU_ACTIONS_VERSION,
+  FEISHU_BITABLE_SERVICE,
+  FEISHU_BITABLE_VERSION,
   LOG_ANALYSIS_FEATURE,
   LOGALYZE_APPLICATIONS_SERVICE,
   lookupActions,
+  lookupBitable,
   lookupRepos,
   lookupReposV8,
   MR_REVIEW_FEATURE,
+  parseBitableUrl,
 }
 export type { LogalyzeConfig } from './config.ts'
 
@@ -93,6 +100,12 @@ export function apply(ctx: HostContext, config?: unknown, options: LogalyzePlugi
   ctx.inject?.([FEISHU_ACTIONS_SERVICE], () => {
     void service.actionsAvailable().catch((error: unknown) => {
       ctx.logger?.error?.('logalyze: 补发飞书动作按钮卡片失败：%s', messageOf(error))
+    })
+  })
+  // Trigger pending Known Issues Bitable sync when `feishuBitable` registers or reloads.
+  ctx.inject?.([FEISHU_BITABLE_SERVICE], () => {
+    void service.bitableAvailable().catch((error: unknown) => {
+      ctx.logger?.error?.('logalyze: 刷新飞书多维表格同步状态失败：%s', messageOf(error))
     })
   })
   // Whenever dsh-repo's service appears, including after it reloads: register

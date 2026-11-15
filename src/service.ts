@@ -9,6 +9,7 @@
  * @module dsh-logalyze/service
  */
 
+import { createHash } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { z } from 'zod'
 import { resolveBatch } from './analyze/batch.ts'
@@ -25,6 +26,7 @@ import { RepoRegistry } from './apps/registry.ts'
 import type { LogalyzeConfig } from './config.ts'
 import { describeIssue } from './config.ts'
 import { FEISHU_ACTIONS_SERVICE, lookupActions } from './deps/actions.ts'
+import { FEISHU_BITABLE_SERVICE, lookupBitable } from './deps/bitable.ts'
 import { DSH_REPOS_SERVICE, ReposClient } from './deps/repos.ts'
 import type { DshRepos } from './deps/repos-contract.ts'
 import { FEISHU_TOPICS_STATUS_EVENT } from './deps/topics-contract.ts'
@@ -34,6 +36,7 @@ import { Dispatcher } from './dispatch/tool.ts'
 import type { HostContext, HostCredentials, ToolActivationContext, ToolDefinition, WorkingDirectoryService } from './host.ts'
 import { SkillViewer } from './improve/show.ts'
 import { SkillImprover } from './improve/tool.ts'
+import { IssueBitableSyncer } from './issues/bitable-sync.ts'
 import { IssueMemory } from './issues/memory.ts'
 import { LogSupervisor, createHostLogSessionDriver, createLogTools } from './log/index.ts'
 import type { LogSessionDriver, LogToolsRuntime } from './log/index.ts'
@@ -68,6 +71,11 @@ const breakerResetSchema = z.object({
   key: z.string().trim().min(1, '熔断器 key 不能为空'),
 }).strict()
 
+const bitableCheckSchema = z.object({
+  bitableUrl: z.string().max(2048, '飞书多维表格地址过长').optional(),
+  table: z.string().max(200, '数据表名称或 ID 最多 200 个字符').optional(),
+}).strict()
+
 /** Optional seams for tests. */
 export interface ServiceOptions {
   /** Fetch used for log downloads and the log platform. */
@@ -92,6 +100,10 @@ export interface ServiceOptions {
   readonly autoMrPollTimer?: boolean
   /** Disable background log poll interval timer in tests (`pollNow()` drives manually). */
   readonly autoLogPollTimer?: boolean
+  /** Disable background Bitable issue sync interval timer in tests (`syncIssuesNow()` drives manually). */
+  readonly autoIssueSyncTimer?: boolean
+  /** Override Bitable push debounce window after AI issue writes in ms (primarily for tests). */
+  readonly issueSyncDebounceMs?: number
 }
 
 /** Package files the service serves. */
@@ -124,6 +136,8 @@ export class LogalyzeService {
   private readonly clock: () => number
   private readonly autoMrPollTimer: boolean
   private readonly autoLogPollTimer: boolean
+  private readonly autoIssueSyncTimer: boolean
+  private readonly issueSyncDebounceMs: number | undefined
   private readonly hostMrDriver: ReturnType<typeof createHostMrSessionDriver> | undefined
   private readonly mrSessionDriver: MrSessionDriver
   private readonly hostLogDriver: ReturnType<typeof createHostLogSessionDriver> | undefined
@@ -131,11 +145,14 @@ export class LogalyzeService {
   private readonly fetchImpl: typeof fetch | undefined
   private breakers: CircuitBreakerRegistry | undefined
   private issueMemory: IssueMemory | undefined
+  private issueSyncer: IssueBitableSyncer | undefined
   private mrSupervisor: MrSupervisor | undefined
   private logSupervisor: LogSupervisor | undefined
   private supervisorPromise: Promise<SupervisorDomain> | undefined
   private active = true
   private readonly refreshWaitMs: number
+  private readonly subagentProvider: string
+  private readonly autoInvoke: boolean
   private readonly booted = Promise.withResolvers<void>()
 
   /**
@@ -162,6 +179,8 @@ export class LogalyzeService {
     this.clock = options.now ?? Date.now
     this.autoMrPollTimer = options.autoMrPollTimer ?? true
     this.autoLogPollTimer = options.autoLogPollTimer ?? true
+    this.autoIssueSyncTimer = options.autoIssueSyncTimer ?? true
+    this.issueSyncDebounceMs = options.issueSyncDebounceMs
     this.hostMrDriver = options.mrSessionDriver === undefined ? createHostMrSessionDriver(ctx) : undefined
     this.mrSessionDriver = options.mrSessionDriver ?? this.hostMrDriver!
     this.hostLogDriver = options.logSessionDriver === undefined ? createHostLogSessionDriver(ctx) : undefined
@@ -170,6 +189,8 @@ export class LogalyzeService {
     this.pools = createSupervisionPools()
     this.settings = new SettingsController(config, store, warn)
     this.refreshWaitMs = config.refreshWaitMs
+    this.subagentProvider = config.subagentProvider
+    this.autoInvoke = config.autoInvoke
     this.repos = new ReposClient(() => ctx.get?.(DSH_REPOS_SERVICE))
     const credentials = (): HostCredentials | undefined => ctx.get?.('credentials') as HostCredentials | undefined
     this.token = new StoredCredential(config.analyzeTokenRef, '分析接口令牌', credentials, warn)
@@ -336,6 +357,15 @@ export class LogalyzeService {
           onError: (error) => { this.ctx.logger?.warn?.('logalyze: 熔断通知失败：%s', messageOf(error)) },
         })
         this.issueMemory = new IssueMemory(domain.issues)
+        this.issueSyncer = new IssueBitableSyncer({
+          issues: domain.issues,
+          getSettings: () => this.settings.get().issueSync,
+          getBitable: () => lookupBitable(this.ctx.get?.(FEISHU_BITABLE_SERVICE)),
+          now: this.clock,
+          logger: this.ctx.logger,
+          autoSyncTimer: this.autoIssueSyncTimer,
+          ...(this.issueSyncDebounceMs === undefined ? {} : { aiMutateDebounceMs: this.issueSyncDebounceMs }),
+        })
         this.mrSupervisor = new MrSupervisor({
           table: domain.supervisedMrs,
           breakers: this.breakers,
@@ -346,6 +376,32 @@ export class LogalyzeService {
           sessionDriver: this.mrSessionDriver,
           getSettings: () => this.settings.get().mrReview,
           getMrRepos: () => this.registry.mrStatus(),
+          notifyHuman: async (input) => {
+            const chatId = this.settings.get().mrReview.feishuChatId
+            const topics = this.topicsService()
+            if (chatId === undefined || topics === undefined) return
+            const bucket = Math.floor(this.clock() / (60 * 60_000))
+            const digest = createHash('sha256')
+              .update(`${input.repo}#${input.mrNumber ?? 0}:${bucket}:${input.text}`)
+              .digest('hex')
+              .slice(0, 24)
+            const key = `mr-alert:${digest}`
+            const targetLabel = input.mrNumber === undefined ? input.repo : `${input.repo} #${input.mrNumber}`
+            await topics.launch({
+              key,
+              fingerprint: key,
+              chatId,
+              requester: { kind: 'external', label: '审微告警' },
+              card: {
+                title: `审微告警：${targetLabel}`,
+                taskName: '告警',
+                lead: [{ text: input.text }],
+              },
+              prompt: `${input.text}\n\n请向值班研发同步该 MR 监管状态，等待人工处理后再恢复；不要自动修改或强推代码。`,
+            }).catch((error: unknown) => {
+              this.ctx.logger?.warn?.('logalyze: 审微飞书告警发送失败：%s', messageOf(error))
+            })
+          },
           now: this.clock,
           logger: this.ctx.logger,
           autoPollTimer: this.autoMrPollTimer,
@@ -391,6 +447,7 @@ export class LogalyzeService {
         this.ctx.logger?.error?.('logalyze: 读取旧版回传记录失败：%s', messageOf(error))
       })
       await this.catalog.load()
+      this.issueSyncer?.boot()
       await this.mrSupervisor?.boot()
       await this.logSupervisor?.boot()
     } finally {
@@ -418,6 +475,7 @@ export class LogalyzeService {
     this.reports.shutdown()
     this.booted.resolve()
     await Promise.allSettled([
+      this.issueSyncer?.drainAndClose(),
       this.logSupervisor?.drainAndClose(),
       this.mrSupervisor?.drainAndClose(),
       this.pools.drainAndClose({ cancelQueued: true, abortActive: true }),
@@ -441,6 +499,13 @@ export class LogalyzeService {
     await this.booted.promise
     if (!this.active) return
     await this.logSupervisor?.onActionsAvailable()
+  }
+
+  /** Re-subscribe and schedule pending Bitable sync whenever `feishuBitable` appears or reloads. */
+  async bitableAvailable(): Promise<void> {
+    await this.booted.promise
+    if (!this.active) return
+    this.issueSyncer?.notifyServiceChanged()
   }
 
   /** Accept one validated analyze request with idempotency protection. */
@@ -559,6 +624,14 @@ export class LogalyzeService {
       },
       ...(this.mrSupervisor === undefined ? {} : { mrSupervision: this.mrSupervisor.panelState() }),
       ...(this.logSupervisor === undefined ? {} : { logSupervision: this.logSupervisor.panelState() }),
+      ...(this.issueSyncer === undefined ? {} : { issues: this.issueSyncer.panelState() }),
+      runtime: {
+        analyzeTokenRef: this.token.ref,
+        platformSecretRef: this.secret.ref,
+        subagentProvider: this.subagentProvider,
+        refreshWaitMs: this.refreshWaitMs,
+        autoInvoke: this.autoInvoke,
+      },
     }
   }
 
@@ -601,6 +674,7 @@ export class LogalyzeService {
     await this.settings.save(raw)
     this.mrSupervisor?.notifyConfigOrReposChanged()
     this.logSupervisor?.notifyConfigOrReposChanged()
+    this.issueSyncer?.notifyConfigChanged()
     return await this.state()
   }
 
@@ -609,6 +683,7 @@ export class LogalyzeService {
     await this.settings.reset()
     this.mrSupervisor?.notifyConfigOrReposChanged()
     this.logSupervisor?.notifyConfigOrReposChanged()
+    this.issueSyncer?.notifyConfigChanged()
     return await this.state()
   }
 
@@ -649,6 +724,32 @@ export class LogalyzeService {
       throw new SettingsError(messageOf(error))
     }
     return await this.state()
+  }
+
+  /** Manually run one two-way synchronization pass between IssueMemory and Feishu Bitable. */
+  async syncIssuesNow(): Promise<StateWire> {
+    await this.prepared()
+    if (this.issueSyncer === undefined) throw new SettingsError('已知问题库同步运行时尚未就绪')
+    const outcome = await this.issueSyncer.syncNow()
+    if (!outcome.ok) {
+      throw new SettingsError(outcome.error ?? '飞书多维表格同步失败')
+    }
+    return await this.state()
+  }
+
+  /** Inspect a Feishu Bitable table schema and store the field-mapping diagnostic report. */
+  async checkIssuesBitable(raw: unknown): Promise<StateWire> {
+    await this.prepared()
+    if (this.issueSyncer === undefined) throw new SettingsError('已知问题库同步运行时尚未就绪')
+    const parsed = bitableCheckSchema.safeParse(raw ?? {})
+    if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
+    await this.issueSyncer.checkFieldMapping(parsed.data)
+    return await this.state()
+  }
+
+  /** Access the active Bitable issue syncer (for tests). */
+  issueSyncerInstance(): IssueBitableSyncer | undefined {
+    return this.issueSyncer
   }
 
   /** Access the active MR supervision coordinator (for tests and internal integrations). */

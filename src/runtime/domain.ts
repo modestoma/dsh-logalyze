@@ -213,6 +213,7 @@ export const issueSchema = z.object({
   latestReportUrl: z.string().min(1).optional(),
   fixMrUrl: z.string().min(1).optional(),
   bitableRecordId: z.string().min(1).optional(),
+  bitableTableKey: z.string().min(1).optional(),
   syncDirty: z.boolean(),
 }).strict()
 
@@ -252,17 +253,46 @@ export interface AiIssueUpsertInput extends ForbiddenHumanIssueFields {
 /**
  * Input accepted by {@link IssuesTable.syncHumanFields} (used by Bitable pull / manual review).
  * Pass `null` to clear a human column, `undefined` to keep its existing value.
+/**
+ * Stable canonical fingerprint over AI-managed issue fields (used to detect
+ * concurrent {@link IssuesTable.upsertByAi} / {@link IssuesTable.attachUrlsByAi}
+ * mutations while a Bitable push is in flight so `syncDirty` is not cleared prematurely).
+ */
+export function computeIssueAiFingerprint(record: IssueRecord): string {
+  return JSON.stringify([
+    record.appId,
+    record.title,
+    record.matchCriteria,
+    record.exclusionCriteria ?? null,
+    record.aiDiagnosis,
+    record.aiStatus,
+    record.resolutionAdvice,
+    record.firstSeenAt,
+    record.lastSeenAt,
+    record.sampleReportUrl ?? null,
+    record.latestReportUrl ?? null,
+    record.fixMrUrl ?? null,
+  ])
+}
+
+/**
  */
 export interface HumanIssueSyncPatch {
   readonly humanConclusion?: string | null
   readonly humanStatus?: string | null
   readonly assignee?: string | null
-  readonly bitableRecordId?: string
+  readonly bitableRecordId?: string | null
+  readonly bitableTableKey?: string | null
   /** Explicit dirty state after sync; defaults to keeping the existing `syncDirty` flag. */
   readonly syncDirty?: boolean
+  /**
+   * When clearing `syncDirty: false`, clear only if the stored record's
+   * {@link computeIssueAiFingerprint} still equals this snapshot; otherwise keep `syncDirty`.
+   */
+  readonly expectedAiFingerprint?: string
 }
 
-function resolveHumanField(patchValue: string | null | undefined, existingValue: string | undefined): string | undefined {
+function resolvePatchString(patchValue: string | null | undefined, existingValue: string | undefined): string | undefined {
   if (patchValue === null) return undefined
   if (patchValue === undefined) return existingValue
   const trimmed = patchValue.trim()
@@ -275,6 +305,7 @@ function resolveHumanField(patchValue: string | null | undefined, existingValue:
  */
 export class IssuesTable {
   private readonly locks = new Map<string, Promise<unknown>>()
+  private readonly aiMutateListeners = new Set<(issueId: string) => void>()
   private readonly now: () => number
   private closed = false
 
@@ -283,6 +314,24 @@ export class IssuesTable {
     now: () => number = Date.now,
   ) {
     this.now = now
+  }
+
+  /** Subscribe to successful AI commits (`upsertByAi` / `attachUrlsByAi`). */
+  onAiMutate(listener: (issueId: string) => void): () => void {
+    this.aiMutateListeners.add(listener)
+    return () => {
+      this.aiMutateListeners.delete(listener)
+    }
+  }
+
+  private emitAiMutate(issueId: string): void {
+    for (const listener of [...this.aiMutateListeners]) {
+      try {
+        listener(issueId)
+      } catch {
+        // 监听回调异常不得影响领域表持久化结果
+      }
+    }
   }
 
   private rejectClosed(): Promise<never> {
@@ -399,10 +448,13 @@ export class IssuesTable {
         ...(latestReportUrl === undefined ? {} : { latestReportUrl }),
         ...(fixMrUrl === undefined ? {} : { fixMrUrl }),
         ...(existing?.bitableRecordId === undefined ? {} : { bitableRecordId: existing.bitableRecordId }),
+        ...(existing?.bitableTableKey === undefined ? {} : { bitableTableKey: existing.bitableTableKey }),
         syncDirty: true,
       }
       await this.table.put(issueId, next)
-      return this.table.get(issueId)!
+      const saved = this.table.get(issueId)!
+      this.emitAiMutate(issueId)
+      return saved
     })
   }
 
@@ -423,10 +475,24 @@ export class IssuesTable {
       if (existing === undefined) {
         throw new StorageDomainError('missing-key', `表 "issues" 中不存在主键 "${key}"`)
       }
-      const humanConclusion = resolveHumanField(patch.humanConclusion, existing.humanConclusion)
-      const humanStatus = resolveHumanField(patch.humanStatus, existing.humanStatus)
-      const assignee = resolveHumanField(patch.assignee, existing.assignee)
-      const bitableRecordId = patch.bitableRecordId ?? existing.bitableRecordId
+      const humanConclusion = resolvePatchString(patch.humanConclusion, existing.humanConclusion)
+      const humanStatus = resolvePatchString(patch.humanStatus, existing.humanStatus)
+      const assignee = resolvePatchString(patch.assignee, existing.assignee)
+      const bitableRecordId = resolvePatchString(patch.bitableRecordId, existing.bitableRecordId)
+      const bitableTableKey = resolvePatchString(patch.bitableTableKey, existing.bitableTableKey)
+
+      let syncDirty = existing.syncDirty
+      if (patch.syncDirty !== undefined) {
+        if (
+          patch.syncDirty === false
+          && patch.expectedAiFingerprint !== undefined
+          && computeIssueAiFingerprint(existing) !== patch.expectedAiFingerprint
+        ) {
+          syncDirty = existing.syncDirty
+        } else {
+          syncDirty = patch.syncDirty
+        }
+      }
 
       const next: IssueRecord = {
         appId: existing.appId,
@@ -445,17 +511,19 @@ export class IssuesTable {
         ...(existing.latestReportUrl === undefined ? {} : { latestReportUrl: existing.latestReportUrl }),
         ...(existing.fixMrUrl === undefined ? {} : { fixMrUrl: existing.fixMrUrl }),
         ...(bitableRecordId === undefined ? {} : { bitableRecordId }),
-        syncDirty: patch.syncDirty ?? existing.syncDirty,
+        ...(bitableTableKey === undefined ? {} : { bitableTableKey }),
+        syncDirty,
       }
       await this.table.put(key, next)
       return this.table.get(key)!
     })
   }
 
-  /** Mark an issue synced with Bitable (setting `syncDirty: false` and optional `bitableRecordId`). */
-  markSynced(issueId: string, bitableRecordId?: string): Promise<IssueRecord> {
+  /** Mark an issue synced with Bitable (setting `syncDirty: false` and optional remote bindings). */
+  markSynced(issueId: string, bitableRecordId?: string, bitableTableKey?: string): Promise<IssueRecord> {
     return this.syncHumanFields(issueId, {
       ...(bitableRecordId === undefined ? {} : { bitableRecordId }),
+      ...(bitableTableKey === undefined ? {} : { bitableTableKey }),
       syncDirty: false,
     })
   }
@@ -501,7 +569,9 @@ export class IssuesTable {
         syncDirty: true,
       }
       await this.table.put(key, next)
-      return this.table.get(key)!
+      const saved = this.table.get(key)!
+      this.emitAiMutate(key)
+      return saved
     })
   }
 

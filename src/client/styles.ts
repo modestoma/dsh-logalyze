@@ -83,6 +83,14 @@ const CSS = `
 .lz__saveBar{position:sticky;bottom:0;z-index:2;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 0;border-top:1px solid var(--lz-line);background:var(--lz-bg)}
 .lz__saveMsg{flex:1;min-width:0;color:var(--lz-fg2);font-size:12px}
 .lz__loading{padding:16px 0;color:var(--lz-fg3);font-size:12px}
+.lz__grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
+.lz__card{display:flex;flex-direction:column;gap:4px;padding:12px 14px;border:1px solid var(--lz-line);border-radius:10px;background:var(--dsw-alias-bg-layer-1,transparent)}
+.lz__cardTitle{display:flex;align-items:center;justify-content:space-between;gap:6px;color:var(--lz-fg3);font-size:12px;line-height:18px}
+.lz__cardVal{font-size:20px;font-weight:600;line-height:26px;font-variant-numeric:tabular-nums}
+.lz__cardMeta{color:var(--lz-fg2);font-size:12px;line-height:17px;overflow-wrap:anywhere}
+.lz__filterBar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.lz__filterBar .lz__input{flex:1 1 200px;width:auto}
+.lz__detail{margin-top:6px;padding:8px 10px;border-radius:7px;background:var(--lz-hover);font-size:12px;line-height:18px;display:flex;flex-direction:column;gap:4px}
 `
 
 /**

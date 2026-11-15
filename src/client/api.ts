@@ -4,7 +4,7 @@
  * @module dsh-logalyze/client/api
  */
 
-import { APPLICATION_ROUTE, BREAKER_RESET_ROUTE, LOG_WATERMARK_ROUTE, OUTBOX_RETRY_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
+import { APPLICATION_ROUTE, BREAKER_RESET_ROUTE, ISSUE_CHECK_ROUTE, ISSUE_SYNC_ROUTE, LOG_WATERMARK_ROUTE, OUTBOX_RETRY_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
 import type { ApplicationMetadata, BreakerStatusWire, EditableSettings, MutationError, MutationOk, StateWire } from '../settings/contract.ts'
 
 /**
@@ -113,4 +113,14 @@ export async function updateLogWatermark(payload: { action: 'pause' | 'resume' |
 /** Retry one or all dead-letter platform outbox uploads immediately. */
 export async function retryOutboxDead(key?: string): Promise<StateWire> {
   return (await request<MutationOk>(OUTBOX_RETRY_ROUTE, { method: 'POST', body: JSON.stringify(key === undefined ? {} : { key }) })).state
+}
+
+/** Manually trigger one Known Issues <-> Feishu Bitable two-way sync pass. */
+export async function syncIssues(): Promise<StateWire> {
+  return (await request<MutationOk>(ISSUE_SYNC_ROUTE, { method: 'POST', body: '{}' })).state
+}
+
+/** Inspect a Feishu Bitable table schema and field mappings against Known Issues columns. */
+export async function checkIssuesBitable(payload: { bitableUrl?: string; table?: string }): Promise<StateWire> {
+  return (await request<MutationOk>(ISSUE_CHECK_ROUTE, { method: 'POST', body: JSON.stringify(payload) })).state
 }

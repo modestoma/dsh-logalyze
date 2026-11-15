@@ -22,6 +22,7 @@ export interface MrWakePromptInput {
   readonly status: MrStatus
   readonly signals: readonly MrPendingSignal[]
   readonly maxAutoFixAttempts: number
+  readonly customInstructions?: string
 }
 
 /** Build the incremental wake prompt sent to the persistent MR session. */
@@ -86,6 +87,11 @@ export function buildMrWakePrompt(input: MrWakePromptInput): string {
     if (!isInitial && !hasPush && hasDiscussion) {
       lines.push(`- 若本轮仅回复/解决了讨论且未调用 \`${MR_PUBLISH_REVIEW_TOOL_NAME}\`，结束前务必调用 \`${MR_CHECKPOINT_TOOL_NAME}\` 以标记已读人类评论。`)
     }
+  }
+
+  const customInstructions = input.customInstructions?.trim()
+  if (customInstructions !== undefined && customInstructions !== '') {
+    lines.push('', '### 团队附加评审要求', customInstructions)
   }
 
   return lines.join('\n')
