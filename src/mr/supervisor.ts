@@ -101,6 +101,8 @@ export interface MrSupervisorDeps {
   readonly repos: ReposClient
   readonly mrPool: TaskPool
   readonly workspacesRoot: string
+  /** Optional legacy workspaces root (from `$DSH_HOME/logalyze/mr-workspaces`) eligible for retention cleanup. */
+  readonly legacyWorkspacesRoot?: string
   readonly sessionDriver: MrSessionDriver
   readonly getSettings: () => MrReviewSettings
   readonly getMrRepos: () => readonly MrRepoStatusWire[]
@@ -1549,7 +1551,10 @@ export class MrSupervisor implements MrToolsRuntime {
       if ((rec.state !== 'merged' && rec.state !== 'closed') || rec.closedAt === undefined) continue
       const age = currentNow - rec.closedAt
       if (age >= WORKDIR_RETENTION_MS && rec.workDir !== undefined) {
-        const removed = await removeExpiredMrWorkspace(this.deps.workspacesRoot, rec.workDir).catch(() => false)
+        const roots = this.deps.legacyWorkspacesRoot === undefined
+          ? this.deps.workspacesRoot
+          : [this.deps.workspacesRoot, this.deps.legacyWorkspacesRoot]
+        const removed = await removeExpiredMrWorkspace(roots, rec.workDir).catch(() => false)
         if (removed) {
           await this.withKeyLock(key, async () => {
             const latest = this.deps.table.get(key)

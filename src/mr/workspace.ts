@@ -12,7 +12,7 @@ import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, rm } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import type { DshReposV8, MrInfo } from '../deps/repos-contract.ts'
 import type { MrOrigin } from '../runtime/domain.ts'
@@ -176,9 +176,18 @@ export async function ensureMrWorkspace(params: {
   }
 }
 
-/** Safely remove an expired MR workspace directory only if it resides inside `workspacesRoot`. */
-export async function removeExpiredMrWorkspace(workspacesRoot: string, workDir: string): Promise<boolean> {
-  if (!isInside(workDir, workspacesRoot) || workDir === workspacesRoot) return false
+/** Safely remove an expired MR workspace directory only if it resides inside an allowed workspaces root. */
+export async function removeExpiredMrWorkspace(
+  workspacesRoot: string | readonly string[],
+  workDir: string,
+): Promise<boolean> {
+  const roots = typeof workspacesRoot === 'string' ? [workspacesRoot] : workspacesRoot
+  const resolvedWorkDir = resolve(workDir)
+  const allowed = roots.some((root) => {
+    const resolvedRoot = resolve(root)
+    return isInside(resolvedWorkDir, resolvedRoot) && resolvedWorkDir !== resolvedRoot
+  })
+  if (!allowed) return false
   if (!existsSync(workDir)) return false
   await rm(workDir, { recursive: true, force: true })
   return true

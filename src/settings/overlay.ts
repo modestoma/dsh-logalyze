@@ -8,11 +8,12 @@
 
 import { mkdir, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { describeIssue, overlaySchema, resolveDshHome } from '../config.ts'
+import { describeIssue, overlaySchema } from '../config.ts'
 import type { SettingsOverlay } from '../config.ts'
 import { replaceFile } from '../util/files.ts'
 import { EDITABLE_KEYS } from './contract.ts'
 import type { EditableKey, EditableSettings } from './contract.ts'
+import { defaultSupervisorDataDir } from './legacy-migration.ts'
 
 /**
  * Default overlay path.
@@ -20,7 +21,7 @@ import type { EditableKey, EditableSettings } from './contract.ts'
  * @returns `$DSH_HOME/supervisor/settings.json`.
  */
 export function defaultOverlayPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(resolveDshHome(env), 'supervisor', 'settings.json')
+  return join(defaultSupervisorDataDir(env), 'settings.json')
 }
 
 /** Result of reading the overlay file. */

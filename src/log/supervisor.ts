@@ -111,6 +111,8 @@ export interface LogSupervisorDeps {
   readonly registry: RepoRegistry
   readonly repos: ReposClient
   readonly workspacesRoot: string
+  /** Optional legacy workspaces root (from `$DSH_HOME/logalyze/log-workspaces`) eligible for retention cleanup. */
+  readonly legacyWorkspacesRoot?: string
   readonly sessionDriver: LogSessionDriver
   readonly getSettings: () => LogSupervisionSettings
   readonly getPlatformSettings: () => PlatformSettings
@@ -2475,7 +2477,9 @@ export class LogSupervisor {
     }
     if (task.workDir !== undefined && task.workDir.trim() !== '') {
       const resolvedWorkDir = resolve(task.workDir)
-      const inRoot = isInside(resolvedWorkDir, root) && resolvedWorkDir !== root
+      const legacyRoot = this.deps.legacyWorkspacesRoot === undefined ? undefined : resolve(this.deps.legacyWorkspacesRoot)
+      const inRoot = (isInside(resolvedWorkDir, root) && resolvedWorkDir !== root)
+        || (legacyRoot !== undefined && isInside(resolvedWorkDir, legacyRoot) && resolvedWorkDir !== legacyRoot)
       const isIsolatedFeishuTaskDir = task.source === 'feishu'
         && basename(resolvedWorkDir) === taskId
         && basename(dirname(resolvedWorkDir)) === 'tasks'

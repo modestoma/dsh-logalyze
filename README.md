@@ -166,6 +166,8 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
 
 配置在加载时校验，不合法时插件加载失败。应用仓库不在这里配置：以前的 `repos` 键会让插件加载失败，错误说明改到 dsh-repo 的「代码仓库 → 仓库」中添加这些仓库并打开「日志分析」；面板设置文件 `settings.json` 里留有 `repos` 时整个文件不生效，面板显示同样的原因，保存一次即覆盖。旧的仓库列表不会自动迁移。
 
+> **从 `dsh-logalyze` 升级**：首次启动时会自动将 `$DSH_HOME/logalyze` 下既有的 `settings.json`、`applications.json`、`analyses/`、`reports/` 以及无宿主 `storageDomain` 时的 `supervisor/dsh_supervisor.json`（迁往 `domain/dsh_supervisor.json`）幂等迁移到 `$DSH_HOME/supervisor`，并兼容迁移默认的 `LOGALYZE_ANALYZE_TOKEN` / `LOGALYZE_PLATFORM_CLIENT_SECRET` 凭据，且不会覆盖 `$DSH_HOME/supervisor` 中已存在的新文件。
+
 ### 应用仓库
 
 智能监管自己不运行 git，也不依赖其他插件的 npm 包。仓库清单、只读快照、会话内共享克隆与推送合并请求都调用运行时的 `dshRepos` 服务（由 [dsh-repo](https://github.com/modestoma/dsh-repo) 提供），契约声明见 `src/deps/repos-contract.ts`。没有该服务或服务版本不符时相关仓库不可用，原因显示在设置面板：

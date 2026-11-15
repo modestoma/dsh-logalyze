@@ -25,6 +25,8 @@ import { HttpError, mediaTypeOf, readBody, sendJson } from '../util/http.ts'
 
 /** The plugin side of the route: switch and token, read per request. */
 export interface AnalyzeGate {
+  /** Ensure startup migration and settings overlay loading have completed before reading gate state. */
+  prepare?(): Promise<void>
   /** @returns whether the API is switched on; false answers every request with 404. */
   enabled(): boolean
   /** Credential reference holding the bearer token, named in the 503 answer while it is unset. */
@@ -88,6 +90,7 @@ export async function handleAnalyzeHttp(
     refuse(res, 404, '未知路径')
     return
   }
+  await gate.prepare?.()
   if (!gate.enabled()) {
     refuse(res, 404, '日志分析接口未开启，请在观象设置面板「分析接口」打开开关')
     return

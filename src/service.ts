@@ -10,7 +10,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { z } from 'zod'
 import { resolveBatch } from './analyze/batch.ts'
 import { analyzeRequestHash } from './analyze/contract.ts'
@@ -58,6 +58,7 @@ import { ApplicationSettings } from './settings/applications.ts'
 import { ANALYZE_ROUTE } from './settings/contract.ts'
 import type { StateWire } from './settings/contract.ts'
 import { SettingsController, SettingsError } from './settings/controller.ts'
+import { defaultLegacyDataDir, defaultSupervisorDataDir, migrateLegacyData } from './settings/legacy-migration.ts'
 import type { OverlayStore } from './settings/overlay.ts'
 import type { BundledSkill } from './skill/bundled.ts'
 import { createEntrySkillProvider } from './skill/entry.ts'
@@ -84,6 +85,8 @@ export interface ServiceOptions {
   readonly analysesDir?: string
   /** Directory of the former report records; defaults to `$DSH_HOME/supervisor/reports`. */
   readonly legacyReportsDir?: string
+  /** Optional legacy `$DSH_HOME/logalyze` directory to migrate from; `null` disables automatic migration. */
+  readonly legacyDataDir?: string | null
   /** Local fallback directory for `dsh_supervisor` when host `storageDomain` is absent. */
   readonly supervisorDir?: string
   /** Local directory where per-MR review workspaces are created. */
@@ -149,6 +152,15 @@ export class SupervisorService {
   private mrSupervisor: MrSupervisor | undefined
   private logSupervisor: LogSupervisor | undefined
   private supervisorPromise: Promise<SupervisorDomain> | undefined
+  private migrationPromise: Promise<void> | undefined
+  private settingsLoadPromise: Promise<void> | undefined
+  private readonly legacyDataDir: string | undefined
+  private readonly nestedLegacySupervisorDir: string | undefined
+  private readonly overlayPath: string
+  private readonly applicationsPath: string
+  private readonly analysesDir: string
+  private readonly legacyReportsDir: string
+  private readonly warnFn: (message: string) => void
   private active = true
   private readonly refreshWaitMs: number
   private readonly subagentProvider: string
@@ -170,12 +182,23 @@ export class SupervisorService {
     options: ServiceOptions = {},
   ) {
     const warn = (message: string): void => { ctx.logger?.warn?.(message) }
+    this.warnFn = warn
     const settings = (): ReturnType<SettingsController['get']> => this.settings.get()
     const workingDirectory = (): WorkingDirectoryService | undefined => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined
     const fetchSeam = options.fetch === undefined ? {} : { fetch: options.fetch }
-    this.supervisorDir = options.supervisorDir ?? join(dirname(store.path), 'domain')
-    this.mrWorkspacesDir = options.mrWorkspacesDir ?? join(dirname(store.path), 'mr-workspaces')
-    this.logWorkspacesDir = options.logWorkspacesDir ?? join(dirname(store.path), 'log-workspaces')
+    const dataDir = dirname(store.path)
+    const isDefaultDataDir = resolve(dataDir) === resolve(defaultSupervisorDataDir())
+    this.overlayPath = store.path
+    this.applicationsPath = join(dataDir, 'applications.json')
+    this.legacyDataDir = options.legacyDataDir !== undefined
+      ? (options.legacyDataDir ?? undefined)
+      : (isDefaultDataDir ? defaultLegacyDataDir() : undefined)
+    this.nestedLegacySupervisorDir = options.supervisorDir === undefined ? join(dataDir, 'supervisor') : undefined
+    this.supervisorDir = options.supervisorDir ?? join(dataDir, 'domain')
+    this.mrWorkspacesDir = options.mrWorkspacesDir ?? join(dataDir, 'mr-workspaces')
+    this.logWorkspacesDir = options.logWorkspacesDir ?? join(dataDir, 'log-workspaces')
+    this.analysesDir = options.analysesDir ?? (isDefaultDataDir ? defaultAnalysesDir() : join(dataDir, 'analyses'))
+    this.legacyReportsDir = options.legacyReportsDir ?? (isDefaultDataDir ? legacyReportsDir() : join(dataDir, 'reports'))
     this.clock = options.now ?? Date.now
     this.autoMrPollTimer = options.autoMrPollTimer ?? true
     this.autoLogPollTimer = options.autoLogPollTimer ?? true
@@ -193,13 +216,19 @@ export class SupervisorService {
     this.autoInvoke = config.autoInvoke
     this.repos = new ReposClient(() => ctx.get?.(DSH_REPOS_SERVICE))
     const credentials = (): HostCredentials | undefined => ctx.get?.('credentials') as HostCredentials | undefined
-    this.token = new StoredCredential(config.analyzeTokenRef, '分析接口令牌', credentials, warn)
-    this.secret = new StoredCredential(config.platformSecretRef, '日志平台 client_secret', credentials, warn)
+    const legacyTokenRef = config.analyzeTokenRef === 'SUPERVISOR_ANALYZE_TOKEN' && config.platformSecretRef !== 'LOGALYZE_ANALYZE_TOKEN'
+      ? 'LOGALYZE_ANALYZE_TOKEN'
+      : undefined
+    const legacySecretRef = config.platformSecretRef === 'SUPERVISOR_PLATFORM_CLIENT_SECRET' && config.analyzeTokenRef !== 'LOGALYZE_PLATFORM_CLIENT_SECRET'
+      ? 'LOGALYZE_PLATFORM_CLIENT_SECRET'
+      : undefined
+    this.token = new StoredCredential(config.analyzeTokenRef, '分析接口令牌', credentials, warn, legacyTokenRef)
+    this.secret = new StoredCredential(config.platformSecretRef, '日志平台 client_secret', credentials, warn, legacySecretRef)
     this.platform = new PlatformClient({ settings: () => this.settings.get().analyze.platform, secret: () => this.secret.value(), now: this.clock, ...fetchSeam })
-    this.legacy = new LegacyReports(options.legacyReportsDir ?? legacyReportsDir(), warn)
+    this.legacy = new LegacyReports(this.legacyReportsDir, warn)
     this.registry = new RepoRegistry({
       repos: this.repos,
-      applications: new ApplicationSettings(join(dirname(store.path), 'applications.json')),
+      applications: new ApplicationSettings(this.applicationsPath),
       skills: ctx.skills,
       onChange: () => { this.onRegistryChange() },
       onMrReposChange: () => { this.mrSupervisor?.notifyConfigOrReposChanged() },
@@ -215,7 +244,7 @@ export class SupervisorService {
     this.viewer = new SkillViewer({ registry: this.registry, repos: this.repos })
     this.dispatcher = new Dispatcher({ ...children, gaps: this.improver, platformLogs: sessionId => this.platformLogsOf(sessionId), platform: this.platformDownloader(options.fetch) })
     this.reports = new ReportTracker({
-      store: new AnalysisStore(options.analysesDir ?? defaultAnalysesDir(), warn),
+      store: new AnalysisStore(this.analysesDir, warn),
       topics: () => this.topicsService(),
       platform: this.platform,
       upload: () => this.settings.get().analyze.upload,
@@ -236,15 +265,32 @@ export class SupervisorService {
     })
   }
 
+  private ensureMigrated(): Promise<void> {
+    this.migrationPromise ??= migrateLegacyData({
+      legacyDataDir: this.legacyDataDir,
+      overlayPath: this.overlayPath,
+      applicationsPath: this.applicationsPath,
+      supervisorDir: this.supervisorDir,
+      nestedLegacySupervisorDir: this.nestedLegacySupervisorDir,
+      analysesDir: this.analysesDir,
+      legacyReportsDir: this.legacyReportsDir,
+      warn: this.warnFn,
+    })
+    return this.migrationPromise
+  }
+
+  private ensureSettingsLoaded(): Promise<void> {
+    this.settingsLoadPromise ??= this.ensureMigrated().then(() => this.settings.load())
+    return this.settingsLoadPromise
+  }
+
   /** Open or return the initialized `dsh_supervisor` storage domain. */
   supervisorDomain(): Promise<SupervisorDomain> {
-    if (this.supervisorPromise === undefined) {
-      this.supervisorPromise = openSupervisorDomain({
-        ctx: this.ctx,
-        fallbackDir: this.supervisorDir,
-        now: this.clock,
-      })
-    }
+    this.supervisorPromise ??= this.ensureMigrated().then(() => openSupervisorDomain({
+      ctx: this.ctx,
+      fallbackDir: this.supervisorDir,
+      now: this.clock,
+    }))
     return this.supervisorPromise
   }
 
@@ -336,11 +382,11 @@ export class SupervisorService {
    */
   async boot(): Promise<void> {
     try {
+      await this.ensureSettingsLoaded()
       const domain = await this.supervisorDomain().catch((error: unknown) => {
         this.ctx.logger?.error?.('supervisor: 打开监管存储域失败：%s', messageOf(error))
         return undefined
       })
-      await this.settings.load()
       if (domain !== undefined) {
         this.breakers = new CircuitBreakerRegistry({
           table: domain.circuitBreakers,
@@ -373,6 +419,7 @@ export class SupervisorService {
           repos: this.repos,
           mrPool: this.pools.mrPool,
           workspacesRoot: this.mrWorkspacesDir,
+          ...(this.legacyDataDir === undefined ? {} : { legacyWorkspacesRoot: join(this.legacyDataDir, 'mr-workspaces') }),
           sessionDriver: this.mrSessionDriver,
           getSettings: () => this.settings.get().mrReview,
           getMrRepos: () => this.registry.mrStatus(),
@@ -420,6 +467,7 @@ export class SupervisorService {
           registry: this.registry,
           repos: this.repos,
           workspacesRoot: this.logWorkspacesDir,
+          ...(this.legacyDataDir === undefined ? {} : { legacyWorkspacesRoot: join(this.legacyDataDir, 'log-workspaces') }),
           sessionDriver: this.logSessionDriver,
           getSettings: () => this.settings.get().logSupervision,
           getPlatformSettings: () => this.settings.get().analyze.platform,
@@ -443,7 +491,7 @@ export class SupervisorService {
       await this.reports.boot().catch((error: unknown) => {
         this.ctx.logger?.error?.('supervisor: 读取分析记录失败：%s', messageOf(error))
       })
-      await this.legacy.load(Date.now()).catch((error: unknown) => {
+      await this.legacy.load(this.clock()).catch((error: unknown) => {
         this.ctx.logger?.error?.('supervisor: 读取旧版回传记录失败：%s', messageOf(error))
       })
       await this.catalog.load()
@@ -588,6 +636,7 @@ export class SupervisorService {
 
   /** Upload one analysis's reports again now. */
   async retryReport(raw: unknown): Promise<StateWire> {
+    await this.prepared()
     const parsed = reportRetrySchema.safeParse(raw)
     if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
     if (!this.reports.retry(parsed.data.id)) throw new SettingsError(`没有这次分析：${parsed.data.id}`)
@@ -602,6 +651,7 @@ export class SupervisorService {
 
   /** @returns the panel state. */
   async state(): Promise<StateWire> {
+    await this.ensureSettingsLoaded()
     const [token, secret] = await Promise.all([this.token.status(), this.secret.status()])
     const problem = platformProblem(this.settings.get().analyze.platform)
     return {
@@ -638,6 +688,7 @@ export class SupervisorService {
   /** @returns the analyze route's switch, limits, and bearer token, read per request. */
   analyzeGate(): AnalyzeGate {
     return {
+      prepare: () => this.ensureSettingsLoaded(),
       enabled: () => this.settings.get().analyze.enabled,
       tokenEnv: () => this.token.ref,
       defaultChatId: () => this.settings.get().analyze.defaultChatId,
@@ -671,6 +722,7 @@ export class SupervisorService {
 
   /** Validate and persist a complete settings payload from the panel. */
   async save(raw: unknown): Promise<StateWire> {
+    await this.ensureSettingsLoaded()
     await this.settings.save(raw)
     this.mrSupervisor?.notifyConfigOrReposChanged()
     this.logSupervisor?.notifyConfigOrReposChanged()
@@ -680,6 +732,7 @@ export class SupervisorService {
 
   /** Remove every panel override. */
   async reset(): Promise<StateWire> {
+    await this.ensureSettingsLoaded()
     await this.settings.reset()
     this.mrSupervisor?.notifyConfigOrReposChanged()
     this.logSupervisor?.notifyConfigOrReposChanged()
