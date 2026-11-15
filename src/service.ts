@@ -356,6 +356,7 @@ export class LogalyzeService {
           logTasks: domain.logTasks,
           outbox: domain.outboxPlatform,
           issues: domain.issues,
+          supervisedMrs: domain.supervisedMrs,
           issueMemory: this.issueMemory,
           breakers: this.breakers,
           logPool: this.pools.logPool,

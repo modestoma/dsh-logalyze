@@ -28,7 +28,7 @@ import {
 } from '../src/deps/topics-contract.ts'
 import type { HostContext, ToolActivationContext, ToolDefinition } from '../src/host.ts'
 import { IssueMemory } from '../src/issues/memory.ts'
-import { LogSupervisor, unpackLogSlot } from '../src/log/index.ts'
+import { LOG_TASK_RETENTION_MS, LogSupervisor, unpackLogSlot } from '../src/log/index.ts'
 import type { LogSessionDriver, LogSessionTurnRequest } from '../src/log/session-driver.ts'
 import { MrSupervisor } from '../src/mr/index.ts'
 import type { MrSessionDriver } from '../src/mr/index.ts'
@@ -42,7 +42,7 @@ import { OverlayStore } from '../src/settings/overlay.ts'
 import { loadBundledSkills } from '../src/skill/bundled.ts'
 import { FakePlatform } from './fake-platform.ts'
 import { FakeRepos } from './fake-repos.ts'
-import { createAppRepo, tempDir } from './helpers.ts'
+import { createAppRepo, git, tempDir } from './helpers.ts'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => {
@@ -266,6 +266,7 @@ class FakeFeishuActions implements FeishuActionsService {
 }
 
 class FakeReposWithMr extends FakeRepos {
+  readonly removedWorkspaces: string[] = []
   readonly v8Mrs = new Map<string, Map<number, {
     info: MrInfo
     comments: CommentInfo[]
@@ -318,6 +319,10 @@ class FakeReposWithMr extends FakeRepos {
   asV8(): DshReposV8 {
     return Object.assign(this, {
       version: 8 as const,
+      workspaceRemove: async (params: { readonly path: string; readonly force?: boolean }) => {
+        this.removedWorkspaces.push(params.path)
+        return { path: params.path, discardedCommits: 0, discardedChanges: false }
+      },
       currentBotUser: async () => this.botUser,
       mrList: async (params: MrListParams) => {
         const list = [...(this.v8Mrs.get(params.repo)?.values() ?? [])].map(m => m.info)
@@ -2379,5 +2384,284 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
       { key: rev2Key, reason: '已更新至修订 rev 3' },
     ])
     expect(domain.logTasks.get(prep.taskId)?.revisions[1]?.actionCardSuperseded).toBe(true)
+  }, 20_000)
+
+  it('matches platform component_code against normalized application names for manifest-less repositories and skips ambiguous matches', async () => {
+    const { dir, cleanup } = await tempDir()
+    cleanups.push(cleanup)
+
+    const billingOrigin = join(dir, 'billing-worker')
+    await mkdir(join(billingOrigin, 'src'), { recursive: true })
+    await writeFile(join(billingOrigin, 'src', 'worker.ts'), 'export function runBilling() { return null }\n')
+    git(billingOrigin, 'init', '-q', '-b', 'main')
+    git(billingOrigin, 'add', '-A')
+    git(billingOrigin, 'commit', '-qm', 'init')
+
+    const h = await createFullHarness({
+      origin: billingOrigin,
+      skipSaveApplication: true,
+      batchSizeThreshold: 1,
+      onLogTurn: async (req, tools) => {
+        const prepare = tools.find(t => t.name === 'supervisor_log_prepare')!
+        const submit = tools.find(t => t.name === 'supervisor_log_submit')!
+        const prepared = await prepare.execute({ taskId: req.taskId }, h.toolExecCtx(req.existingSessionId!, req.workDir)) as {
+          readonly appId: string
+          readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+        }
+        await submit.execute({
+          taskId: req.taskId,
+          summary: 'billing-worker 组件匹配成功',
+          items: prepared.slots.map(s => ({
+            ref: s.ref,
+            status: 'diagnosed',
+            rootCauseCategory: 'code_defect',
+            conclusion: 'worker 空指针问题',
+            evidences: [
+              { source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'BillingError' },
+              { source: `repos/${prepared.appId}/src/worker.ts`, locator: 'L1', excerpt: 'return null' },
+            ],
+          })),
+        }, h.toolExecCtx(req.existingSessionId!, req.workDir))
+      },
+    })
+
+    const migratedApps = h.service.registry.readyApps()
+    expect(migratedApps).toHaveLength(1)
+    const billingApp = migratedApps[0]!
+    expect(billingApp.app.id).toMatch(/^app-/u)
+    expect(billingApp.app.name).toBe('billing-worker')
+    expect(billingApp.app.aliases).toEqual([])
+
+    const sup = h.service.logSupervisorInstance()!
+    await h.service.controlLogWatermark({ action: 'rewind', cursorTime: '2026-11-12T09:50:00.000Z' })
+    h.fakePlatform.addLog({
+      log_id: 'billing-log-1',
+      product_code: 'P1',
+      component_code: 'Ｂｉｌｌｉｎｇ-Ｗｏｒｋｅｒ',
+      error_code: 'E_BILL',
+      file_name: 'billing.log',
+      storage_type: 'fds',
+      status: 'completed',
+      archived_at: '2026-11-12T09:55:00.000Z',
+    }, 'BillingError: null pointer\n')
+
+    await sup.pollNow()
+    await waitFor(() => h.logTurns.length >= 1)
+    const domain = await h.service.supervisorDomain()
+    await waitFor(() => domain.logTasks.values().some(t => t.status === 'completed'))
+
+    expect(domain.logTasks.values()).toHaveLength(1)
+    expect(domain.logTasks.values()[0]?.appId).toBe(billingApp.app.id)
+
+    // Register a second manifest-less repository sharing the same basename so normalized names collide.
+    const duplicateBillingOrigin = join(dir, 'nested', 'billing-worker')
+    await mkdir(join(duplicateBillingOrigin, 'src'), { recursive: true })
+    await writeFile(join(duplicateBillingOrigin, 'src', 'worker.ts'), 'export const dup = true\n')
+    git(duplicateBillingOrigin, 'init', '-q', '-b', 'main')
+    git(duplicateBillingOrigin, 'add', '-A')
+    git(duplicateBillingOrigin, 'commit', '-qm', 'init dup')
+
+    const unwatch = h.service.watchRepos(h.fakeRepos.asV8())
+    cleanups.push(async () => { unwatch() })
+    h.fakeRepos.setCatalog(
+      [
+        { url: billingOrigin, base: 'main' },
+        { url: duplicateBillingOrigin, base: 'main' },
+      ],
+      ['log-analysis', 'mr-review'],
+    )
+    await waitFor(() => h.service.registry.readyApps().length === 2)
+    expect(h.service.registry.status().every(s => s.error?.includes('触发名称冲突') === true)).toBe(true)
+
+    h.advanceNow(10_000)
+    h.fakePlatform.addLog({
+      log_id: 'billing-log-ambiguous',
+      product_code: 'P1',
+      component_code: 'billing-worker',
+      error_code: 'E_BILL',
+      file_name: 'billing-2.log',
+      storage_type: 'fds',
+      status: 'completed',
+      archived_at: '2026-11-12T10:00:05.000Z',
+    }, 'BillingError ambiguous\n')
+
+    await sup.pollNow()
+    await flushMicrotasks()
+
+    expect(h.logTurns).toHaveLength(1)
+    expect(domain.logTasks.values()).toHaveLength(1)
+    expect(domain.pendingBatches.entries()).toHaveLength(0)
+  }, 20_000)
+
+  it('prunes expired terminal log tasks and managed workspaces after 90 days while preserving issue-referenced reports and shared session directories', async () => {
+    const DAY_MS = 24 * 60 * 60 * 1000
+    let activeHarness!: Awaited<ReturnType<typeof createFullHarness>>
+    const h = await createFullHarness({
+      batchSizeThreshold: 1,
+      onLogTurn: async (req, tools) => {
+        const prepare = tools.find(t => t.name === 'supervisor_log_prepare')!
+        const submit = tools.find(t => t.name === 'supervisor_log_submit')!
+        const prepared = await prepare.execute({ taskId: req.taskId }, activeHarness.toolExecCtx(req.existingSessionId!, req.workDir)) as {
+          readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+        }
+        await submit.execute({
+          taskId: req.taskId,
+          summary: `平台批次 ${req.taskId} 诊断完成`,
+          items: prepared.slots.map(s => ({
+            ref: s.ref,
+            status: 'diagnosed',
+            rootCauseCategory: 'code_defect',
+            conclusion: 'HandleOrder 未判空导致 NPE',
+            evidences: [
+              { source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'NullPointerException' },
+              { source: 'repos/order-service/src/handler.ts', locator: 'L1', excerpt: 'return null' },
+            ],
+            issueLink: {
+              mode: 'new',
+              title: s.files[0] === 'ret-log-recent.log' ? '订单服务近期偶发超时' : '订单服务 NPE 空指针异常',
+              matchCriteria: 'NullPointerException handleOrder',
+              resolutionAdvice: '对入参增加空检查',
+            },
+          })),
+        }, activeHarness.toolExecCtx(req.existingSessionId!, req.workDir))
+      },
+    })
+    activeHarness = h
+
+    const sup = h.service.logSupervisorInstance()!
+    const domain = await h.service.supervisorDomain()
+    await h.service.controlLogWatermark({ action: 'rewind', cursorTime: '2026-11-12T09:50:00.000Z' })
+
+    const runPlatformBatch = async (logId: string, archivedAt: string): Promise<string> => {
+      const beforeIds = new Set(domain.logTasks.keys())
+      h.fakePlatform.addLog({
+        log_id: logId,
+        product_code: 'P1',
+        component_code: 'order-comp',
+        error_code: 'E_RET',
+        file_name: `${logId}.log`,
+        storage_type: 'fds',
+        status: 'completed',
+        archived_at: archivedAt,
+      }, `NullPointerException ${logId}\n`)
+      await sup.pollNow()
+      await waitFor(() => domain.logTasks.keys().some(id => !beforeIds.has(id)))
+      const taskId = domain.logTasks.keys().find(id => !beforeIds.has(id))!
+      await waitFor(() => {
+        const rec = domain.logTasks.get(taskId)
+        return rec?.status === 'completed'
+          && rec.feishuLaunchKey === `log-task:${taskId}`
+          && domain.outboxPlatform.values().some(o => o.taskId === taskId && o.status === 'done')
+      })
+      h.fakeTopics.emitState({ key: `log-task:${taskId}`, status: 'done', sessionId: `topic-${logId}` })
+      await waitFor(() => domain.logTasks.get(taskId)?.revisions[0]?.actionCardKey !== undefined)
+      return taskId
+    }
+
+    // 1. Dispatch 3 platform tasks referencing the same issue:
+    //    task1 -> sampleReportUrl (kept)
+    //    task2 -> overwritten in latestReportUrl by task3 (eligible for expiry)
+    //    task3 -> latestReportUrl (kept)
+    const task1Id = await runPlatformBatch('ret-log-1', '2026-11-12T09:55:00.000Z')
+    h.advanceNow(10_000)
+    const task2Id = await runPlatformBatch('ret-log-2', '2026-11-12T10:00:05.000Z')
+    h.advanceNow(10_000)
+    const task3Id = await runPlatformBatch('ret-log-3', '2026-11-12T10:00:15.000Z')
+
+    const issue = domain.issues.get('ISS-order-service-0001')
+    expect(issue?.sampleReportUrl).toContain('ret-log-1')
+    expect(issue?.latestReportUrl).toContain('ret-log-3')
+
+    const task1WorkDir = domain.logTasks.get(task1Id)!.workDir!
+    const task2WorkDir = domain.logTasks.get(task2Id)!.workDir!
+    const task3WorkDir = domain.logTasks.get(task3Id)!.workDir!
+    expect((await stat(join(task2WorkDir, 'repos', 'order-service', '.git'))).isDirectory()).toBe(true)
+
+    // 2. Create two completed Feishu manual tasks in a shared session cwd:
+    //    manualTask1 uses sharedFeishuCwd directly (parent cwd MUST never be deleted);
+    //    manualTask2 uses isolated <sharedFeishuCwd>/tasks/<taskId> (isolated dir MUST be deleted).
+    const sharedFeishuCwd = join(h.dir, 'feishu-shared-cwd')
+    const manualLog1 = join(h.dir, 'manual-ret-1.log')
+    const manualLog2 = join(h.dir, 'manual-ret-2.log')
+    await mkdir(sharedFeishuCwd, { recursive: true })
+    await writeFile(manualLog1, 'manual ret 1\n')
+    await writeFile(manualLog2, 'manual ret 2\n')
+    const prepare = h.toolNamed('supervisor_log_prepare')
+    const submit = h.toolNamed('supervisor_log_submit')
+    const manualSess = 'manual-ret-sess'
+
+    const prep1 = await prepare.execute({ app: 'order-service', logs: [{ path: manualLog1 }] }, h.toolExecCtx(manualSess, sharedFeishuCwd, 'c-m1')) as {
+      readonly taskId: string
+      readonly workDir: string
+      readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+    }
+    expect(prep1.workDir).toBe(sharedFeishuCwd)
+    await submit.execute({
+      taskId: prep1.taskId,
+      summary: '手工任务 1',
+      items: prep1.slots.map(s => ({
+        ref: s.ref,
+        status: 'insufficient_evidence',
+        rootCauseCategory: 'unknown',
+        conclusion: '暂无结论 1',
+        evidences: [{ source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'manual ret 1' }],
+      })),
+    }, h.toolExecCtx(manualSess, prep1.workDir, 'c-m1-s'))
+
+    const prep2 = await prepare.execute({ app: 'order-service', logs: [{ path: manualLog2 }] }, h.toolExecCtx(manualSess, sharedFeishuCwd, 'c-m2')) as {
+      readonly taskId: string
+      readonly workDir: string
+      readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+    }
+    expect(prep2.workDir).toBe(join(sharedFeishuCwd, 'tasks', prep2.taskId))
+    await submit.execute({
+      taskId: prep2.taskId,
+      summary: '手工任务 2',
+      items: prep2.slots.map(s => ({
+        ref: s.ref,
+        status: 'diagnosed',
+        rootCauseCategory: 'code_defect',
+        conclusion: '手工复现 HandleOrder NPE',
+        evidences: [
+          { source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'manual ret 2' },
+          { source: 'repos/order-service/src/handler.ts', locator: 'L1', excerpt: 'return null' },
+        ],
+      })),
+    }, h.toolExecCtx(manualSess, prep2.workDir, 'c-m2-s'))
+    sup.onSessionEvent(manualSess, 'turn/end', { reason: { kind: 'completed' } })
+    await waitFor(() => domain.logTasks.get(prep2.taskId)?.revisions[0]?.actionCardKey !== undefined)
+
+    // 3. Advance 80 days and create a recent platform task (< 90d at sweep time).
+    h.advanceNow(80 * DAY_MS)
+    const recentIso = new Date(h.getNow() - 5_000).toISOString()
+    const recentTaskId = await runPlatformBatch('ret-log-recent', recentIso)
+    const recentWorkDir = domain.logTasks.get(recentTaskId)!.workDir!
+
+    // 4. Advance past 90 days from the earlier batch (80 + 11 = 91 days; recentTask is 11 days old).
+    h.advanceNow(11 * DAY_MS)
+    expect(LOG_TASK_RETENTION_MS).toBe(90 * DAY_MS)
+    await sup.pollNow()
+
+    // Expired non-exempt tasks and their managed workspaces (plus outbox 'done' rows & repo checkouts) are pruned.
+    expect(domain.logTasks.get(task2Id)).toBeUndefined()
+    await expect(stat(task2WorkDir)).rejects.toThrow()
+    expect(h.fakeRepos.removedWorkspaces).toContain(join(task2WorkDir, 'repos', 'order-service'))
+    expect(domain.outboxPlatform.values().some(o => o.taskId === task2Id)).toBe(false)
+
+    // Issue-referenced tasks (sampleReportUrl = task1, latestReportUrl = task3) are exempt and retained.
+    expect(domain.logTasks.get(task1Id)).toBeDefined()
+    expect(domain.logTasks.get(task3Id)).toBeDefined()
+    expect((await stat(task1WorkDir)).isDirectory()).toBe(true)
+    expect((await stat(task3WorkDir)).isDirectory()).toBe(true)
+
+    // Manual tasks > 90d are deleted; isolated tasks/<id> is removed while shared session cwd stays intact.
+    expect(domain.logTasks.get(prep1.taskId)).toBeUndefined()
+    expect(domain.logTasks.get(prep2.taskId)).toBeUndefined()
+    await expect(stat(prep2.workDir)).rejects.toThrow()
+    expect((await stat(sharedFeishuCwd)).isDirectory()).toBe(true)
+
+    // Tasks younger than 90 days are preserved.
+    expect(domain.logTasks.get(recentTaskId)).toBeDefined()
+    expect((await stat(recentWorkDir)).isDirectory()).toBe(true)
   }, 20_000)
 })

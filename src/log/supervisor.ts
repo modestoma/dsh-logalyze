@@ -10,7 +10,7 @@
 
 import { randomBytes } from 'node:crypto'
 import { mkdir, readdir, rm, stat } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { z } from 'zod'
 import type { ReadyApp, RepoRegistry } from '../apps/registry.ts'
 import type { FeishuActionsService } from '../deps/actions-contract.ts'
@@ -26,20 +26,24 @@ import { buildManifest } from '../report/manifest.ts'
 import { UNLABELED_ERROR_CODE } from '../report/render.ts'
 import { uploadRevision } from '../report/upload.ts'
 import { admitPlatformUrl, downloadLog, DownloadError } from '../runs/download.ts'
+import { isInside } from '../runs/run-dir.ts'
 import type { CircuitBreakerRegistry } from '../runtime/breaker.ts'
 import { outboxPlatformKey } from '../runtime/domain.ts'
 import type {
+  IssueRecord,
   IssuesTable,
   LogTaskInput,
   LogTaskRecord,
   LogTaskRevision,
   OutboxPlatformRecord,
   PendingBatchRecord,
+  SupervisedMrRecord,
   WatermarkRecord,
 } from '../runtime/domain.ts'
 import { OutboxRunner } from '../runtime/outbox.ts'
 import type { TaskPool } from '../runtime/pool.ts'
 import type { DomainTable } from '../runtime/storage.ts'
+import { applicationKey } from '../settings/applications.ts'
 import type {
   BreakerStatusWire,
   DownloadSettings,
@@ -61,6 +65,11 @@ import type { LogSessionDriver } from './session-driver.ts'
 import type { LogToolsRuntime } from './tools.ts'
 
 export const LOG_WATERMARK_KEY = 'log_platform'
+const DAY_MS = 24 * 60 * 60 * 1000
+/** Terminal `log_tasks` and workspace retention window (90 days, matching `04-storage-and-operations.md`). */
+export const LOG_TASK_RETENTION_MS = 90 * DAY_MS
+const MR_WORKDIR_RETENTION_MS = 14 * DAY_MS
+const RETENTION_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
 const MAX_POLL_PAGES = 1_000
 const MAX_POLL_BACKOFF_MS = 15 * 60 * 1000
 const OUTBOX_POLL_INTERVAL_MS = 2_000
@@ -94,6 +103,7 @@ export interface LogSupervisorDeps {
   readonly logTasks: DomainTable<LogTaskRecord>
   readonly outbox: DomainTable<OutboxPlatformRecord>
   readonly issues: IssuesTable
+  readonly supervisedMrs?: DomainTable<SupervisedMrRecord>
   readonly issueMemory: IssueMemory
   readonly breakers: CircuitBreakerRegistry
   readonly logPool: TaskPool
@@ -116,10 +126,6 @@ export interface LogSupervisorDeps {
   readonly autoPollTimer?: boolean
 }
 
-function normalizeComponentKey(value: string): string {
-  return value.normalize('NFKC').trim().toLowerCase()
-}
-
 function normalizeOptional(value: string | null | undefined): string | undefined {
   if (typeof value !== 'string') return undefined
   const trimmed = value.trim()
@@ -132,7 +138,7 @@ function batchKeyFor(
   errorCode: string | undefined,
 ): string {
   const p = encodeURIComponent(productCode ?? '<none>')
-  const c = encodeURIComponent(normalizeComponentKey(componentCode))
+  const c = encodeURIComponent(applicationKey(componentCode))
   const e = encodeURIComponent(errorCode ?? '<none>')
   return `${p}|${c}|${e}`
 }
@@ -180,6 +186,8 @@ export class LogSupervisor {
 
   private pollTimer: ReturnType<typeof setTimeout> | undefined
   private pollInFlight: Promise<void> | undefined
+  private retentionTimer: ReturnType<typeof setTimeout> | undefined
+  private retentionInFlight: Promise<void> | undefined
   private actionRetryTimer: ReturnType<typeof setTimeout> | undefined
   private actionRetryFailures = 0
   private readonly batchTimers = new Map<string, ScheduledBatchTimer>()
@@ -369,6 +377,9 @@ export class LogSupervisor {
     await this.reconcilePendingTopics()
     await this.reconcilePendingActions()
     await this.reconcilePendingBatches()
+    await this.sweepRetention().catch((error: unknown) => {
+      this.deps.logger?.warn?.('logalyze: 日志任务留存清理失败：%s', messageOf(error))
+    })
 
     if (this.closed) return
     this.booted = true
@@ -382,6 +393,7 @@ export class LogSupervisor {
     if (this.autoPollTimer) {
       this.scheduleNextPoll(this.nextPollDelayMs())
       this.scheduleActionRetry(ACTION_RETRY_BASE_MS)
+      this.scheduleRetentionSweep()
     }
   }
 
@@ -391,24 +403,23 @@ export class LogSupervisor {
     if (this.pollInFlight !== undefined) {
       return await this.pollInFlight
     }
-    let tracked: Promise<void> | undefined
-    tracked = (async (): Promise<void> => {
-      try {
-        while (!this.closed) {
-          const expectedEpoch = this.watermarkEpoch
-          await this.runPollCycle(expectedEpoch)
-          if (this.closed || this.watermarkEpoch === expectedEpoch) break
-          const wm = this.readWatermark()
-          if (wm.paused || !this.deps.getSettings().enabled) break
-        }
-      } finally {
-        if (this.pollInFlight === tracked) {
-          this.pollInFlight = undefined
-        }
+    const run = this.runPollLoop().finally(() => {
+      if (this.pollInFlight === run) {
+        this.pollInFlight = undefined
       }
-    })()
-    this.pollInFlight = tracked
-    return await tracked
+    })
+    this.pollInFlight = run
+    return await run
+  }
+
+  private async runPollLoop(): Promise<void> {
+    while (!this.closed) {
+      const expectedEpoch = this.watermarkEpoch
+      await this.runPollCycle(expectedEpoch)
+      if (this.closed || this.watermarkEpoch === expectedEpoch) break
+      const wm = this.readWatermark()
+      if (wm.paused || !this.deps.getSettings().enabled) break
+    }
   }
 
   /** React to updated plugin settings or catalog repositories. */
@@ -718,6 +729,7 @@ export class LogSupervisor {
     if (this.closed) return
     this.closed = true
     this.clearPollTimer()
+    this.clearRetentionTimer()
     this.clearActionRetryTimer()
     for (const entry of this.batchTimers.values()) {
       clearTimeout(entry.timer)
@@ -729,6 +741,7 @@ export class LogSupervisor {
 
     await Promise.allSettled([
       this.pollInFlight ?? Promise.resolve(),
+      this.retentionInFlight ?? Promise.resolve(),
       this.outboxRunner.drainAndClose({ abortActive: true }),
       Promise.allSettled([...this.backgroundWork]),
     ])
@@ -750,6 +763,33 @@ export class LogSupervisor {
       clearTimeout(this.pollTimer)
       this.pollTimer = undefined
     }
+  }
+
+  private clearRetentionTimer(): void {
+    if (this.retentionTimer !== undefined) {
+      clearTimeout(this.retentionTimer)
+      this.retentionTimer = undefined
+    }
+  }
+
+  private scheduleRetentionSweep(): void {
+    if (this.closed || !this.autoPollTimer || this.retentionTimer !== undefined) return
+    const timer = setTimeout(() => {
+      this.retentionTimer = undefined
+      if (this.closed) return
+      const run = this.sweepRetention()
+        .catch((error: unknown) => {
+          this.deps.logger?.warn?.('logalyze: 定期日志任务留存清理失败：%s', messageOf(error))
+        })
+        .finally(() => {
+          if (!this.closed && this.autoPollTimer) {
+            this.scheduleRetentionSweep()
+          }
+        })
+      this.trackBackground(run)
+    }, RETENTION_SWEEP_INTERVAL_MS)
+    timer.unref?.()
+    this.retentionTimer = timer
   }
 
   private clearActionRetryTimer(): void {
@@ -862,6 +902,10 @@ export class LogSupervisor {
     if (!isEpochCurrent()) return
     await this.reconcilePendingActions().catch((error: unknown) => {
       this.deps.logger?.warn?.('logalyze: 轮询前补发后续动作按钮卡片失败：%s', messageOf(error))
+    })
+    if (!isEpochCurrent()) return
+    await this.sweepRetention().catch((error: unknown) => {
+      this.deps.logger?.warn?.('logalyze: 轮询前清理过期日志任务失败：%s', messageOf(error))
     })
     if (!isEpochCurrent()) return
     const wm = this.readWatermark()
@@ -994,16 +1038,11 @@ export class LogSupervisor {
   // -------------------------------------------------------------------------
 
   private resolveAppByComponent(componentCode: string): ReadyApp | undefined {
-    const key = normalizeComponentKey(componentCode)
+    const key = applicationKey(componentCode)
     if (key === '') return undefined
-    const matches: ReadyApp[] = []
-    for (const app of this.deps.registry.readyApps()) {
-      const idMatch = normalizeComponentKey(app.app.id) === key
-      const aliasMatch = app.app.aliases.some(alias => normalizeComponentKey(alias) === key)
-      if (idMatch || aliasMatch) {
-        matches.push(app)
-      }
-    }
+    const matches = this.deps.registry.readyApps().filter(({ app }) =>
+      [app.id, app.name, ...app.aliases].some(value => applicationKey(value) === key),
+    )
     if (matches.length === 0) {
       this.deps.logger?.warn?.('logalyze: 收到未知 component_code=%s，已跳过自动入队', componentCode)
       return undefined
@@ -2302,6 +2341,312 @@ export class LogSupervisor {
       rows,
     }).catch((error: unknown) => {
       this.deps.logger?.warn?.('logalyze: 更新飞书报告链接表失败（%s）：%s', taskId, messageOf(error))
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // 90-Day Retention Sweep
+  // -------------------------------------------------------------------------
+
+  private sweepRetention(): Promise<void> {
+    if (this.closed) return Promise.resolve()
+    if (this.retentionInFlight !== undefined) {
+      return this.retentionInFlight
+    }
+    const run = this.doSweepRetention().finally(() => {
+      if (this.retentionInFlight === run) {
+        this.retentionInFlight = undefined
+      }
+    })
+    this.retentionInFlight = run
+    return run
+  }
+
+  private async doSweepRetention(): Promise<void> {
+    const initialNow = this.now()
+    const initialExempt = this.collectIssueExemptTaskIds()
+    const candidateIds: string[] = []
+    for (const [taskId, task] of this.deps.logTasks.entries()) {
+      if (this.isTaskRetentionEligible(taskId, task, initialNow, initialExempt)) {
+        candidateIds.push(taskId)
+      }
+    }
+    for (const taskId of candidateIds) {
+      if (this.closed) return
+      await this.pruneExpiredTask(taskId).catch((error: unknown) => {
+        this.deps.logger?.warn?.('logalyze: 清理过期日志任务失败（%s）：%s', taskId, messageOf(error))
+      })
+    }
+  }
+
+  private collectIssueExemptTaskIds(): Set<string> {
+    const referencedUrls = new Set<string>()
+    const issuesWithoutBothUrls: [string, IssueRecord][] = []
+    for (const [issueId, issue] of this.deps.issues.entries()) {
+      if (issue.sampleReportUrl !== undefined) referencedUrls.add(issue.sampleReportUrl)
+      if (issue.latestReportUrl !== undefined) referencedUrls.add(issue.latestReportUrl)
+      if (issue.sampleReportUrl === undefined || issue.latestReportUrl === undefined) {
+        issuesWithoutBothUrls.push([issueId, issue])
+      }
+    }
+
+    const exempt = new Set<string>()
+    if (referencedUrls.size > 0) {
+      for (const [, outbox] of this.deps.outbox.entries()) {
+        if (outbox.detailUrl !== undefined && referencedUrls.has(outbox.detailUrl)) {
+          exempt.add(outbox.taskId)
+        }
+      }
+      const baseUrl = this.deps.getPlatformSettings().baseUrl
+      for (const [taskId, task] of this.deps.logTasks.entries()) {
+        for (const input of task.inputs) {
+          const derivedDetailUrl = input.logId === undefined ? undefined : platformLogDetailUrl(baseUrl, input.logId)
+          if (
+            (input.detailUrl !== undefined && referencedUrls.has(input.detailUrl))
+            || (input.url !== undefined && referencedUrls.has(input.url))
+            || (derivedDetailUrl !== undefined && referencedUrls.has(derivedDetailUrl))
+          ) {
+            exempt.add(taskId)
+            break
+          }
+        }
+      }
+    }
+
+    if (issuesWithoutBothUrls.length > 0) {
+      const tasksByIssue = new Map<string, { taskId: string; createdAt: number; updatedAt: number }[]>()
+      for (const [taskId, task] of this.deps.logTasks.entries()) {
+        const refs = new Set<string>()
+        for (const rev of task.revisions) {
+          if (rev.issueId !== undefined) refs.add(rev.issueId)
+          for (const item of rev.items ?? []) {
+            if (item.issueId !== undefined) refs.add(item.issueId)
+          }
+        }
+        if (refs.size === 0) continue
+        const createdAt = task.createdAt ?? task.updatedAt ?? 0
+        const updatedAt = task.updatedAt ?? task.createdAt ?? 0
+        for (const issueId of refs) {
+          const list = tasksByIssue.get(issueId) ?? []
+          list.push({ taskId, createdAt, updatedAt })
+          tasksByIssue.set(issueId, list)
+        }
+      }
+      for (const [issueId, issue] of issuesWithoutBothUrls) {
+        const linked = tasksByIssue.get(issueId)
+        if (linked === undefined || linked.length === 0) continue
+        if (issue.sampleReportUrl === undefined) {
+          const earliest = linked.reduce((best, cur) => (cur.createdAt < best.createdAt ? cur : best))
+          exempt.add(earliest.taskId)
+        }
+        if (issue.latestReportUrl === undefined) {
+          const latest = linked.reduce((best, cur) => (cur.updatedAt > best.updatedAt ? cur : best))
+          exempt.add(latest.taskId)
+        }
+      }
+    }
+
+    return exempt
+  }
+
+  private lastTaskActivityAt(task: LogTaskRecord): number | undefined {
+    let latest: number | undefined
+    if (task.updatedAt !== undefined) latest = task.updatedAt
+    if (task.createdAt !== undefined) {
+      latest = latest === undefined ? task.createdAt : Math.max(latest, task.createdAt)
+    }
+    for (const rev of task.revisions) {
+      latest = latest === undefined ? rev.createdAt : Math.max(latest, rev.createdAt)
+    }
+    return latest
+  }
+
+  private pathsOverlap(a: string, b: string): boolean {
+    const ra = resolve(a)
+    const rb = resolve(b)
+    return ra === rb || isInside(ra, rb) || isInside(rb, ra)
+  }
+
+  private managedTaskWorkspaceDirs(taskId: string, task: LogTaskRecord): string[] {
+    const root = resolve(this.deps.workspacesRoot)
+    const candidates = new Set<string>()
+    if (task.source === 'platform') {
+      candidates.add(resolve(root, taskId))
+    }
+    if (task.workDir !== undefined && task.workDir.trim() !== '') {
+      const resolvedWorkDir = resolve(task.workDir)
+      const inRoot = isInside(resolvedWorkDir, root) && resolvedWorkDir !== root
+      const isIsolatedFeishuTaskDir = task.source === 'feishu'
+        && basename(resolvedWorkDir) === taskId
+        && basename(dirname(resolvedWorkDir)) === 'tasks'
+      if (inRoot || isIsolatedFeishuTaskDir) {
+        candidates.add(resolvedWorkDir)
+      }
+    }
+    if (candidates.size === 0) return []
+
+    const out: string[] = []
+    for (const dir of candidates) {
+      let overlapsOther = false
+      for (const [otherId, other] of this.deps.logTasks.entries()) {
+        if (otherId === taskId) continue
+        if (other.workDir !== undefined && other.workDir.trim() !== '' && this.pathsOverlap(dir, other.workDir)) {
+          overlapsOther = true
+          break
+        }
+      }
+      if (!overlapsOther) {
+        out.push(dir)
+      }
+    }
+    return out
+  }
+
+  private hasActiveMrWorkspaceOverlap(dirs: readonly string[], currentNow: number): boolean {
+    if (dirs.length === 0 || this.deps.supervisedMrs === undefined) return false
+    for (const [, mr] of this.deps.supervisedMrs.entries()) {
+      if (mr.workDir === undefined || mr.workDir.trim() === '') continue
+      const stillNeedsWorkDir = mr.state === 'open'
+        || mr.state === 'draft_skipped'
+        || mr.closedAt === undefined
+        || currentNow - mr.closedAt < MR_WORKDIR_RETENTION_MS
+      if (!stillNeedsWorkDir) continue
+      if (dirs.some(dir => this.pathsOverlap(dir, mr.workDir!))) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private isTaskRetentionEligible(
+    taskId: string,
+    task: LogTaskRecord,
+    currentNow: number,
+    exemptTaskIds: ReadonlySet<string>,
+  ): boolean {
+    if (task.status !== 'completed' && task.status !== 'failed' && task.status !== 'interrupted') {
+      return false
+    }
+    if (this.activeTaskIds.has(taskId)) return false
+    if (
+      task.feishuLaunchKey !== undefined
+      && this.deps.getTopics()?.state(task.feishuLaunchKey)?.status === 'running'
+    ) {
+      return false
+    }
+    if (task.pendingTopicDelivery === true) return false
+    if (exemptTaskIds.has(taskId)) return false
+
+    const latestRev = task.revisions.at(-1)
+    if (latestRev !== undefined) {
+      if (
+        task.revisions.some(
+          r => r.revision < latestRev.revision && r.actionCardKey !== undefined && !r.actionCardSuperseded,
+        )
+      ) {
+        return false
+      }
+      if (
+        latestRev.actionCardKey === undefined
+        && !latestRev.actionCardSkipped
+        && latestRev.pendingActionSessionId !== undefined
+      ) {
+        return false
+      }
+    }
+
+    for (const [, outbox] of this.deps.outbox.entries()) {
+      if (outbox.taskId === taskId && outbox.status !== 'done') {
+        return false
+      }
+    }
+
+    const lastActiveAt = this.lastTaskActivityAt(task)
+    if (lastActiveAt === undefined || currentNow - lastActiveAt < LOG_TASK_RETENTION_MS) {
+      return false
+    }
+
+    const managedDirs = this.managedTaskWorkspaceDirs(taskId, task)
+    if (this.hasActiveMrWorkspaceOverlap(managedDirs, currentNow)) {
+      return false
+    }
+
+    return true
+  }
+
+  private async removeManagedWorkspaceDir(dir: string): Promise<void> {
+    if (!(await pathExists(dir))) return
+    const reposDir = join(dir, 'repos')
+    const entries = await readdir(reposDir).catch(() => [] as string[])
+    const lookup = this.deps.repos.lookup()
+    const removeRepoWorkspace = lookup.availability === 'ready' && typeof lookup.service.workspaceRemove === 'function'
+      ? lookup.service.workspaceRemove.bind(lookup.service)
+      : undefined
+    if (removeRepoWorkspace !== undefined) {
+      for (const entry of entries) {
+        const repoPath = join(reposDir, entry)
+        if (await pathExists(join(repoPath, '.git'))) {
+          await removeRepoWorkspace({ path: repoPath, force: true }).catch(() => undefined)
+        }
+      }
+    }
+    await rm(dir, { recursive: true, force: true })
+  }
+
+  private async pruneExpiredTask(taskId: string): Promise<void> {
+    // Strictly preserve lock acquisition order:
+    // withTopicDeliveryLock -> withTaskOperation -> withActionDeliveryLock -> withTaskLock
+    await this.withTopicDeliveryLock(taskId, async () => {
+      await this.withTaskOperation(taskId, async () => {
+        await this.withActionDeliveryLock(taskId, async () => {
+          if (this.closed) return
+          const latest = this.deps.logTasks.get(taskId)
+          if (latest === undefined) return
+          const currentNow = this.now()
+          const exemptTaskIds = this.collectIssueExemptTaskIds()
+          if (!this.isTaskRetentionEligible(taskId, latest, currentNow, exemptTaskIds)) return
+
+          const dirs = this.managedTaskWorkspaceDirs(taskId, latest)
+          for (const dir of dirs) {
+            await this.removeManagedWorkspaceDir(dir)
+          }
+
+          const deleted = await this.withTaskLock(taskId, async () => {
+            const cur = this.deps.logTasks.get(taskId)
+            if (
+              cur === undefined
+              || cur.status === 'running'
+              || this.activeTaskIds.has(taskId)
+              || (cur.updatedAt ?? 0) !== (latest.updatedAt ?? 0)
+            ) {
+              return false
+            }
+            await this.deps.logTasks.delete(taskId)
+            for (const [sessionId, list] of [...this.sessionToTaskIds.entries()]) {
+              const filtered = list.filter(id => id !== taskId)
+              if (filtered.length === 0) {
+                this.sessionToTaskIds.delete(sessionId)
+              } else if (filtered.length !== list.length) {
+                this.sessionToTaskIds.set(sessionId, filtered)
+              }
+            }
+            for (const [launchKey, mappedTaskId] of [...this.launchKeyToTaskId.entries()]) {
+              if (mappedTaskId === taskId) {
+                this.launchKeyToTaskId.delete(launchKey)
+              }
+            }
+            return true
+          })
+
+          if (deleted) {
+            for (const [outboxKey, outboxRec] of [...this.deps.outbox.entries()]) {
+              if (outboxRec.taskId === taskId && outboxRec.status === 'done') {
+                await this.deps.outbox.delete(outboxKey)
+              }
+            }
+          }
+        })
+      })
     })
   }
 
