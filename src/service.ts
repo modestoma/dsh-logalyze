@@ -435,6 +435,13 @@ export class LogalyzeService {
     await this.logSupervisor?.onTopicsAvailable()
   }
 
+  /** Retry deferred follow-up action cards whenever `feishuActions` appears or reloads. */
+  async actionsAvailable(): Promise<void> {
+    await this.booted.promise
+    if (!this.active) return
+    await this.logSupervisor?.onActionsAvailable()
+  }
+
   /** Accept one validated analyze request with idempotency protection. */
   async acceptAnalysis(topics: FeishuTopicService, request: AnalyzeRequest, key: string): Promise<AnalyzeResponse> {
     const pending = this.accepting.get(key)

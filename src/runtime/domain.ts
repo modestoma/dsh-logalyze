@@ -127,6 +127,8 @@ export const logTaskRevisionSchema = z.object({
   items: z.array(logRevisionItemSchema).optional(),
   attachments: z.array(z.string().min(1)).optional(),
   actionCardKey: z.string().min(1).optional(),
+  pendingActionSessionId: z.string().min(1).optional(),
+  actionCardSkipped: z.boolean().optional(),
   reportDir: z.string().min(1).optional(),
   createdAt: z.number().int().nonnegative(),
 }).strict()

@@ -64,6 +64,8 @@ export const LOG_WATERMARK_KEY = 'log_platform'
 const MAX_POLL_PAGES = 1_000
 const MAX_POLL_BACKOFF_MS = 15 * 60 * 1000
 const OUTBOX_POLL_INTERVAL_MS = 2_000
+const ACTION_RETRY_BASE_MS = 2_000
+const MAX_ACTION_RETRY_DELAY_MS = 60_000
 const MAX_PANEL_TASKS = 50
 
 const watermarkControlSchema = z.discriminatedUnion('action', [
@@ -178,6 +180,8 @@ export class LogSupervisor {
 
   private pollTimer: ReturnType<typeof setTimeout> | undefined
   private pollInFlight: Promise<void> | undefined
+  private actionRetryTimer: ReturnType<typeof setTimeout> | undefined
+  private actionRetryFailures = 0
   private readonly batchTimers = new Map<string, ScheduledBatchTimer>()
   private readonly batchLocks = new Map<string, Promise<unknown>>()
   private readonly taskLocks = new Map<string, Promise<unknown>>()
@@ -190,6 +194,7 @@ export class LogSupervisor {
   private readonly launchKeyToTaskId = new Map<string, string>()
   private readonly liveTopicWaiters = new Map<string, Set<() => void>>()
   private readonly topicDeliveryLocks = new Map<string, Promise<unknown>>()
+  private readonly actionDeliveryLocks = new Map<string, Promise<unknown>>()
 
   private watermarkEpoch = 0
 
@@ -264,6 +269,30 @@ export class LogSupervisor {
       if (task.sessionId !== undefined) this.indexSessionTask(task.sessionId, taskId)
       if (task.feishuLaunchKey !== undefined) this.launchKeyToTaskId.set(task.feishuLaunchKey, taskId)
 
+      if (task.status === 'completed' && task.source === 'feishu' && task.sessionId !== undefined) {
+        const latestRev = task.revisions.at(-1)
+        if (
+          latestRev !== undefined
+          && latestRev.actionCardKey === undefined
+          && !latestRev.actionCardSkipped
+          && latestRev.pendingActionSessionId === undefined
+        ) {
+          const targetSessionId = task.sessionId
+          await this.updateTask(taskId, cur => ({
+            ...cur,
+            revisions: cur.revisions.map(r => (
+              r.revision === latestRev.revision
+                && r.actionCardKey === undefined
+                && !r.actionCardSkipped
+                && r.pendingActionSessionId === undefined
+                ? { ...r, pendingActionSessionId: targetSessionId }
+                : r
+            )),
+            updatedAt: this.now(),
+          }))
+        }
+      }
+
       if (task.status !== 'running') continue
 
       if (task.source === 'platform') {
@@ -308,10 +337,21 @@ export class LogSupervisor {
         await this.updateTask(taskId, cur => {
           if (cur.status !== 'running') return cur
           if (cur.revisions.length > 0) {
+            const latestRevNum = cur.revisions.at(-1)?.revision
             return {
               ...cur,
               status: 'completed',
               lastError: undefined,
+              ...(cur.sessionId === undefined ? {} : {
+                revisions: cur.revisions.map(r => (
+                  r.revision === latestRevNum
+                    && r.actionCardKey === undefined
+                    && !r.actionCardSkipped
+                    && r.pendingActionSessionId === undefined
+                    ? { ...r, pendingActionSessionId: cur.sessionId }
+                    : r
+                )),
+              }),
               updatedAt: this.now(),
             }
           }
@@ -326,6 +366,7 @@ export class LogSupervisor {
     }
 
     await this.reconcilePendingTopics()
+    await this.reconcilePendingActions()
     await this.reconcilePendingBatches()
 
     if (this.closed) return
@@ -339,6 +380,7 @@ export class LogSupervisor {
     )
     if (this.autoPollTimer) {
       this.scheduleNextPoll(this.nextPollDelayMs())
+      this.scheduleActionRetry(ACTION_RETRY_BASE_MS)
     }
   }
 
@@ -384,6 +426,9 @@ export class LogSupervisor {
     void this.reconcilePendingTopics().catch((error: unknown) => {
       this.deps.logger?.warn?.('logalyze: 补发静默摘要卡片失败：%s', messageOf(error))
     })
+    void this.reconcilePendingActions().catch((error: unknown) => {
+      this.deps.logger?.warn?.('logalyze: 补发后续动作按钮卡片失败：%s', messageOf(error))
+    })
     if (this.autoPollTimer) {
       this.scheduleNextPoll(this.nextPollDelayMs())
     }
@@ -412,6 +457,14 @@ export class LogSupervisor {
         }
       }
     }
+    await this.reconcilePendingActions()
+  }
+
+  /** Retry deferred follow-up action cards once `feishuActions` becomes ready. */
+  async onActionsAvailable(): Promise<void> {
+    if (this.closed) return
+    this.actionRetryFailures = 0
+    await this.reconcilePendingActions()
   }
 
   /** Observe `FEISHU_TOPICS_STATUS_EVENT` updates to bind session IDs and post action proposals on completion. */
@@ -425,7 +478,7 @@ export class LogSupervisor {
     this.trackBackground(p)
   }
 
-  /** Observe generic host session events (`turn/end`) to trigger action proposals for manual Feishu sessions. */
+  /** Observe generic host session events (`turn/end`) to trigger action proposals for manual and live Feishu sessions. */
   onSessionEvent(sessionId: string, eventType: string, _data: unknown): void {
     if (this.closed || eventType !== 'turn/end') return
     const taskIds = this.sessionToTaskIds.get(sessionId)
@@ -433,11 +486,17 @@ export class LogSupervisor {
     const latestTaskId = taskIds[taskIds.length - 1]
     if (latestTaskId === undefined) return
     const task = this.deps.logTasks.get(latestTaskId)
-    if (task === undefined || task.source !== 'feishu') return
+    if (task === undefined) return
+    const isFeishuManual = task.source === 'feishu'
+    const isDeliveredPlatformTopic = task.source === 'platform'
+      && task.feishuLaunchKey !== undefined
+      && !task.pendingTopicDelivery
+      && (sessionId === task.sessionId || this.deps.getTopics()?.launchKeyOf(sessionId) === task.feishuLaunchKey)
+    if (!isFeishuManual && !isDeliveredPlatformTopic) return
     const latestRev = task.revisions.at(-1)
-    if (latestRev === undefined || latestRev.actionCardKey !== undefined) return
+    if (latestRev === undefined || latestRev.actionCardKey !== undefined || latestRev.actionCardSkipped) return
     const p = this.maybeProposeActionsForRevision(latestTaskId, latestRev.revision, sessionId).catch((error: unknown) => {
-      this.deps.logger?.warn?.('logalyze: 飞书手动诊断推荐操作卡片发送失败（%s）：%s', latestTaskId, messageOf(error))
+      this.deps.logger?.warn?.('logalyze: 飞书日志诊断推荐操作卡片发送失败（%s）：%s', latestTaskId, messageOf(error))
     })
     this.trackBackground(p)
   }
@@ -658,6 +717,7 @@ export class LogSupervisor {
     if (this.closed) return
     this.closed = true
     this.clearPollTimer()
+    this.clearActionRetryTimer()
     for (const entry of this.batchTimers.values()) {
       clearTimeout(entry.timer)
     }
@@ -689,6 +749,63 @@ export class LogSupervisor {
       clearTimeout(this.pollTimer)
       this.pollTimer = undefined
     }
+  }
+
+  private clearActionRetryTimer(): void {
+    if (this.actionRetryTimer !== undefined) {
+      clearTimeout(this.actionRetryTimer)
+      this.actionRetryTimer = undefined
+    }
+  }
+
+  private nextActionRetryDelayMs(): number {
+    const exp = Math.min(Math.max(0, this.actionRetryFailures - 1), 10)
+    return Math.min(ACTION_RETRY_BASE_MS * (2 ** exp), MAX_ACTION_RETRY_DELAY_MS)
+  }
+
+  private hasPendingActionDeliveries(): boolean {
+    for (const [, task] of this.deps.logTasks.entries()) {
+      if (task.status !== 'completed' || task.revisions.length === 0) continue
+      const latestRev = task.revisions.at(-1)
+      if (
+        latestRev !== undefined
+        && latestRev.actionCardKey === undefined
+        && !latestRev.actionCardSkipped
+        && latestRev.pendingActionSessionId !== undefined
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private scheduleActionRetry(explicitDelayMs?: number): void {
+    if (
+      this.closed
+      || !this.autoPollTimer
+      || !this.booted
+      || this.actionRetryTimer !== undefined
+      || !this.hasPendingActionDeliveries()
+    ) {
+      return
+    }
+    const delayMs = explicitDelayMs ?? this.nextActionRetryDelayMs()
+    const timer = setTimeout(() => {
+      this.actionRetryTimer = undefined
+      if (this.closed) return
+      const run = this.reconcilePendingActions()
+        .catch((error: unknown) => {
+          this.deps.logger?.warn?.('logalyze: 重试投递飞书动作按钮卡片异常：%s', messageOf(error))
+        })
+        .finally(() => {
+          if (!this.closed && this.hasPendingActionDeliveries()) {
+            this.scheduleActionRetry()
+          }
+        })
+      this.trackBackground(run)
+    }, Math.max(0, delayMs))
+    timer.unref?.()
+    this.actionRetryTimer = timer
   }
 
   private nextPollDelayMs(): number {
@@ -732,6 +849,10 @@ export class LogSupervisor {
     if (!settings.enabled) return
     await this.reconcilePendingTopics().catch((error: unknown) => {
       this.deps.logger?.warn?.('logalyze: 轮询前补发静默摘要卡片失败：%s', messageOf(error))
+    })
+    if (!isEpochCurrent()) return
+    await this.reconcilePendingActions().catch((error: unknown) => {
+      this.deps.logger?.warn?.('logalyze: 轮询前补发后续动作按钮卡片失败：%s', messageOf(error))
     })
     if (!isEpochCurrent()) return
     const wm = this.readWatermark()
@@ -1589,13 +1710,17 @@ export class LogSupervisor {
         return
       }
 
-      await this.updateTask(taskId, cur => ({
-        ...cur,
-        feishuLaunchKey: launchKey,
-        feishuChatId: chatId,
-        pendingTopicDelivery: undefined,
-        updatedAt: this.now(),
-      }))
+      await this.updateTask(taskId, (cur) => {
+        const prevSessionId = cur.feishuLaunchKey === undefined ? undefined : cur.sessionId
+        const { sessionId: _headlessSessionId, pendingTopicDelivery: _pending, ...rest } = cur
+        return {
+          ...rest,
+          ...(prevSessionId === undefined ? {} : { sessionId: prevSessionId }),
+          feishuLaunchKey: launchKey,
+          feishuChatId: chatId,
+          updatedAt: this.now(),
+        }
+      })
 
       const state = topics.state(launchKey)
       if (state !== undefined) {
@@ -1663,12 +1788,24 @@ export class LogSupervisor {
             nextError = `飞书话题状态：${state.status}`
           }
         }
+        const latestRevNum = cur.revisions.at(-1)?.revision
+        const shouldMarkPendingAction = state.status === 'done'
+          && state.sessionId !== undefined
+          && latestRevNum !== undefined
+        const nextRevisions = shouldMarkPendingAction
+          ? cur.revisions.map(r => (
+              r.revision === latestRevNum && r.actionCardKey === undefined && !r.actionCardSkipped
+                ? { ...r, pendingActionSessionId: state.sessionId }
+                : r
+            ))
+          : cur.revisions
         return {
           ...cur,
           ...(nextSessionId === undefined ? {} : { sessionId: nextSessionId }),
           ...(nextWorkDir === undefined ? {} : { workDir: nextWorkDir }),
           status: nextStatus,
           ...(nextError === undefined ? { lastError: undefined } : { lastError: nextError }),
+          ...(nextRevisions === cur.revisions ? {} : { revisions: nextRevisions }),
           updatedAt: this.now(),
         }
       })
@@ -1677,7 +1814,7 @@ export class LogSupervisor {
 
     if (state.status === 'done' && state.sessionId !== undefined) {
       const latestRev = updated.revisions.at(-1)
-      if (latestRev !== undefined && latestRev.actionCardKey === undefined) {
+      if (latestRev !== undefined && latestRev.actionCardKey === undefined && !latestRev.actionCardSkipped) {
         await this.maybeProposeActionsForRevision(taskId, latestRev.revision, state.sessionId)
       }
     }
@@ -1687,51 +1824,170 @@ export class LogSupervisor {
     }
   }
 
-  private async maybeProposeActionsForRevision(
+  private maybeProposeActionsForRevision(
     taskId: string,
     revisionNumber: number,
     sessionId: string,
   ): Promise<void> {
-    const actionsService = this.deps.getActions()
-    if (actionsService === undefined) return
-    const task = this.deps.logTasks.get(taskId)
-    if (task === undefined) return
-    const revision = task.revisions.find(r => r.revision === revisionNumber)
-    if (revision === undefined || revision.actionCardKey !== undefined) return
+    return this.withActionDeliveryLock(taskId, async () => {
+      if (this.closed) return
+      const initialTask = this.deps.logTasks.get(taskId)
+      if (initialTask === undefined || initialTask.revisions.length === 0) return
 
-    const app = this.findReadyOrName(task.appId)
-    if (app === undefined) return
+      const initialLatest = initialTask.revisions.at(-1)
+      if (initialLatest === undefined) return
 
-    const actions = buildDefaultActionsForRevision({
-      taskId,
-      appId: task.appId,
-      appName: app.app.name,
-      repoUrl: app.url,
-      baseCommit: app.commit,
-      writable: app.writable,
-      revision,
+      if (initialLatest.revision !== revisionNumber) {
+        const hasStalePending = initialTask.revisions.some(
+          r => r.revision < initialLatest.revision && r.pendingActionSessionId !== undefined,
+        )
+        if (hasStalePending) {
+          await this.updateTask(taskId, (cur) => {
+            const latestNum = cur.revisions.at(-1)?.revision ?? initialLatest.revision
+            return {
+              ...cur,
+              revisions: cur.revisions.map((r) => {
+                if (r.revision >= latestNum || r.pendingActionSessionId === undefined) return r
+                const { pendingActionSessionId: _stale, ...rest } = r
+                return rest
+              }),
+              updatedAt: this.now(),
+            }
+          })
+        }
+        return
+      }
+
+      if (initialLatest.actionCardKey !== undefined || initialLatest.actionCardSkipped) {
+        if (initialLatest.pendingActionSessionId !== undefined) {
+          await this.updateTask(taskId, cur => ({
+            ...cur,
+            revisions: cur.revisions.map((r) => {
+              if (r.revision !== revisionNumber || r.pendingActionSessionId === undefined) return r
+              const { pendingActionSessionId: _stale, ...rest } = r
+              return rest
+            }),
+            updatedAt: this.now(),
+          }))
+        }
+        return
+      }
+
+      if (initialLatest.pendingActionSessionId !== sessionId) {
+        await this.updateTask(taskId, (cur) => {
+          const curLatest = cur.revisions.at(-1)
+          if (
+            curLatest?.revision !== revisionNumber
+            || curLatest.actionCardKey !== undefined
+            || curLatest.actionCardSkipped
+          ) {
+            return cur
+          }
+          return {
+            ...cur,
+            revisions: cur.revisions.map((r) => {
+              if (r.revision === revisionNumber) {
+                return { ...r, pendingActionSessionId: sessionId }
+              }
+              if (r.pendingActionSessionId === undefined) return r
+              const { pendingActionSessionId: _stale, ...rest } = r
+              return rest
+            }),
+            updatedAt: this.now(),
+          }
+        })
+      }
+
+      const task = this.deps.logTasks.get(taskId)
+      const revision = task?.revisions.find(r => r.revision === revisionNumber)
+      if (
+        task === undefined
+        || revision === undefined
+        || task.revisions.at(-1)?.revision !== revisionNumber
+        || revision.actionCardKey !== undefined
+        || revision.actionCardSkipped
+      ) {
+        return
+      }
+
+      const actionsService = this.deps.getActions()
+      const app = this.findReadyOrName(task.appId)
+      if (actionsService === undefined || app === undefined) {
+        this.scheduleActionRetry()
+        return
+      }
+
+      const actions = buildDefaultActionsForRevision({
+        taskId,
+        appId: task.appId,
+        appName: app.app.name,
+        repoUrl: app.url,
+        baseCommit: app.commit,
+        writable: app.writable,
+        revision,
+      })
+      if (actions.length === 0) {
+        await this.updateTask(taskId, cur => ({
+          ...cur,
+          revisions: cur.revisions.map((r) => {
+            if (r.revision !== revisionNumber) return r
+            const { pendingActionSessionId: _stale, ...rest } = r
+            return { ...rest, actionCardSkipped: true }
+          }),
+          updatedAt: this.now(),
+        }))
+        if (!this.hasPendingActionDeliveries()) this.clearActionRetryTimer()
+        return
+      }
+
+      const cardKey = `log-act:${taskId}:rev${revision.revision}`
+      let posted: Awaited<ReturnType<FeishuActionsService['propose']>>
+      try {
+        posted = await actionsService.propose({
+          key: cardKey,
+          sessionId,
+          prompt: '已完成异常日志诊断，请选择后续动作（或忽略/追问）：',
+          actions,
+        })
+      } catch (error) {
+        this.actionRetryFailures = Math.min(this.actionRetryFailures + 1, 10)
+        this.deps.logger?.warn?.('logalyze: 投递动作按钮卡片异常（%s）：%s', cardKey, messageOf(error))
+        this.scheduleActionRetry()
+        return
+      }
+
+      if (!posted.ok) {
+        this.deps.logger?.warn?.('logalyze: 投递动作按钮卡片失败（%s）：%s', cardKey, posted.message)
+        if (posted.code === 'invalid' || posted.code === 'unrouted-session') {
+          await this.updateTask(taskId, cur => ({
+            ...cur,
+            revisions: cur.revisions.map((r) => {
+              if (r.revision !== revisionNumber) return r
+              const { pendingActionSessionId: _stale, ...rest } = r
+              return { ...rest, actionCardSkipped: true }
+            }),
+            updatedAt: this.now(),
+          }))
+          if (!this.hasPendingActionDeliveries()) this.clearActionRetryTimer()
+        } else {
+          this.actionRetryFailures = Math.min(this.actionRetryFailures + 1, 10)
+          this.scheduleActionRetry()
+        }
+        return
+      }
+
+      this.actionRetryFailures = 0
+      await this.updateTask(taskId, cur => ({
+        ...cur,
+        revisions: cur.revisions.map((r) => {
+          if (r.revision !== revisionNumber) return r
+          const { pendingActionSessionId: _pending, actionCardSkipped: _skipped, ...rest } = r
+          return { ...rest, actionCardKey: cardKey }
+        }),
+        updatedAt: this.now(),
+      }))
+      if (!this.hasPendingActionDeliveries()) this.clearActionRetryTimer()
     })
-    if (actions.length === 0) return
-
-    const cardKey = `log-act:${taskId}:rev${revision.revision}`
-    const posted = await actionsService.propose({
-      key: cardKey,
-      sessionId,
-      prompt: '已完成异常日志诊断，请选择后续动作（或忽略/追问）：',
-      actions,
-    })
-    if (!posted.ok) {
-      this.deps.logger?.warn?.('logalyze: 投递动作按钮卡片失败（%s）：%s', cardKey, posted.message)
-      return
-    }
-
-    await this.updateTask(taskId, cur => ({
-      ...cur,
-      revisions: cur.revisions.map(r => (
-        r.revision === revisionNumber ? { ...r, actionCardKey: cardKey } : r
-      )),
-      updatedAt: this.now(),
-    }))
   }
 
   private async notifyThrottle(
@@ -1810,15 +2066,41 @@ export class LogSupervisor {
 
     // Mark task completed (and arm pendingTopicDelivery if no live Feishu topic owns this batch
     // yet, including topic-on-start headless fallbacks) AFTER durable outbox enqueue.
-    const completedTask = await this.updateTask(params.taskId, (cur) => {
+    let pendingActionTarget: { readonly sessionId: string } | undefined
+    await this.updateTask(params.taskId, (cur) => {
       const chatId = cur.feishuChatId ?? this.deps.getSettings().feishuChatId
       const needsSummaryCard = cur.source === 'platform'
         && cur.feishuLaunchKey === undefined
         && chatId !== undefined
+      let actionSessionId: string | undefined
+      if (!needsSummaryCard && cur.source === 'platform' && cur.feishuLaunchKey !== undefined && !cur.pendingTopicDelivery) {
+        const topicState = this.deps.getTopics()?.state(cur.feishuLaunchKey)
+        if (topicState?.status === 'done') {
+          actionSessionId = topicState.sessionId ?? cur.sessionId
+        }
+      }
+      pendingActionTarget = actionSessionId === undefined ? undefined : { sessionId: actionSessionId }
+      const nextRevisions = cur.revisions.map((r) => {
+        if (r.revision < params.revision.revision) {
+          if (r.pendingActionSessionId === undefined) return r
+          const { pendingActionSessionId: _stale, ...rest } = r
+          return rest
+        }
+        if (
+          r.revision === params.revision.revision
+          && actionSessionId !== undefined
+          && r.actionCardKey === undefined
+          && !r.actionCardSkipped
+        ) {
+          return { ...r, pendingActionSessionId: actionSessionId }
+        }
+        return r
+      })
       return {
         ...cur,
         status: 'completed',
         lastError: undefined,
+        revisions: nextRevisions,
         ...(needsSummaryCard ? { feishuChatId: cur.feishuChatId ?? chatId, pendingTopicDelivery: true } : {}),
         updatedAt: this.now(),
       }
@@ -1831,20 +2113,15 @@ export class LogSupervisor {
       this.trackBackground(kick)
     }
 
-    if (
-      completedTask.source === 'platform'
-      && completedTask.feishuLaunchKey !== undefined
-      && completedTask.sessionId !== undefined
-    ) {
-      const state = this.deps.getTopics()?.state(completedTask.feishuLaunchKey)
-      if (state?.status === 'done') {
-        const kickActions = this.maybeProposeActionsForRevision(
-          params.taskId,
-          params.revision.revision,
-          completedTask.sessionId,
-        ).catch(() => undefined)
-        this.trackBackground(kickActions)
-      }
+    if (pendingActionTarget !== undefined) {
+      const kickActions = this.maybeProposeActionsForRevision(
+        params.taskId,
+        params.revision.revision,
+        pendingActionTarget.sessionId,
+      ).catch((error: unknown) => {
+        this.deps.logger?.warn?.('logalyze: 投递后续动作按钮卡片失败（%s）：%s', params.taskId, messageOf(error))
+      })
+      this.trackBackground(kickActions)
     }
 
     return {
@@ -1994,6 +2271,35 @@ export class LogSupervisor {
       if (latestRev === undefined) continue
       const reportUrls = this.collectRevisionReportUrls(taskId, latestRev.revision)
       await this.deliverQuietDoneSummaryTopic(taskId, latestRev, reportUrls)
+    }
+  }
+
+  private async reconcilePendingActions(): Promise<void> {
+    if (this.closed) return
+    const topics = this.deps.getTopics()
+    for (const [taskId, task] of this.deps.logTasks.entries()) {
+      if (this.closed) return
+      if (task.status !== 'completed' || task.revisions.length === 0) continue
+      const latestRev = task.revisions.at(-1)
+      if (latestRev === undefined || latestRev.actionCardKey !== undefined || latestRev.actionCardSkipped) continue
+
+      if (latestRev.pendingActionSessionId !== undefined) {
+        await this.maybeProposeActionsForRevision(taskId, latestRev.revision, latestRev.pendingActionSessionId)
+        continue
+      }
+
+      if (task.source === 'platform' && task.feishuLaunchKey !== undefined && !task.pendingTopicDelivery) {
+        const topicState = topics?.state(task.feishuLaunchKey)
+        if (topicState !== undefined) {
+          if (topicState.status === 'done' && topicState.sessionId !== undefined) {
+            await this.applyTopicState(taskId, topicState)
+          }
+          continue
+        }
+        if (task.sessionId !== undefined) {
+          await this.maybeProposeActionsForRevision(taskId, latestRev.revision, task.sessionId)
+        }
+      }
     }
   }
 
@@ -2239,6 +2545,10 @@ export class LogSupervisor {
 
   private withTopicDeliveryLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
     return this.serializeKeyedLock(this.topicDeliveryLocks, key, fn)
+  }
+
+  private withActionDeliveryLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    return this.serializeKeyedLock(this.actionDeliveryLocks, key, fn)
   }
 }
 

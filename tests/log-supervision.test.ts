@@ -229,9 +229,19 @@ class FakeFeishuTopics implements FeishuTopicService {
 class FakeFeishuActions implements FeishuActionsService {
   readonly version = 1 as const
   readonly proposals: ActionProposalSpec[] = []
+  readonly attemptKeys: string[] = []
   readonly superseded: { readonly key: string; readonly reason?: string }[] = []
+  failNextPropose: { readonly code: 'invalid' | 'not-connected' | 'unrouted-session' | 'send-failed'; readonly message: string } | undefined
+  failedProposals = 0
 
   async propose(spec: ActionProposalSpec) {
+    this.attemptKeys.push(spec.key)
+    if (this.failNextPropose !== undefined) {
+      const failure = this.failNextPropose
+      this.failNextPropose = undefined
+      this.failedProposals += 1
+      return { ok: false as const, code: failure.code, message: failure.message }
+    }
     const existingIdx = this.proposals.findIndex(p => p.key === spec.key)
     if (existingIdx >= 0) {
       return { ok: true as const, replayed: true, cardMessageId: `card_${existingIdx + 1}` }
@@ -1973,5 +1983,235 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     h.fakeTopics.emitState({ key: h.fakeTopics.launched[1]!.key, status: 'done', sessionId: summarySess2 })
     await waitFor(() => h.fakeActions.proposals.length === 2)
     expect(h.fakeActions.proposals[1]!.actions.map(a => a.id)).toEqual(['fix_code', 'improve_skill'])
+  }, 20_000)
+
+  it('retries failed follow-up action card deliveries across polls, service recovery, and restarts with the same idempotency key', async () => {
+    const sharedSup = await tempDir()
+    cleanups.push(sharedSup.cleanup)
+    const settingsPath = join(sharedSup.dir, 'settings.json')
+
+    const h = await createFullHarness({
+      deliveryMode: 'quiet-until-done',
+      batchSizeThreshold: 1,
+      supervisorDir: sharedSup.dir,
+      settingsPath,
+      onLogTurn: async (req) => {
+        const prepare = h.toolNamed('supervisor_log_prepare')
+        const submit = h.toolNamed('supervisor_log_submit')
+        const prep = await prepare.execute({ taskId: req.taskId }, h.toolExecCtx(req.existingSessionId!, req.workDir)) as {
+          readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+        }
+        await submit.execute({
+          taskId: req.taskId,
+          summary: `动作卡片重试测试完成（${req.taskId}）`,
+          items: prep.slots.map(s => ({
+            ref: s.ref,
+            status: 'diagnosed',
+            rootCauseCategory: 'code_defect',
+            conclusion: 'handleOrder 返回 null 导致空指针',
+            evidences: [
+              { source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'NullPointerException' },
+              { source: 'repos/order-service/src/handler.ts', locator: 'L1', excerpt: 'return null' },
+            ],
+          })),
+        }, h.toolExecCtx(req.existingSessionId!, req.workDir))
+      },
+    })
+
+    const sup = h.service.logSupervisorInstance()!
+    const domain = await h.service.supervisorDomain()
+
+    // 1. Completed quiet-until-done task experiences transient 'not-connected' then 'send-failed',
+    // then succeeds on subsequent pollNow() using the exact same idempotency key.
+    await h.service.controlLogWatermark({ action: 'rewind', cursorTime: '2026-11-12T09:50:00.000Z' })
+    h.fakePlatform.addLog({
+      log_id: 'action-retry-1',
+      product_code: 'P1',
+      component_code: 'order-service',
+      error_code: 'E_ACT_1',
+      file_name: 'action-retry-1.log',
+      storage_type: 'fds',
+      status: 'completed',
+      archived_at: '2026-11-12T09:55:00.000Z',
+    }, 'NullPointerException at handleOrder\n')
+
+    await sup.pollNow()
+    await waitFor(async () => h.fakeTopics.launched.length === 1 && (await h.service.state()).logSupervision?.running === 0)
+
+    const launch1 = h.fakeTopics.launched[0]!
+    const taskId1 = [...domain.logTasks.entries()][0]![0]
+    const expectedKey1 = `log-act:${taskId1}:rev1`
+
+    h.fakeActions.failNextPropose = { code: 'not-connected', message: 'ws offline' }
+    h.fakeTopics.emitState({ key: launch1.key, status: 'running', sessionId: 'act-sess-1' })
+    h.fakeTopics.emitState({ key: launch1.key, status: 'done', sessionId: 'act-sess-1' })
+    await waitFor(() => h.fakeActions.failedProposals === 1)
+
+    expect(h.fakeActions.proposals).toHaveLength(0)
+    expect(domain.logTasks.get(taskId1)?.revisions[0]?.actionCardKey).toBeUndefined()
+    expect(domain.logTasks.get(taskId1)?.revisions[0]?.pendingActionSessionId).toBe('act-sess-1')
+
+    h.fakeActions.failNextPropose = { code: 'send-failed', message: '502 bad gateway' }
+    h.advanceNow(60_000)
+    await sup.pollNow()
+    expect(h.fakeActions.failedProposals).toBe(2)
+    expect(h.fakeActions.proposals).toHaveLength(0)
+    expect(domain.logTasks.get(taskId1)?.revisions[0]?.actionCardKey).toBeUndefined()
+
+    h.advanceNow(60_000)
+    await sup.pollNow()
+    expect(h.fakeActions.proposals).toHaveLength(1)
+    expect(h.fakeActions.attemptKeys.filter(k => k === expectedKey1)).toEqual([expectedKey1, expectedKey1, expectedKey1])
+    expect(domain.logTasks.get(taskId1)?.revisions[0]?.actionCardKey).toBe(expectedKey1)
+    expect(domain.logTasks.get(taskId1)?.revisions[0]?.pendingActionSessionId).toBeUndefined()
+    expect(h.fakeActions.proposals[0]?.actions.map(a => a.id)).toEqual(['fix_code', 'improve_skill'])
+
+    // 2a. Missing feishuActions during topic 'done' -> actionsAvailable() recovers immediately.
+    h.services.delete('feishuActions')
+    h.fakePlatform.addLog({
+      log_id: 'action-recover-2',
+      product_code: 'P1',
+      component_code: 'order-service',
+      error_code: 'E_ACT_2',
+      file_name: 'action-recover-2.log',
+      storage_type: 'fds',
+      status: 'completed',
+      archived_at: '2026-11-12T10:02:30.000Z',
+    }, 'NullPointerException at handleOrder\n')
+    h.advanceNow(60_000)
+    await sup.pollNow()
+    await waitFor(() => h.fakeTopics.launched.length === 2)
+
+    const launch2 = h.fakeTopics.launched[1]!
+    const taskId2 = [...domain.logTasks.entries()].find(([id]) => id !== taskId1)![0]
+    h.fakeTopics.emitState({ key: launch2.key, status: 'running', sessionId: 'act-sess-2' })
+    h.fakeTopics.emitState({ key: launch2.key, status: 'done', sessionId: 'act-sess-2' })
+    await flushMicrotasks()
+    expect(h.fakeActions.proposals).toHaveLength(1)
+    expect(domain.logTasks.get(taskId2)?.revisions[0]?.pendingActionSessionId).toBe('act-sess-2')
+
+    h.services.set('feishuActions', h.fakeActions)
+    await h.service.actionsAvailable()
+    expect(h.fakeActions.proposals).toHaveLength(2)
+    expect(domain.logTasks.get(taskId2)?.revisions[0]?.actionCardKey).toBe(`log-act:${taskId2}:rev1`)
+    expect(domain.logTasks.get(taskId2)?.revisions[0]?.pendingActionSessionId).toBeUndefined()
+
+    // 2b. Completed platform task whose topic state settled while unobserved recovers on topicsAvailable().
+    await domain.logTasks.put('settled-unobserved-3', {
+      source: 'platform',
+      appId: 'order-service',
+      appName: '订单服务',
+      feishuLaunchKey: 'log-task:settled-unobserved-3',
+      deliveryMode: 'quiet-until-done',
+      feishuChatId: 'oc_ops_group',
+      inputs: [{ ref: 'L1', logId: 'settled-log-3', fileName: 'settled-3.log' }],
+      status: 'completed',
+      revisions: [{
+        revision: 1,
+        summary: '已完成诊断但未及捕获 topic done',
+        createdAt: 1_000,
+        items: [{
+          ref: 'L1',
+          status: 'diagnosed',
+          rootCauseCategory: 'code_defect',
+          conclusion: 'NullPointerException',
+          evidences: [{ source: 'logs/L1/settled-3.log', locator: 'L1', excerpt: 'NullPointerException' }],
+        }],
+      }],
+      createdAt: 1_000,
+      updatedAt: 1_000,
+    })
+    h.fakeTopics.states.set('log-task:settled-unobserved-3', {
+      key: 'log-task:settled-unobserved-3',
+      status: 'done',
+      sessionId: 'act-sess-3',
+    })
+    await h.service.topicsAvailable()
+    expect(h.fakeActions.proposals).toHaveLength(3)
+    expect(domain.logTasks.get('settled-unobserved-3')?.revisions[0]?.actionCardKey).toBe('log-act:settled-unobserved-3:rev1')
+
+    // 3. Permanent 'unrouted-session' failure on a manual Feishu session sets actionCardSkipped and stops retrying.
+    const manualSess = 'manual-unrouted-sess'
+    const manualWs = join(h.dir, 'manual-unrouted-ws')
+    const manualLog = join(h.dir, 'manual-unrouted.log')
+    await mkdir(manualWs, { recursive: true })
+    await writeFile(manualLog, 'NullPointerException in handleOrder\n')
+    const prepManual = await h.toolNamed('supervisor_log_prepare').execute({
+      app: 'order-service',
+      logs: [{ path: manualLog }],
+    }, h.toolExecCtx(manualSess, manualWs, 'call-manual-prep')) as {
+      readonly taskId: string
+      readonly workDir: string
+      readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+    }
+    await h.toolNamed('supervisor_log_submit').execute({
+      taskId: prepManual.taskId,
+      summary: '手工会话诊断结果',
+      items: prepManual.slots.map(s => ({
+        ref: s.ref,
+        status: 'diagnosed',
+        rootCauseCategory: 'code_defect',
+        conclusion: 'handleOrder 返回 null',
+        evidences: [
+          { source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'NullPointerException' },
+          { source: 'repos/order-service/src/handler.ts', locator: 'L1', excerpt: 'return null' },
+        ],
+      })),
+    }, h.toolExecCtx(manualSess, prepManual.workDir, 'call-manual-sub'))
+
+    const attemptsBeforeUnrouted = h.fakeActions.attemptKeys.length
+    h.fakeActions.failNextPropose = { code: 'unrouted-session', message: 'session not bound to feishu route' }
+    sup.onSessionEvent(manualSess, 'turn/end', { reason: { kind: 'completed' } })
+    await waitFor(() => domain.logTasks.get(prepManual.taskId)?.revisions[0]?.actionCardSkipped === true)
+    expect(h.fakeActions.attemptKeys.length).toBe(attemptsBeforeUnrouted + 1)
+    expect(domain.logTasks.get(prepManual.taskId)?.revisions[0]?.pendingActionSessionId).toBeUndefined()
+    expect(domain.logTasks.get(prepManual.taskId)?.revisions[0]?.actionCardKey).toBeUndefined()
+
+    h.advanceNow(60_000)
+    await sup.pollNow()
+    expect(h.fakeActions.attemptKeys.length).toBe(attemptsBeforeUnrouted + 1)
+
+    // 2c. Process restart recovers persisted completed revisions carrying pendingActionSessionId on boot.
+    const restartTaskId = 'restart-pending-action-4'
+    await domain.logTasks.put(restartTaskId, {
+      source: 'platform',
+      appId: 'order-service',
+      appName: '订单服务',
+      feishuLaunchKey: `log-task:${restartTaskId}`,
+      deliveryMode: 'quiet-until-done',
+      feishuChatId: 'oc_ops_group',
+      sessionId: 'restart-action-sess-4',
+      inputs: [{ ref: 'L1', logId: 'restart-log-4', fileName: 'restart-4.log' }],
+      status: 'completed',
+      revisions: [{
+        revision: 1,
+        summary: '重启恢复补发动作按钮测试',
+        pendingActionSessionId: 'restart-action-sess-4',
+        createdAt: 2_000,
+        items: [{
+          ref: 'L1',
+          status: 'diagnosed',
+          rootCauseCategory: 'code_defect',
+          conclusion: 'NullPointerException',
+          evidences: [{ source: 'logs/L1/restart-4.log', locator: 'L1', excerpt: 'NullPointerException' }],
+        }],
+      }],
+      createdAt: 2_000,
+      updatedAt: 2_000,
+    })
+
+    const origin = h.origin
+    await h.service.shutdown()
+
+    const hRestart = await createFullHarness({
+      origin,
+      settingsPath,
+      skipSaveApplication: true,
+      supervisorDir: sharedSup.dir,
+    })
+    expect(hRestart.fakeActions.proposals.map(p => p.key)).toContain(`log-act:${restartTaskId}:rev1`)
+    const restartDomain = await hRestart.service.supervisorDomain()
+    expect(restartDomain.logTasks.get(restartTaskId)?.revisions[0]?.actionCardKey).toBe(`log-act:${restartTaskId}:rev1`)
+    expect(restartDomain.logTasks.get(restartTaskId)?.revisions[0]?.pendingActionSessionId).toBeUndefined()
   }, 20_000)
 })
