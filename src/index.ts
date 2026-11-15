@@ -1,30 +1,25 @@
 /**
- * 观象 Logalyze —— DeepSeek Harness 日志分析插件。观其象，知其因。
+ * 智能监管（dsh-supervisor）—— DeepSeek Harness AI 原生智能监管中心底座运行时（观象日志监管 + 审微 MR 监管）。
  *
- * 提供入口 SKILL `/logalyze`（识别日志属于哪个应用；用户显式调用，或在
- * 任务匹配已注册应用时由顶层 Agent 自行加载）和
- * `logalyze_dispatch` 工具（按应用派发子 Agent，工作目录为该应用的代码
- * 仓库，首条消息用 `/<skill>` 加载仓库里的日志分析 SKILL），以及 SKILL 改进
- * 工具：`logalyze_show_skill` 只读查看应用 SKILL；`logalyze_improve_skill` 在
- * 用户于分析结论之后的消息中同意改进时，由一个改进子 Agent 把该应用的所有改进点
- * 在运行目录的可写工作区里按 `/logalyze-improve` 改进 SKILL 并沉淀案例，经
- * `dshRepos` 服务推送到新分支并创建合并请求。应用仓库是 dsh-repo 仓库清单中
- * 打开了「日志分析」功能的仓库，由插件拉取；应用描述来自各仓库的
- * `.agents/logalyze.yaml`。顶层 Agent 还可以用 `logalyze_add_repo` 在对话中
- * 把仓库加入 dsh-repo 的仓库清单，并用 `logalyze_init_repo` / `logalyze_submit_init` 为缺少应用描述
- * 的仓库在工作区里起草并推送接入合并请求。另提供日志平台分析接口 `POST /open-api/logalyze`，
- * 经飞书渠道插件的 `feishuTopics` 服务在飞书群话题中开始分析；带 `logId` 的请求在
- * 话题每轮结束后把报告目录交给回传命令。
+ * 从 `dsh-repo` 的仓库目录读取启用「日志分析」与「MR 自动评审」的代码仓库，提供：
+ * - `dsh_supervisor` 共享监管运行时（7 张强类型状态表、并发池、键控防抖器、滑动窗口熔断器、单调修订 Outbox）；
+ * - 跨插件窄契约（`dshRepos` v7/v8 与 `feishuActions` v1）；
+ * - 面板归属的应用描述与触发别名设置、可选 DSH SKILL 发现与加载、分析派发与报告回传。
  *
- * @module dsh-logalyze
+ * Cordis 插件名与配置 ID 为 `supervisor`，npm 包名为 `dsh-supervisor`。
+ *
+ * @module dsh-supervisor
  */
 
 import { mountAnalyzeRoute } from './analyze/server.ts'
+import { SUPERVISOR_APPLICATIONS_SERVICE } from './apps/access.ts'
 import { resolveConfig } from './config.ts'
-import { DSH_REPOS_SERVICE, lookupRepos } from './deps/repos.ts'
+import { FEISHU_ACTIONS_SERVICE, FEISHU_ACTIONS_VERSION, lookupActions } from './deps/actions.ts'
+import { FEISHU_BITABLE_SERVICE, FEISHU_BITABLE_VERSION, lookupBitable, parseBitableUrl } from './deps/bitable.ts'
+import { DSH_REPOS_SERVICE, LOG_ANALYSIS_FEATURE, lookupRepos, lookupReposV8, MR_REVIEW_FEATURE } from './deps/repos.ts'
 import { FEISHU_TOPICS_SERVICE } from './deps/topics.ts'
 import type { HostContext } from './host.ts'
-import { LogalyzeService } from './service.ts'
+import { SupervisorService } from './service.ts'
 import type { ServiceOptions } from './service.ts'
 import { defaultOverlayPath, OverlayStore } from './settings/overlay.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
@@ -32,10 +27,35 @@ import { loadBundledSkills } from './skill/bundled.ts'
 import { messageOf } from './util/errors.ts'
 
 export type * from './settings/contract.ts'
-export type { LogalyzeConfig } from './config.ts'
+export type * from './deps/repos-contract.ts'
+export type * from './deps/actions-contract.ts'
+export type * from './deps/bitable-contract.ts'
+export * from './runtime/index.ts'
+export * from './issues/memory.ts'
+export * from './issues/bitable-sync.ts'
+export * from './log/index.ts'
+export * from './mr/index.ts'
+export type { ApplicationAccess } from './apps/access.ts'
+export type { LeasedApp, ReadyApp, RepoLease } from './apps/registry.ts'
+export {
+  DSH_REPOS_SERVICE,
+  FEISHU_ACTIONS_SERVICE,
+  FEISHU_ACTIONS_VERSION,
+  FEISHU_BITABLE_SERVICE,
+  FEISHU_BITABLE_VERSION,
+  LOG_ANALYSIS_FEATURE,
+  SUPERVISOR_APPLICATIONS_SERVICE,
+  lookupActions,
+  lookupBitable,
+  lookupRepos,
+  lookupReposV8,
+  MR_REVIEW_FEATURE,
+  parseBitableUrl,
+}
+export type { SupervisorConfig } from './config.ts'
 
-/** Cordis plugin name. */
-export const name = 'logalyze'
+/** Cordis plugin name (matches `id: supervisor` in `cordis.patch.yml`). */
+export const name = 'supervisor'
 
 /** Host services the plugin needs before `apply()`. */
 export const inject = ['tools', 'skills', 'subagents'] as const
@@ -44,49 +64,58 @@ export const inject = ['tools', 'skills', 'subagents'] as const
 export { pluginConfigSchema as Config } from './config.ts'
 
 /** Direct-invocation options (tests and embedding hosts). */
-export interface LogalyzePluginOptions extends ServiceOptions {
-  /** Overlay file path; defaults to `$DSH_HOME/logalyze/settings.json`. */
+export interface SupervisorPluginOptions extends ServiceOptions {
+  /** Overlay file path; defaults to `$DSH_HOME/supervisor/settings.json`. */
   readonly overlayPath?: string
 }
 
 /**
- * Install the entry skill, the bundled guide skills, the dispatch, SKILL
- * view and improvement, and repository
- * onboarding tools, the settings routes, and the analyze route, then mirror
- * or update the application repositories (the dsh-repo catalog repositories
- * with the log analysis feature) in the background, again after each catalog
- * or host change in dsh-repo.
+ * Install the supervision runtime, entry skill, bundled guide skills, analysis and
+ * SKILL improvement tools, settings routes, and analyze route, then follow `dsh-repo`
+ * catalog and host changes for both `log-analysis` and `mr-review` features.
  * @param ctx - plugin context.
  * @param config - loader-validated configuration.
  * @param options - test seams.
  */
-export function apply(ctx: HostContext, config?: unknown, options: LogalyzePluginOptions = {}): void {
+export function apply(ctx: HostContext, config?: unknown, options: SupervisorPluginOptions = {}): void {
   const bundled = loadBundledSkills(new URL('../skills/', import.meta.url))
-  const service = new LogalyzeService(ctx, resolveConfig(config), new OverlayStore(options.overlayPath ?? defaultOverlayPath()), { bundled }, options)
+  const service = new SupervisorService(ctx, resolveConfig(config), new OverlayStore(options.overlayPath ?? defaultOverlayPath()), { bundled }, options)
   service.registerSkill()
   service.registerTools()
   mountSettingsRoutes(ctx, service)
-  mountAnalyzeRoute(ctx, service.analyzeGate(), (request, key) => service.trackReport(request, key))
+  mountAnalyzeRoute(ctx, service.analyzeGate(), async (topics, request, key) => await service.acceptAnalysis(topics, request, key))
   ctx.effect(() => {
     void service.boot().catch((error: unknown) => {
-      ctx.logger?.error?.('logalyze: 启动失败：%s', messageOf(error))
+      ctx.logger?.error?.('supervisor: 启动失败：%s', messageOf(error))
     })
-    return () => { service.shutdown() }
-  }, 'logalyze: repositories')
+    return () => service.shutdown()
+  }, 'supervisor: repositories')
   // Check reports waiting for their first turn whenever the Feishu channel plugin's service appears.
   ctx.inject?.([FEISHU_TOPICS_SERVICE], () => {
     void service.topicsAvailable().catch((error: unknown) => {
-      ctx.logger?.error?.('logalyze: 核对分析报告失败：%s', messageOf(error))
+      ctx.logger?.error?.('supervisor: 核对分析报告失败：%s', messageOf(error))
+    })
+  })
+  // Retry deferred follow-up action button cards whenever the Feishu actions service appears.
+  ctx.inject?.([FEISHU_ACTIONS_SERVICE], () => {
+    void service.actionsAvailable().catch((error: unknown) => {
+      ctx.logger?.error?.('supervisor: 补发飞书动作按钮卡片失败：%s', messageOf(error))
+    })
+  })
+  // Trigger pending Known Issues Bitable sync when `feishuBitable` registers or reloads.
+  ctx.inject?.([FEISHU_BITABLE_SERVICE], () => {
+    void service.bitableAvailable().catch((error: unknown) => {
+      ctx.logger?.error?.('supervisor: 刷新飞书多维表格同步状态失败：%s', messageOf(error))
     })
   })
   // Whenever dsh-repo's service appears, including after it reloads: register
-  // the log analysis feature, follow its catalog and host changes, and take the
-  // application repositories from the catalog again.
+  // both `log-analysis` and `mr-review` features, follow catalog and host changes,
+  // and take the enabled repositories from the catalog again.
   ctx.inject?.([DSH_REPOS_SERVICE], (child) => {
     const lookup = lookupRepos(child.get?.(DSH_REPOS_SERVICE))
-    if (lookup.availability === 'ready') child.effect(() => service.watchRepos(lookup.service), 'logalyze: dsh-repo catalog')
+    if (lookup.availability === 'ready') child.effect(() => service.watchRepos(lookup.service), 'supervisor: dsh-repo catalog')
     void service.reposAvailable().catch((error: unknown) => {
-      ctx.logger?.error?.('logalyze: 同步仓库失败：%s', messageOf(error))
+      ctx.logger?.error?.('supervisor: 同步仓库失败：%s', messageOf(error))
     })
   })
 }

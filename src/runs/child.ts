@@ -3,7 +3,7 @@
  * 为每个应用各用一个，SKILL 改进和接入起草各用一个。超过时限或调用被取消时
  * 停止子 Agent；无论结果如何都释放它。
  *
- * @module dsh-logalyze/runs/child
+ * @module dsh-supervisor/runs/child
  */
 
 import type { Agent, ContentBlock, SubagentService } from '../host.ts'

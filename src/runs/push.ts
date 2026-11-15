@@ -8,7 +8,7 @@
  * - 推送提交工作区里未提交的改动，从不强推；远端分支已经变化时报告 `exists`。
  * - 分支推送后合并请求没有创建时报告 `pushed`，由用户手动创建。
  *
- * @module dsh-logalyze/runs/push
+ * @module dsh-supervisor/runs/push
  */
 
 import type { Agent, ToolRunContext } from '../host.ts'

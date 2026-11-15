@@ -3,7 +3,7 @@ import type { Server } from 'node:http'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, beforeAll, afterAll, describe, expect, it } from 'vitest'
-import { admitUrl, downloadLog, fileNameFor, isHostAllowed } from '../src/runs/download.ts'
+import { admitPlatformUrl, admitUrl, downloadLog, fileNameFor, isHostAllowed } from '../src/runs/download.ts'
 import type { DownloadSettings } from '../src/settings/contract.ts'
 import { tempDir } from './helpers.ts'
 
@@ -11,7 +11,7 @@ let server: Server
 let port = 0
 beforeAll(async () => {
   server = createServer((req, res) => {
-    switch (req.url) {
+    switch (req.url?.split('?')[0]) {
       case '/logs/app.tar.gz':
         res.writeHead(200, { 'content-length': '5' })
         res.end('hello')
@@ -100,5 +100,15 @@ describe('downloadLog', () => {
   it('reports HTTP failures and timeouts', async () => {
     await expect(downloadLog(`http://127.0.0.1:${port}/nope`, await dir(), 'x', settings, new AbortController().signal)).rejects.toThrow('HTTP 404')
     await expect(downloadLog(`http://127.0.0.1:${port}/slow`, await dir(), 'x', { ...settings, timeoutMs: 200 }, new AbortController().signal)).rejects.toThrow('下载超时')
+  })
+
+  it('admits any http(s) platform link and names the file instead of the signed address in messages', async () => {
+    expect(() => admitPlatformUrl('ftp://x/y')).toThrow('不是 http/https')
+    expect(() => admitPlatformUrl('https://u:p@x/y')).toThrow('用户名或密码')
+    const target = await dir()
+    const signed = `http://127.0.0.1:${port}/big?sig=secret`
+    const error = await downloadLog(signed, target, 'big', { ...settings, allowedHosts: [] }, new AbortController().signal, fetch, { admit: admitPlatformUrl, label: '日志 L1（a.tar.gz）' }).catch((caught: unknown) => caught)
+    expect((error as Error).message).toContain('日志 L1（a.tar.gz）')
+    expect((error as Error).message).not.toContain('sig=secret')
   })
 })

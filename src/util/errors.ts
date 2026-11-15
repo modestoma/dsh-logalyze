@@ -1,7 +1,7 @@
 /**
  * Error text helpers shared by the tools, the services, and the routes.
  *
- * @module dsh-logalyze/util/errors
+ * @module dsh-supervisor/util/errors
  */
 
 /**

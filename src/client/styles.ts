@@ -1,11 +1,11 @@
 /**
- * 「观象」页面样式。使用 DSH 语义 token（`--dsw-alias-*`）并带中性回退，
+ * 「智能监管」页面样式。使用 DSH 语义 token（`--dsw-alias-*`）并带中性回退，
  * 页面随当前主题变化。
  *
- * @module dsh-logalyze/client/styles
+ * @module dsh-supervisor/client/styles
  */
 
-const STYLE_ATTRIBUTE = 'data-dsh-logalyze-css'
+const STYLE_ATTRIBUTE = 'data-dsh-supervisor-css'
 
 const CSS = `
 .lz-page{width:100%;height:100%;min-width:0;min-height:0;overflow:auto;scrollbar-gutter:stable;background:var(--dsw-alias-bg-base,#fff)}
@@ -53,6 +53,17 @@ const CSS = `
 .lz__addRow .lz__input--branch{flex:0 1 140px}
 .lz__addRow--flush{padding:6px 0 0}
 .lz__addForm{display:flex;flex-direction:column;gap:6px;padding:10px 14px}
+.lz__appForm{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+.lz__appForm .lz__field{flex:none}
+.lz__aliasInput{display:flex;align-items:center;gap:8px;margin-top:6px}
+.lz__appForm .lz__aliasInput .lz__input{flex:1 1 auto;width:0}
+.lz__aliases{display:flex;flex-wrap:wrap;gap:6px;margin:0;padding:0;list-style:none}
+.lz__alias{display:inline-flex;align-items:center;gap:4px;max-width:100%;box-sizing:border-box;padding:3px 4px 3px 10px;border:1px solid var(--lz-line);border-radius:6px;background:var(--lz-hover);color:var(--lz-fg2);font-size:12px;line-height:20px}
+.lz__aliasLabel{min-width:0;overflow-wrap:anywhere}
+.lz__aliasRemove{display:inline-flex;align-items:center;justify-content:center;flex:none;width:24px;height:24px;border:0;border-radius:4px;background:transparent;color:var(--lz-fg3);font:inherit;font-size:16px;cursor:pointer}
+.lz__aliasRemove:hover:not(:disabled){background:var(--lz-hover);color:var(--lz-bad)}
+.lz__aliasRemove:disabled{color:var(--lz-dim);cursor:default}
+.lz__aliasRemove:focus-visible{outline:2px solid var(--lz-accent);outline-offset:2px}
 .lz__field{display:flex;flex-direction:column;gap:2px;flex:1 1 160px;color:var(--lz-fg3);font-size:12px}
 .lz__field .lz__input{flex:none;width:100%}
 .lz__btn--end{align-self:flex-end;height:30px}
@@ -72,6 +83,14 @@ const CSS = `
 .lz__saveBar{position:sticky;bottom:0;z-index:2;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 0;border-top:1px solid var(--lz-line);background:var(--lz-bg)}
 .lz__saveMsg{flex:1;min-width:0;color:var(--lz-fg2);font-size:12px}
 .lz__loading{padding:16px 0;color:var(--lz-fg3);font-size:12px}
+.lz__grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
+.lz__card{display:flex;flex-direction:column;gap:4px;padding:12px 14px;border:1px solid var(--lz-line);border-radius:10px;background:var(--dsw-alias-bg-layer-1,transparent)}
+.lz__cardTitle{display:flex;align-items:center;justify-content:space-between;gap:6px;color:var(--lz-fg3);font-size:12px;line-height:18px}
+.lz__cardVal{font-size:20px;font-weight:600;line-height:26px;font-variant-numeric:tabular-nums}
+.lz__cardMeta{color:var(--lz-fg2);font-size:12px;line-height:17px;overflow-wrap:anywhere}
+.lz__filterBar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.lz__filterBar .lz__input{flex:1 1 200px;width:auto}
+.lz__detail{margin-top:6px;padding:8px 10px;border-radius:7px;background:var(--lz-hover);font-size:12px;line-height:18px;display:flex;flex-direction:column;gap:4px}
 `
 
 /**

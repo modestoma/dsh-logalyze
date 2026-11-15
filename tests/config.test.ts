@@ -1,44 +1,70 @@
 import { describe, expect, it } from 'vitest'
-import { applyOverlay, defaultsOf, isAcceptedBranch, isAcceptedGitUrl, overlaySchema, resolveConfig } from '../src/config.ts'
+import { applyOverlay, defaultsOf, overlaySchema, resolveConfig } from '../src/config.ts'
 import { diffOverlay } from '../src/settings/overlay.ts'
-
-describe('git address policy', () => {
-  it.each([
-    'https://github.com/example/pay-service.git',
-    'https://gitlab.example.com:8443/team/app.git',
-  ])('accepts %s', (url) => {
-    expect(isAcceptedGitUrl(url)).toBe(true)
-  })
-
-  it.each([
-    'git@github.com:example/order-service.git',
-    'ssh://git@git.example.com:2222/team/app.git',
-    'git://example.com/a.git',
-    'http://example.com/a.git',
-    'ext::sh -c id',
-    '--upload-pack=touch /tmp/x',
-    'relative/path',
-    'ftp://example.com/a.git',
-    'file:///srv/git/app.git',
-    '/srv/git/app',
-    '',
-  ])('refuses %s', (url) => {
-    expect(isAcceptedGitUrl(url)).toBe(false)
-  })
-
-  it('refuses branch names that could be read as options or ranges', () => {
-    expect(isAcceptedBranch('release/1.2')).toBe(true)
-    expect(isAcceptedBranch('-f')).toBe(false)
-    expect(isAcceptedBranch('a..b')).toBe(false)
-    expect(isAcceptedBranch('a b')).toBe(false)
-  })
-})
 
 describe('configuration', () => {
   it('defaults every field', () => {
     const config = resolveConfig(undefined)
     expect(config).toMatchObject({ fetchIntervalMs: 0, maxAppsPerRequest: 4, subagentProvider: 'spawn', refreshWaitMs: 15000 })
     expect(defaultsOf(config).skillUpdates).toEqual({ enabled: true, maxFiles: 16, maxFileBytes: 262144 })
+    expect(defaultsOf(config).mrReview).toEqual({
+      enabled: true,
+      pollIntervalMs: 60_000,
+      debounceMs: 45_000,
+      maxConcurrentSessions: 3,
+      skipDraft: true,
+      ignoreLabels: [],
+      maxAutoFixAttempts: 2,
+      dailyMrTurnLimit: 12,
+      repoHourlyTurnLimit: 30,
+    })
+    expect(defaultsOf(config).logSupervision).toEqual({
+      enabled: false,
+      pollIntervalMs: 60_000,
+      batchSizeThreshold: 5,
+      maxBatchSize: 20,
+      batchWindowMs: 300_000,
+      maxConcurrentBatches: 4,
+      appHourlyBatchLimit: 15,
+      deliveryMode: 'quiet-until-done',
+      maxUnpackBytes: 512 * 1024 * 1024,
+    })
+    expect(defaultsOf(config).issueSync).toEqual({
+      enabled: true,
+      syncIntervalMs: 300_000,
+    })
+  })
+
+  it('validates mrReview optional fields and issueSync bitable URLs', () => {
+    const custom = resolveConfig({
+      mrReview: {
+        customInstructions: '  注意检查权限校验与并发锁。 ',
+        feishuChatId: ' oc_mr_team_1 ',
+      },
+      issueSync: {
+        enabled: true,
+        bitableUrl: 'https://mi.feishu.cn/base/appBase123?table=tblIssues',
+        table: ' tblIssues ',
+        syncIntervalMs: 10_000,
+      },
+    })
+    expect(custom.mrReview.customInstructions).toBe('注意检查权限校验与并发锁。')
+    expect(custom.mrReview.feishuChatId).toBe('oc_mr_team_1')
+    expect(custom.issueSync.bitableUrl).toBe('https://mi.feishu.cn/base/appBase123?table=tblIssues')
+    expect(custom.issueSync.table).toBe('tblIssues')
+
+    const cleared = resolveConfig({
+      mrReview: { customInstructions: '   ', feishuChatId: '' },
+      issueSync: { bitableUrl: '', table: '   ' },
+    })
+    expect(cleared.mrReview.customInstructions).toBeUndefined()
+    expect(cleared.mrReview.feishuChatId).toBeUndefined()
+    expect(cleared.issueSync.bitableUrl).toBeUndefined()
+    expect(cleared.issueSync.table).toBeUndefined()
+
+    expect(() => resolveConfig({ mrReview: { feishuChatId: 'bad_chat' } })).toThrow(/chat_id/)
+    expect(() => resolveConfig({ issueSync: { bitableUrl: 'https://example.com/not-bitable' } })).toThrow(/飞书多维表格地址/)
+    expect(() => resolveConfig({ issueSync: { syncIntervalMs: 1000 } })).toThrow(/issueSync\.syncIntervalMs/)
   })
 
   it('normalizes allowed hosts and rejects schemes', () => {

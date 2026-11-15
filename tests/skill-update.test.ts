@@ -39,7 +39,7 @@ async function workspace(files: Record<string, string>, changes: Partial<Workspa
   return {
     root,
     changes: {
-      workspace: { repo: 'https://code.example.com/team/app.git', path: root, base: 'main', baseCommit: 'b'.repeat(40), branch: 'logalyze/x' },
+      workspace: { repo: 'https://code.example.com/team/app.git', path: root, base: 'main', baseCommit: 'b'.repeat(40), branch: 'supervisor/x' },
       files: changes.map(change => ({ path: '', status: 'added', binary: false, additions: 1, deletions: 0, ...change })),
       diff: 'diff --git a/x b/x\n',
       truncated: false,
@@ -189,7 +189,7 @@ async function setup(endTurn = true): Promise<Setup> {
     repos: new ReposClient(() => repos.service),
     now: () => new Date(2026, 9, 31, 22, 0, 0),
   })
-  const workDir = join(root, 'project', '.logalyze', 'runs', 'r1', '1-order-service')
+  const workDir = join(root, 'project', '.supervisor', 'runs', 'r1', '1-order-service')
   await mkdir(workDir, { recursive: true })
   await writeFile(join(workDir, 'skill-gap.md'), GAP)
   const task: AnalyzedTask = { workDir, sessionId: 'parent', app: ready!.app, url: origin, commit: ready!.commit, question: '21 点下单报 500', output: '根因：促销商品没有 SKU', logs: ['/logs/order.log'] }
@@ -230,7 +230,7 @@ const IN_SKILL = (path: string) => `.agents/skills/log-analysis/${path}`
 
 const escape = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
-describe('logalyze_improve_skill', () => {
+describe('supervisor_improve_skill', () => {
   it('drafts a case with the improvement child and pushes it with a merge request through dsh-repo', async () => {
     const { origin, registry, task, improver, agent, repos, started, skill } = await setup()
     const exec = { signal: new AbortController().signal, agent, callId: 'call-1' }
@@ -241,14 +241,15 @@ describe('logalyze_improve_skill', () => {
     const status = registry.status()[0]!
     expect(child?.spec).toMatchObject({ provider: 'spawn', label: '订单服务 SKILL 改进', delivery: 'caller', parent: agent, maxDepth: 1 })
     const improveDir = improveDirOf(child!)
-    expect(improveDir).toMatch(new RegExp(`^${escape(join(agent.session.header.cwd as string, '.logalyze', 'runs'))}/20261031-220000-[0-9a-f]{6}/improve-[0-9a-f]{6}$`))
+    expect(improveDir).toMatch(new RegExp(`^${escape(join(agent.session.header.cwd as string, '.supervisor', 'runs'))}/20261031-220000-[0-9a-f]{6}/improve-[0-9a-f]{6}$`))
     expect(child?.spec.cwd).toBe(join(improveDir, 'repo'))
-    // The workspace is a clone at the latest synced commit, pushing to a new branch named after the run.
+    // The workspace is a clone of the baseline head.
     expect(await readFile(join(improveDir, 'repo', SKILL), 'utf8')).toBe(skill)
     expect(await stat(join(improveDir, 'repo', '.git')).then(() => true, () => false)).toBe(true)
-    expect(repos.service.creates).toEqual([{ repo: origin, path: join(improveDir, 'repo'), commit: status.commit, branch: expect.stringMatching(/^logalyze\/skill-order-service-20261031-220000-[0-9a-f]{6}$/), agent, callId: 'call-1', signal: exec.signal }])
+    // dsh-repo starts from the baseline head and names the branch from its template.
+    expect(repos.service.creates).toEqual([{ repo: origin, path: join(improveDir, 'repo'), agent, callId: 'call-1', signal: exec.signal }])
     const prompt = child?.spec.prompt[0]?.text as string
-    expect(prompt.split('\n')[0]).toBe('/logalyze-improve')
+    expect(prompt.split('\n')[0]).toBe('/supervisor-improve')
     expect(prompt).toContain('本会话的一次日志分析之后，分析子 Agent 认为这个 SKILL 没能很好地覆盖遇到的问题，用户同意改进。下面列出的所有改进点都在这一次修改中完成。')
     expect(prompt).toContain(`## 分析 1\n\n运行目录：\`${task.workDir}\``)
     expect(prompt).toContain('### 问题\n\n21 点下单报 500')
@@ -278,7 +279,7 @@ describe('logalyze_improve_skill', () => {
       files: [{ path: SKILL, added: 4, removed: 0 }, { path: `.agents/skills/log-analysis/${CASE}`, added: 1, removed: 0 }],
       output: '- SKILL.md：补充 traceId\n- cases/2026-10-31-trace-id.md：新增案例',
     })
-    expect(value.branch).toBe(repos.service.creates[0]?.branch)
+    expect(value.branch).toBe('dsh/parent')
     expect(await readFile(value.diffPath!, 'utf8')).toContain('+# traceId 串联')
     expect(child?.dispose).toHaveBeenCalledTimes(1)
     expect(registry.status()[0]?.activeRuns).toBe(0)
@@ -293,7 +294,7 @@ describe('logalyze_improve_skill', () => {
     const [push] = repos.service.pushes
     expect(Object.keys(push!.files)).toEqual([SKILL, IN_SKILL(CASE)])
     expect(git(origin, 'rev-parse', `${value.branch}^`).trim()).toBe(status.commit)
-    expect(push?.message).toMatch(new RegExp(`^chore: 补充 traceId 字段说明与案例\\n\\n# 补充 traceId[\\s\\S]*\\n\\nProposed-by: 观象 Logalyze\\nAnalyzed-commit: ${task.commit}\\n$`))
+    expect(push?.message).toMatch(new RegExp(`^chore: 补充 traceId 字段说明与案例\\n\\n# 补充 traceId[\\s\\S]*\\n\\nProposed-by: 智能监管 Supervisor\\nAnalyzed-commit: ${task.commit}\\n$`))
     expect(push?.session).toBe('parent')
     expect(repos.openMr).toHaveBeenCalledWith({ repo: origin, branch: value.branch, base: 'main', title: 'chore: 补充 traceId 字段说明与案例', body: expect.stringContaining('请评审案例和 SKILL 修改') })
     const text = renderImproveValue(value)[0]?.text
@@ -301,17 +302,30 @@ describe('logalyze_improve_skill', () => {
     expect(text).toContain('改进子 Agent 的说明：\n- SKILL.md：补充 traceId')
   })
 
+  it('keeps code-only applications analyzable and refuses legacy improvement before opening a workspace', async () => {
+    const { root, origin, registry, improver, agent, repos, started } = await setup()
+    const code = await createAppRepo(join(root, 'code-only'), { '.agents/logalyze.yaml': 'id: code-only\nname: 代码应用\ndescription: 代码直读\n' })
+    git(code, 'rm', '-qr', '.agents/skills')
+    git(code, 'commit', '-qm', 'no skill')
+    registry.configure([{ url: origin, writable: true }, { url: code, writable: true }])
+    await registry.syncAll()
+    expect(registry.readyApp('code-only').app.skill).toBeUndefined()
+    await expect(improver.execute({ app: 'code-only', feedback: '创建排查知识' }, { signal: new AbortController().signal, agent })).rejects.toThrow('创建初版 SKILL 待知识改进功能接入')
+    expect(repos.service.creates).toEqual([])
+    expect(started).toEqual([])
+  })
+
   it('merges every improvement point of an application into one child', async () => {
     const { root, origin, task, improver, agent, repos, started, skill } = await setup(false)
-    const second = join(root, 'project', '.logalyze', 'runs', 'r2', '1-order-service')
-    const quiet = join(root, 'project', '.logalyze', 'runs', 'r3', '1-order-service')
+    const second = join(root, 'project', '.supervisor', 'runs', 'r2', '1-order-service')
+    const quiet = join(root, 'project', '.supervisor', 'runs', 'r3', '1-order-service')
     for (const path of [second, quiet]) await mkdir(path, { recursive: true })
     await writeFile(join(second, 'skill-gap.md'), 'SKILL 没写库存服务的超时阈值')
     await improver.inspect({ ...task, workDir: second, question: '库存扣减超时', output: '根因：库存服务慢', logs: ['/logs/order.log', '/logs/stock.log'] })
     // An analysis without a gap record is not an improvement point by itself.
     await improver.inspect({ ...task, workDir: quiet, question: '无关问题', output: '正常' })
     // An unusable gap record drops only its own analysis.
-    const broken = join(root, 'project', '.logalyze', 'runs', 'r4', '1-order-service')
+    const broken = join(root, 'project', '.supervisor', 'runs', 'r4', '1-order-service')
     await mkdir(broken, { recursive: true })
     await writeFile(join(broken, 'skill-gap.md'), '')
     expect(await improver.inspect({ ...task, workDir: broken, question: '记录损坏', output: '?' })).toEqual({ ok: false, error: 'skill-gap.md 是空的' })
@@ -417,12 +431,13 @@ describe('logalyze_improve_skill', () => {
       improver.turnEnded('parent')
       repos.service.pushError = error
       const again = improver.execute({ app: 'order-service', workDirs: [task.workDir] }, exec)
-      await finishChild(started, index, { [IN_SKILL(CASE)]: '# c\n' })
+      // Later improvements of the Session continue its branch, so each one changes the case again.
+      await finishChild(started, index, { [IN_SKILL(CASE)]: `# c${index}\n` })
       return await again
     }
     const exists = await attempt(1, repoError('conflict', '远端分支已经变化'))
     expect(exists.status).toBe('exists')
-    expect(exists.branch).not.toBe(pushed.branch)
+    expect(exists.branch).toBe(pushed.branch)
     expect(renderImproveValue(exists)[0]?.text).toContain('在远端已有其他提交')
     const rejected = await attempt(2, declinedError('rejected'))
     expect(rejected.status).toBe('rejected')
@@ -475,13 +490,48 @@ describe('logalyze_improve_skill', () => {
     expect(repos.workspacePush).not.toHaveBeenCalled()
   })
 
+  /** Give the origin a `dev` branch whose description is changed by `edit`, and make it the catalog's baseline while the analysis reads `main`. */
+  async function baselineBranch({ origin, repos }: Setup, edit: (manifest: string) => string, renameSkill: boolean): Promise<void> {
+    git(origin, 'checkout', '-q', '-b', 'dev')
+    if (renameSkill) {
+      git(origin, 'mv', '.agents/skills/log-analysis', '.agents/skills/logs-v2')
+      const skillPath = join(origin, '.agents/skills/logs-v2/SKILL.md')
+      await writeFile(skillPath, (await readFile(skillPath, 'utf8')).replace('name: log-analysis', 'name: logs-v2'))
+    }
+    const manifestPath = join(origin, '.agents/logalyze.yaml')
+    await writeFile(manifestPath, edit(await readFile(manifestPath, 'utf8')))
+    git(origin, 'add', '-A')
+    git(origin, 'commit', '-qm', 'baseline change')
+    git(origin, 'checkout', '-q', 'main')
+    repos.service.catalog = [{ id: '000000000001', url: origin, base: 'dev', access: 'write', features: [{ id: 'log-analysis', branch: 'main' }] }]
+  }
+
+  it('improves the SKILL the baseline branch names when it differs from the analysed branch', async () => {
+    const context = await setup()
+    const { improver, agent, started } = context
+    await baselineBranch(context, manifest => manifest.replace('skill: log-analysis', 'skill: logs-v2'), true)
+    const running = improver.execute({ app: 'order-service' }, { signal: new AbortController().signal, agent })
+    await waitForStarts(started, 1)
+    expect(started[0]?.spec.prompt[0]?.text).toContain('.agents/skills/logs-v2/')
+    await finishChild(started, 0, { '.agents/skills/logs-v2/cases/2026-10-31-trace-id.md': '# c\n' })
+    expect(await running).toMatchObject({ status: 'opened', target: 'dev', files: [{ path: '.agents/skills/logs-v2/cases/2026-10-31-trace-id.md' }] })
+  })
+
+  it('stops before starting a child when the baseline branch describes another application', async () => {
+    const context = await setup()
+    const { improver, agent, started } = context
+    await baselineBranch(context, manifest => manifest.replace('id: order-service', 'id: other-service'), false)
+    await expect(improver.execute({ app: 'order-service' }, { signal: new AbortController().signal, agent })).rejects.toThrow('声明的是应用「other-service」')
+    expect(started).toHaveLength(0)
+  })
+
   it('tells the child when the repository moved on since the analysis', async () => {
     const { task, improver, agent, started } = await setup()
     await improver.inspect({ ...task, commit: 'a'.repeat(40) })
     improver.turnEnded('parent')
     const running = improver.execute({ app: 'order-service' }, { signal: new AbortController().signal, agent })
     await waitForStarts(started, 1)
-    expect(started[0]?.spec.prompt[0]?.text).toContain(`这次分析时的提交是 \`${'a'.repeat(12)}\`，之后仓库有更新`)
+    expect(started[0]?.spec.prompt[0]?.text).toContain(`这次分析时的提交是 \`${'a'.repeat(12)}\`，和工作区的提交不同`)
     started[0]?.settle({ stopReason: 'completed', output: [] })
     expect((await running).status).toBe('failed')
   })
@@ -525,13 +575,13 @@ describe('logalyze_improve_skill', () => {
     expect(value).toMatchObject({ status: 'opened', files: [{ path: SKILL, added: 2, removed: 0 }] })
     expect(value.workDirs).toBeUndefined()
     const [push] = repos.service.pushes
-    expect(push?.message).toBe('chore: 修正日志时区说明\n\nfix(skill)!: 修正日志时区说明\n\n- SKILL.md：时间是 UTC\n\nProposed-by: 观象 Logalyze\n')
+    expect(push?.message).toBe('chore: 修正日志时区说明\n\nfix(skill)!: 修正日志时区说明\n\n- SKILL.md：时间是 UTC\n\nProposed-by: 智能监管 Supervisor\n')
     expect(push?.session).toBe('parent')
     expect(repos.openMr).toHaveBeenCalledWith(expect.objectContaining({ repo: origin, title: 'chore: 修正日志时区说明', body: expect.stringMatching(/^由观象按用户反馈提出（应用 order-service，会话 parent）。请评审 SKILL 修改。/) }))
   })
 })
 
-describe('logalyze_show_skill', () => {
+describe('supervisor_show_skill', () => {
   it('shows the SKILL file list and a file from the latest synced commit', async () => {
     const { origin, registry, repos } = await setup()
     const viewer = new SkillViewer({ registry, repos: new ReposClient(() => repos.service) })

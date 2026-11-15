@@ -1,5 +1,5 @@
 /**
- * `logalyze_improve_skill`：用户在对话中同意改进某个应用的日志分析 SKILL 后，
+ * `supervisor_improve_skill`：用户在对话中同意改进某个应用的日志分析 SKILL 后，
  * 派一个改进子 Agent 把该应用的所有改进点一次改进完（需要时把问题整理为案例），
  * 再提交到新分支、创建合并请求供用户评审。父 Agent 只在用户于对话中同意后调用；
  * 推送前 dsh-repo 按它的写操作设置可能再请用户批准一次。只改进仓库清单中可写
@@ -20,9 +20,9 @@
  *
  * 其余规则：
  *
- * - 观象在新的运行目录 `.logalyze/runs/<runId>/improve-<序号>/repo/` 从应用最新
- *   同步提交创建工作区，推送分支为新的 `logalyze/skill-<应用 id>-<runId>`；改进
- *   子 Agent 以它为工作目录、首行 `/logalyze-improve`，
+ * - 观象在新的运行目录 `.supervisor/runs/<runId>/improve-<序号>/repo/` 从应用最新
+ *   同步提交创建工作区，推送分支由 `dsh-repo` 生成；改进
+ *   子 Agent 以它为工作目录、首行 `/supervisor-improve`，
  *   直接修改 `.agents/skills/<skill>/`，改动说明写在工作区之外的
  *   `improve-<序号>/reason.md`；超时（`dispatchTimeoutMs`）或调用被取消时停止它。
  * - 改动只能是 `.agents/skills/<skill>/` 下新增或修改的文件；依据分析时必须新增
@@ -30,13 +30,14 @@
  *   分支并创建合并请求，从不推送到已有分支或默认分支。
  * - 工作区、推送和合并请求经 `dshRepos` 服务完成。子会话中不提供本工具。
  *
- * @module dsh-logalyze/improve/tool
+ * @module dsh-supervisor/improve/tool
  */
 
 import { randomBytes } from 'node:crypto'
-import { basename, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { z } from 'zod'
-import { disablesUserInvocation, skillDir, skillNameOf } from '../apps/manifest.ts'
+import { checkAppManifest, disablesUserInvocation, skillDir, skillNameOf } from '../apps/manifest.ts'
+import { MAX_REPO_FILE_BYTES, treeReader } from '../apps/tree.ts'
 import type { RepoRegistry } from '../apps/registry.ts'
 import { describeIssue } from '../config.ts'
 import type { ReposClient } from '../deps/repos.ts'
@@ -397,6 +398,7 @@ export class SkillImprover {
     const settings = this.deps.settings()
     const { feedback } = args
     const { app, url, writable } = this.deps.registry.readyApp(args.app)
+    if (app.skill === undefined) throw new Error(`应用「${app.id}」没有旧版 SKILL 改进目标；仍可直接分析日志与代码，创建初版 SKILL 待知识改进功能接入`)
     if (!writable) throw new Error(`应用「${app.id}」的仓库在 dsh-repo 仓库清单中的权限是「只读」，观象不能推送 SKILL 改进；请在 dsh-repo「代码仓库 → 仓库」把权限改为「可改代码」，或由仓库维护者自己修改 SKILL`)
     const turn = this.turnOf(sessionId)
     const analyzed = [...this.tasks.values()].filter(record => record.task.sessionId === sessionId && record.task.app.id === app.id)
@@ -435,23 +437,24 @@ export class SkillImprover {
     const { bases, feedback } = request
     const tasks = bases.map(basis => basis.record.task)
     const caseRequired = tasks.length > 0
-    const { app, url, commit } = this.deps.registry.readyApp(request.app.id)
-    const base = this.deps.registry.branchOf(url)
+    const { app: analyzed, url } = this.deps.registry.readyApp(request.app.id)
     const improveDir = join(request.parentDir, `improve-${randomBytes(3).toString('hex')}`)
     const { workspace, repoDir, logs: extra } = await openWorkspace({
       repos: this.deps.repos,
       parent,
       exec,
       repo: url,
-      base,
-      commit,
-      branch: `logalyze/skill-${app.id}-${basename(request.parentDir)}`,
       workDir: improveDir,
       sources: request.sources,
       download: settings.download,
       ...this.deps.fetch === undefined ? {} : { fetch: this.deps.fetch },
-      subject: `应用「${app.id}」`,
+      subject: `应用「${analyzed.id}」`,
     })
+    // The workspace starts from the baseline branch, whose description may name another SKILL than the analysed branch.
+    const baseline = await checkAppManifest(treeReader(repoDir, MAX_REPO_FILE_BYTES))
+    if (!baseline.ok) throw new Error(`基线分支 ${workspace.base} 上应用「${analyzed.id}」的描述或 SKILL 不可用：${baseline.error}；先在基线分支上修好再改进 SKILL`)
+    if (baseline.app.id !== analyzed.id) throw new Error(`基线分支 ${workspace.base} 上的应用描述声明的是应用「${baseline.app.id}」，不是「${analyzed.id}」；先让两个分支的应用描述一致再改进 SKILL`)
+    const { app } = baseline
     const logs: ChildLog[] = [...distinct(tasks.flatMap(task => task.logs)).map(path => ({ path })), ...extra]
     const analyses: ImproveAnalysis[] = bases.map(({ record: { task }, gap }) => ({
       commit: task.commit,
@@ -462,7 +465,7 @@ export class SkillImprover {
     }))
     const prompt = renderImprovePrompt({
       app,
-      commit,
+      commit: workspace.baseCommit,
       analyses,
       ...feedback === undefined ? {} : { feedback },
       logs,
@@ -509,7 +512,7 @@ export class SkillImprover {
       exec,
       agent: parent,
       dir: repoDir,
-      message: `${title}\n\n${reason}\n\nProposed-by: 观象 Logalyze\n${commits.map(sha => `Analyzed-commit: ${sha}\n`).join('')}`,
+      message: `${title}\n\n${reason}\n\nProposed-by: 智能监管 Supervisor\n${commits.map(sha => `Analyzed-commit: ${sha}\n`).join('')}`,
       title,
       body: `${origin}。请评审${caseRequired ? '案例和 ' : ' '}SKILL 修改。\n\n${reason.slice(0, REASON_DESCRIPTION_CHARS)}`,
     })

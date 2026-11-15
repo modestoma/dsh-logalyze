@@ -1,12 +1,12 @@
 /**
- * SKILL 改进子 Agent 的首条消息。首行的 `/logalyze-improve` 由 DSH 的 skill
+ * SKILL 改进子 Agent 的首条消息。首行的 `/supervisor-improve` 由 DSH 的 skill
  * 手势确定性注入观象自带的改进指南（怎样写案例、怎样改 SKILL）；其余部分只
  * 给出本次运行的信息：应用、改进的依据（本会话中该应用的若干次分析的问题、
  * 结论与 SKILL 不足记录，以及用户的反馈）、日志、工作区与运行目录和文件数上限。
  * 同一应用的所有改进点在这一个子 Agent 中一次完成。子 Agent 的工作目录是可写
  * 工作区，它直接修改其中的 SKILL 目录。
  *
- * @module dsh-logalyze/improve/prompt
+ * @module dsh-supervisor/improve/prompt
  */
 
 import { skillDir } from '../apps/manifest.ts'
@@ -53,7 +53,7 @@ export interface ImprovePromptInput {
 }
 
 function analysisSection(analysis: ImproveAnalysis, index: number, commit: string): string {
-  const version = analysis.commit === commit ? '' : `\n\n这次分析时的提交是 \`${analysis.commit.slice(0, 12)}\`，之后仓库有更新；以当前工作区中的 SKILL 为准修改。`
+  const version = analysis.commit === commit ? '' : `\n\n这次分析时的提交是 \`${analysis.commit.slice(0, 12)}\`，和工作区的提交不同（仓库有更新，或分析读的分支不是基线分支）；以当前工作区中的 SKILL 为准修改。`
   const gap = analysis.gapPath === undefined
     ? '分析子 Agent 当时没有发现 SKILL 的不足，是按 SKILL 现有的记录分析的；改进的依据是下面的用户反馈。'
     : `分析子 Agent 认为 SKILL 没能很好地覆盖这个问题，记录写在 \`${analysis.gapPath}\`，先读它。`
@@ -86,10 +86,11 @@ function originOf(analyses: readonly ImproveAnalysis[]): string {
 /**
  * Render the improvement child's first message.
  * @param input - application, the basis of the improvement, and writable directory.
- * @returns prompt text whose first line is the `/logalyze-improve` gesture.
+ * @returns prompt text whose first line is the `/supervisor-improve` gesture.
  */
 export function renderImprovePrompt(input: ImprovePromptInput): string {
   const { app, commit, analyses, feedback, logs, workDir, maxFiles, caseRequired, date } = input
+  if (app.skill === undefined) throw new Error('没有可改进的现有 SKILL')
   const dir = skillDir(app.skill)
   const logSection = logs.length === 0
     ? ''

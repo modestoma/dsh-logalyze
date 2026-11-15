@@ -5,6 +5,8 @@ import { basename, dirname, join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { resolveConfig, defaultsOf } from '../src/config.ts'
 import { Dispatcher, renderDispatchValue } from '../src/dispatch/tool.ts'
+import type { DispatchDeps } from '../src/dispatch/tool.ts'
+import type { PlatformLogRef } from '../src/runs/logs.ts'
 import type { Agent, SubagentActivation, SubagentResult, SubagentService } from '../src/host.ts'
 import { RepoRegistry } from '../src/apps/registry.ts'
 import type { EditableSettings } from '../src/settings/contract.ts'
@@ -51,7 +53,7 @@ function fakeSubagents(): { service: SubagentService; started: Started[] } {
   return { service, started }
 }
 
-async function setup(overrides: Partial<EditableSettings> = {}, gaps = false) {
+async function setup(overrides: Partial<EditableSettings> = {}, gaps = false, extra: Partial<DispatchDeps> = {}) {
   const { dir, cleanup } = await tempDir()
   cleanups.push(cleanup)
   const origin = await createAppRepo(join(dir, 'order-service'))
@@ -76,6 +78,7 @@ async function setup(overrides: Partial<EditableSettings> = {}, gaps = false) {
     provider: 'spawn',
     workingDirectory: () => ({ ensure: async () => join(project, 'sample-logs') }),
     now: () => new Date(2026, 9, 25, 9, 30, 0),
+    ...extra,
   })
   const parent: Agent = { id: 'parent', session: { header: { id: 'parent', cwd: project } } }
   return { dir, project, registry, dispatcher, started, parent, settings, repos }
@@ -86,7 +89,7 @@ async function waitForStarts(started: Started[], count: number): Promise<void> {
   expect(started).toHaveLength(count)
 }
 
-describe('logalyze_dispatch', () => {
+describe('supervisor_dispatch', () => {
   it('starts one child per task in the app repository and returns every result', async () => {
     const { project, dispatcher, started, parent, registry, repos } = await setup()
     const { url, commit } = registry.status()[0]!
@@ -104,8 +107,9 @@ describe('logalyze_dispatch', () => {
     expect(child?.spec).toMatchObject({ provider: 'spawn', label: '订单服务分析', delivery: 'caller', parent, maxDepth: 1 })
     expect(child?.spec.cwd).toBe(join(repos.root, '.snapshots', basename(repos.mirrorDir(registry.status()[0]!.url)), registry.status()[0]!.commit!.slice(0, 12)))
     const prompt = child?.spec.prompt[0]?.text as string
-    expect(prompt.split('\n')[0]).toBe('/log-analysis')
-    const workDir = join(project, 'sample-logs', '.logalyze', 'runs')
+    expect(prompt).not.toMatch(/^\/log-analysis/u)
+    expect(prompt).toContain('没有适用 SKILL 时直接分析日志与代码')
+    const workDir = join(project, 'sample-logs', '.supervisor', 'runs')
     expect(prompt).toContain(`- \`${log}\``)
     expect(prompt).toContain(`（下载自 http://127.0.0.1:${port}/bucket/app.tar.gz?sig=x）；只看本应用相关部分：tag=order`)
     expect(prompt).toContain(workDir)
@@ -152,7 +156,7 @@ describe('logalyze_dispatch', () => {
     expect(value.results[1]?.skillGap).toBeUndefined()
     const text = renderDispatchValue(value)[0]?.text
     expect(text).toContain(`SKILL 不足（记录在 ${join(workDir, 'skill-gap.md')}）：SKILL 没写 traceId 字段 靠 grep 找到的`)
-    expect(text).toContain('在汇总回复末尾的「SKILL 改进建议」中用一两句说明，并问用户是否改进。本回合不要调用 logalyze_improve_skill（工具会拒绝）；用户同意后再调用，app 为 order-service。')
+    expect(text).toContain('在汇总回复末尾的「SKILL 改进建议」中用一两句说明，并问用户是否改进。本回合不要调用 supervisor_improve_skill（工具会拒绝）；用户同意后再调用，app 为 order-service。')
   })
 
   it('does not ask children of read-only repositories to record SKILL gaps', async () => {
@@ -176,6 +180,42 @@ describe('logalyze_dispatch', () => {
     const value = await running
     expect(value.results[0]?.skillGap).toEqual({ ok: false, error: 'skill-gap.md 有 20 字节，超过上限 8' })
     expect(renderDispatchValue(value)[0]?.text).toContain('SKILL 不足记录不可用：skill-gap.md 有 20 字节，超过上限 8')
+  })
+
+  it('downloads platform logs named by number in an analyze API topic, and refuses numbers elsewhere', async () => {
+    const downloads: { log: PlatformLogRef; fileName: string }[] = []
+    const logs: Record<string, PlatformLogRef> = { L1: { ref: 'L1', logId: 'id-1', fileName: 'device 1.tar.gz' } }
+    const { dispatcher, started, parent } = await setup({}, false, {
+      platformLogs: sessionId => sessionId === 'parent'
+        ? (ref) => {
+            const log = logs[ref]
+            if (log === undefined) throw new Error(`本话题没有日志 ${ref}（可用：L1）`)
+            return log
+          }
+        : undefined,
+      platform: {
+        download: async (log, dir, fileName) => {
+          downloads.push({ log, fileName })
+          await writeFile(join(dir, fileName), 'platform-log')
+          return join(dir, fileName)
+        },
+      },
+    })
+    const exec = { signal: new AbortController().signal, agent: parent }
+    await expect(dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ ref: 'L2' }] }] }, exec)).rejects.toThrow('本话题没有日志 L2')
+    await expect(dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ ref: 'x' }] }] }, exec)).rejects.toThrow('ref 是首轮消息日志表里的编号')
+    const other = { ...parent, session: { header: { ...parent.session.header, id: 'other' } } }
+    await expect(dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ ref: 'L1' }] }] }, { ...exec, agent: other })).rejects.toThrow('只能在分析接口发起的话题中使用')
+    expect(started).toHaveLength(0)
+
+    const running = dispatcher.execute({ tasks: [{ app: 'order-service', question: '分析', logs: [{ ref: 'L1', filter: 'tag=order' }] }] }, exec)
+    await waitForStarts(started, 1)
+    const prompt = started[0]?.spec.prompt[0]?.text as string
+    expect(downloads).toEqual([{ log: logs.L1, fileName: 'L1-device_1.tar.gz' }])
+    expect(prompt).toContain('/L1-device_1.tar.gz`（日志 L1，日志平台 log_id `id-1`，原文件名 device 1.tar.gz）；只看本应用相关部分：tag=order')
+    started[0]?.settle({ stopReason: 'completed', output: [{ type: 'text', text: '结论' }] })
+    const value = await running
+    expect(await readFile(value.results[0]!.logs[0]!, 'utf8')).toBe('platform-log')
   })
 
   it('rejects unknown apps, unreadable paths, disallowed URLs, and too many tasks before starting anything', async () => {

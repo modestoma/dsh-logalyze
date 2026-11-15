@@ -1,23 +1,19 @@
 /**
- * 观象对 `dshRepos` 服务（version 6）的需求：只声明观象调用的方法和读取的
- * 字段。服务在运行时经 `ctx.get('dshRepos')` 取得，由任何按这一约定提供该服务
- * 的插件实现；观象不依赖提供方的包。
+ * 智能监管中心对 `dshRepos` 服务的窄契约声明（兼容 v7 基础仓库目录/快照/工作区，并完整声明 v8 行级评审与增量感知接口）：
  *
- * 服务方维护仓库清单：只有清单里的仓库可以访问，每个仓库有权限（读、改代码、
- * 合并）和其他插件注册的功能开关。观象注册「日志分析」功能，只使用打开了这个
- * 功能的仓库。
+ * - 基础仓库清单（`repoList` / `featureRegister`）、只读快照（`snapshotAcquire`）与可写工作区
+ *   （`workspaceCreate` / `workspaceStatus` / `workspacePush`）兼容 `version: 7 | 8`。
+ * - MR 自动评审所需的增量查询、行级评审与讨论线程接口（`mrCompare` / `mrDiscussions` /
+ *   `mrReview` / `mrDiscussionReply` / `mrDiscussionResolve` / `currentBotUser`）要求 `version: 8`。
  *
- * 快照是某个提交的只读普通文件（没有 `.git`），每次取用前服务方先从远端拉取。
- * 工作区是普通 git 克隆，`origin` 经服务方的本机 git 代理访问远端；推送和合并
- * 请求由 {@link DshRepos.workspacePush} 一步完成。每个方法在预期内的失败时以
- * `name` 为 `RepoError`、带字符串 `code` 的错误拒绝（例如 `conflict` 表示远端
- * 分支已变，`declined` 表示用户没有批准，`invalid` 表示参数违反约定）。
- *
- * @module dsh-logalyze/deps/repos-contract
+ * @module dsh-supervisor/deps/repos-contract
  */
 
-/** The `dshRepos` service version this plugin calls. */
-export type DshReposVersion = 6
+/** Base `dshRepos` contract versions compatible with repository catalog, snapshots, and workspaces. */
+export type DshReposVersion = 7 | 8
+
+/** `dshRepos` contract version required for inline MR review and discussion threads. */
+export type DshReposReviewVersion = 8
 
 /** Options every call accepts. */
 export interface CallOptions {
@@ -32,10 +28,8 @@ export interface CallerAgent {
 }
 
 /**
- * Caller fields of a write made for an Agent: the provider asks
- * `access/authorize` for its Session and, while its settings say so, shows
- * the user the same approval card its own tool shows (a refusal rejects with
- * `declined`, writes turned off with `forbidden`).
+ * Caller fields of a write made for an Agent: the provider asks `access/authorize`
+ * for its Session and, while its settings say so, shows the user the approval card.
  */
 export interface AgentWriteOptions extends CallOptions {
   readonly agent: CallerAgent
@@ -44,13 +38,42 @@ export interface AgentWriteOptions extends CallOptions {
 }
 
 /**
- * The provider's settings this plugin reads. The provider has no default
- * mirror directory: while `mirrorDir` is undefined every snapshot and
- * workspace call rejects with `unavailable` and a message saying where to
- * choose one.
+ * Caller fields of a write that may run either on behalf of an Agent (`agent` set)
+ * or under the calling supervision plugin's own policy (`agent` omitted).
+ */
+export interface WriteOptions extends CallOptions {
+  readonly agent?: CallerAgent
+  readonly callId?: string
+}
+
+/** Offset paging of list methods. */
+export interface PageParams {
+  /** 1-based page; default 1. */
+  readonly page?: number
+  /** Items per page. */
+  readonly perPage?: number
+}
+
+/** One page of a list call. */
+export interface Page<T> {
+  readonly items: readonly T[]
+  /** Next page number when the page was full; absent on the last page. */
+  readonly nextPage?: number
+}
+
+/** A user as the code host shows them. */
+export interface RepoUser {
+  /** Login (GitHub) or username (GitLab). */
+  readonly username: string
+  readonly webUrl?: string
+}
+
+/**
+ * The provider's settings this plugin reads. While `mirrorDir` is undefined,
+ * every snapshot and workspace call rejects with `unavailable`.
  */
 export interface RepoPublicSettings {
-  /** Absolute directory holding the mirrors and the snapshots; undefined while none is chosen or the stored choice is unusable. */
+  /** Absolute directory holding the mirrors and snapshots; undefined while none is chosen or unusable. */
   readonly mirrorDir: string | undefined
   /** Why the provider's stored directory is not in use; absent otherwise. */
   readonly mirrorProblem?: string
@@ -58,8 +81,7 @@ export interface RepoPublicSettings {
 
 /**
  * Read-only plain files of one commit (no `.git`), shared by every holder of
- * the same repository and commit. The directory stays unchanged until
- * released; release exactly once.
+ * the same repository and commit. Release exactly once.
  */
 export interface SnapshotLease {
   /** Catalog address of the repository. */
@@ -74,21 +96,21 @@ export interface SnapshotLease {
 /** Parameters of {@link DshRepos.snapshotAcquire}. */
 export interface SnapshotAcquireParams extends CallOptions {
   readonly repo: string
-  /** Branch, tag, or full commit id; default: the catalog entry's branch, or the remote's default branch. */
+  /** Branch, tag, or full commit id; default: the catalog entry's baseline branch, or the remote's default branch. */
   readonly ref?: string
 }
 
 /** Parameters of {@link DshRepos.workspaceCreate}. */
-export interface WorkspaceCreateParams extends AgentWriteOptions {
+export interface WorkspaceCreateParams extends WriteOptions {
   readonly repo: string
   /** Absolute directory of the new workspace: missing or empty (its parent is created). */
   readonly path: string
-  /** Branch the work merges into; default: the remote's default branch. */
+  /** Branch the work starts from and merges into; default: the catalog entry's baseline branch, or the remote's default branch. */
   readonly base?: string
-  /** Full commit id on {@link base} to start from. */
+  /** Full commit id on {@link base} to start from; default: the head of {@link base}. */
   readonly commit?: string
-  /** New remote branch the workspace pushes to; created by the first push. Never the default branch, {@link base}, or a protected branch. */
-  readonly branch: string
+  /** Remote branch the workspace pushes to. */
+  readonly branch?: string
 }
 
 /** A workspace: an ordinary git clone whose `origin` reaches the remote through the provider. */
@@ -139,6 +161,19 @@ export interface WorkspacePushParams extends AgentWriteOptions {
   readonly mr?: { readonly title: string; readonly body?: string }
 }
 
+/** Parameters of `workspaceRemove`. */
+export interface WorkspaceRemoveParams extends CallOptions {
+  readonly path: string
+  readonly force?: boolean
+}
+
+/** Outcome of `workspaceRemove`. */
+export interface WorkspaceRemoveResult {
+  readonly path: string
+  readonly discardedCommits: number
+  readonly discardedChanges: boolean
+}
+
 /** A pull/merge request a push reported. */
 export interface MrSummary {
   readonly number: number
@@ -150,7 +185,7 @@ export interface WorkspacePushResult {
   readonly branch: string
   /** Commit the remote branch points to after the push. */
   readonly commit: string
-  /** Open requests from the branch after the push, including one opened for {@link WorkspacePushParams.mr}; empty for a repository on no code host. */
+  /** Open requests from the branch after the push, including one opened for {@link WorkspacePushParams.mr}. */
   readonly openMrs: readonly MrSummary[]
   /** The request opened for {@link WorkspacePushParams.mr}; absent when one was already open or none was asked for. */
   readonly createdMr?: MrSummary
@@ -171,99 +206,226 @@ export interface RepoFeature {
   readonly description?: string
 }
 
+/** A feature turned on for a catalog repository. */
+export interface RepoFeatureSwitch {
+  readonly id: string
+  /** Branch the feature uses; absent uses the entry's baseline branch. */
+  readonly branch?: string
+}
+
 /** One catalog repository, as {@link DshRepos.repoList} returns it. */
 export interface CatalogRepo {
   readonly id: string
   /** Address as the catalog stores it. */
   readonly url: string
-  /** Branch to follow; absent follows the remote's default branch. */
-  readonly branch?: string
+  /** Baseline branch: where code changes start and merge into; absent uses the remote's default branch. */
+  readonly base?: string
   readonly access: RepoAccess
-  /** Feature ids turned on for the repository. */
-  readonly features: readonly string[]
+  /** Features turned on for the repository. */
+  readonly features: readonly RepoFeatureSwitch[]
 }
 
-/**
- * Parameters of {@link DshRepos.repoAdd}. With an Agent the provider asks
- * `access/authorize` (level `admin`) for its Session and, while its settings
- * say so, shows its approval card (a refusal rejects with `declined`, writes
- * turned off with `forbidden`).
- */
-export interface RepoAddParams extends CallOptions {
-  /** HTTPS address on a configured host. */
+// ---------------------------------------------------------------------------
+// dshRepos v8 MR & Inline Review Types (01-cross-plugin-contracts.md Part B)
+// ---------------------------------------------------------------------------
+
+/** Lifecycle state of a pull or merge request. */
+export type MrState = 'open' | 'closed' | 'merged'
+
+/** Parameters naming one pull/merge request in a repository. */
+export interface NumberParams {
   readonly repo: string
-  readonly branch?: string
-  /** Access of a new entry; an existing entry keeps its access. Default `read`. */
-  readonly access?: RepoAccess
-  /** Feature ids to turn on. */
-  readonly features?: readonly string[]
-  /** The Agent the change is made for. */
-  readonly agent?: CallerAgent
-  /** The calling tool call, so the approval card shows that call. */
-  readonly callId?: string
+  readonly number: number
 }
 
-/** Outcome of {@link DshRepos.repoAdd}. */
-export interface RepoAddResult {
-  readonly status: 'added' | 'updated' | 'unchanged'
-  readonly repo: CatalogRepo
+/** One conversation comment on an issue or pull/merge request. */
+export interface CommentInfo {
+  readonly id: string
+  readonly author: RepoUser
+  readonly body: string
+  readonly createdAt: string
+  readonly webUrl?: string
 }
 
-/** The `dshRepos` methods this plugin calls. */
+/** One pull request (GitHub) or merge request (GitLab). */
+export interface MrInfo {
+  readonly number: number
+  readonly title: string
+  readonly body: string
+  readonly state: MrState
+  readonly draft: boolean
+  readonly sourceBranch: string
+  readonly targetBranch: string
+  readonly headSha: string
+  readonly author: RepoUser
+  readonly labels: readonly string[]
+  readonly assignees: readonly RepoUser[]
+  readonly createdAt: string
+  readonly updatedAt: string
+  readonly webUrl: string
+}
+
+/** A pull/merge request with its top-level conversation comments. */
+export interface MrDetail extends MrInfo {
+  readonly comments: readonly CommentInfo[]
+}
+
+/** A unified diff. */
+export interface MrDiff {
+  readonly diff: string
+  readonly truncated: boolean
+}
+
+/** Aggregated CI result. */
+export type CheckState = 'success' | 'failure' | 'pending' | 'none'
+
+/** One CI check, status, or pipeline. */
+export interface CheckInfo {
+  readonly name: string
+  readonly state: Exclude<CheckState, 'none'>
+  readonly webUrl?: string
+  readonly runId?: number
+  readonly jobId?: number
+}
+
+/** CI and merge readiness of a pull/merge request. */
+export interface MrStatus {
+  readonly headSha: string
+  readonly checks: readonly CheckInfo[]
+  readonly overall: CheckState
+  readonly mergeable?: boolean
+}
+
+/** Parameters of {@link DshReposV8.mrList} (extended in v8 with `sort` and `updatedAfter`). */
+export interface MrListParams extends PageParams {
+  readonly repo: string
+  /** Default `'open'`. */
+  readonly state?: MrState | 'all'
+  readonly sourceBranch?: string
+  readonly targetBranch?: string
+  /** v8: sort order; defaults to `'updated'` for incremental repository polling. */
+  readonly sort?: 'created' | 'updated'
+  /** v8: ISO-8601 lower bound on `updatedAt` for incremental repository polling. */
+  readonly updatedAfter?: string
+}
+
+/** Parameters of {@link DshReposV8.mrCompare}. */
+export interface MrCompareParams {
+  readonly repo: string
+  readonly baseSha: string
+  readonly headSha: string
+}
+
+/** Diff line anchor for inline review comments. */
+export interface DiffPosition {
+  /** Repository-root-relative path (`/`-separated). */
+  readonly path: string
+  /** Line number in the new version of the file (required for added/context lines; omitted for pure deletions). */
+  readonly newLine?: number
+  /** Line number in the old version of the file (required for pure deletions; optional on modified hunks). */
+  readonly oldLine?: number
+}
+
+/** A single message inside an MR discussion thread. */
+export interface DiscussionNote {
+  readonly id: string
+  readonly author: RepoUser
+  readonly body: string
+  readonly createdAt: string
+  readonly updatedAt?: string
+  readonly webUrl?: string
+}
+
+/** An inline code review thread or resolvable top-level discussion thread on a PR/MR. */
+export interface MrDiscussion {
+  /** Unique thread id (GitHub reviewThread GraphQL node id / GitLab discussion id). */
+  readonly id: string
+  /** `true` for diff-anchored inline code threads; `false` for general conversation threads. */
+  readonly inline: boolean
+  /** Diff line anchor when `inline` is `true`. */
+  readonly position?: DiffPosition
+  /** Whether the host supports resolving this thread and whether it is currently resolved. */
+  readonly resolvable: boolean
+  readonly resolved: boolean
+  readonly resolvedBy?: RepoUser
+  /** Chronological messages in the thread (`[0]` started the thread). */
+  readonly notes: readonly DiscussionNote[]
+}
+
+/** Parameters of {@link DshReposV8.mrDiscussions}. */
+export interface MrDiscussionsParams extends NumberParams, PageParams {
+  readonly onlyUnresolved?: boolean
+}
+
+/** Overall verdict of a structured code review submission. */
+export type ReviewVerdict = 'comment' | 'approve' | 'request-changes'
+
+/** One pending inline review comment to publish atomically with a review. */
+export interface DraftInlineComment extends DiffPosition {
+  readonly body: string
+}
+
+/** Parameters of {@link DshReposV8.mrReview}. */
+export interface MrReviewParams extends NumberParams {
+  /** Head commit SHA the review was conducted against. */
+  readonly headSha: string
+  /** Review verdict; automatically downgraded to `'comment'` on self-authored MRs (`downgradedVerdict: true`). */
+  readonly verdict: ReviewVerdict
+  /** Overall review summary Markdown (optional only when `verdict === 'comment'` and `comments` is non-empty). */
+  readonly body?: string
+  /** Inline diff comments (at most 50). */
+  readonly comments?: readonly DraftInlineComment[]
+}
+
+/** Outcome of {@link DshReposV8.mrReview}. */
+export interface MrReviewResult {
+  readonly verdict: ReviewVerdict
+  /** `true` when `approve` or `request-changes` was downgraded to `comment` due to self-review restrictions. */
+  readonly downgradedVerdict?: boolean
+  readonly postedComments: number
+  /** Number of inline comments folded into the summary body because their lines fell outside remote diff hunks. */
+  readonly fallbackInlineCount: number
+  readonly webUrl?: string
+}
+
+/** Parameters of {@link DshReposV8.mrDiscussionReply}. */
+export interface MrDiscussionReplyParams extends NumberParams {
+  readonly discussionId: string
+  readonly body: string
+}
+
+/** Parameters of {@link DshReposV8.mrDiscussionResolve}. */
+export interface MrDiscussionResolveParams extends NumberParams {
+  readonly discussionId: string
+  readonly resolved: boolean
+}
+
+/** Base `dshRepos` methods compatible across v7 and v8. */
 export interface DshRepos {
   readonly version: DshReposVersion
-  /**
-   * The catalog repositories.
-   * @param params - `feature` lists only the repositories with that feature turned on.
-   * @returns the repositories in catalog order.
-   */
   repoList(params?: { readonly feature?: string } & CallOptions): Promise<readonly CatalogRepo[]>
-  /**
-   * Register a feature; the provider's settings page shows a switch for it on every repository.
-   * @returns disposer that withdraws the registration.
-   */
   featureRegister(feature: RepoFeature): () => void
-  /**
-   * Observe catalog changes.
-   * @param listener - runs after each change.
-   * @returns disposer that stops the observation.
-   */
   repoOnChange(listener: () => void): () => void
-  /**
-   * Add a repository to the catalog, or turn features on for the entry holding it.
-   * @returns the outcome and the entry.
-   * @throws `conflict` when the entry follows another branch; `not-allowed` for an address on an unconfigured host; with an Agent, `declined` when the user did not approve and `forbidden` when writes are off or `access/authorize` refused.
-   */
-  repoAdd(params: RepoAddParams): Promise<RepoAddResult>
-  /** @returns the settings this plugin reads. */
   settingsGet(): RepoPublicSettings
-  /**
-   * Observe host, token, and mirror directory changes that can change what a snapshot can reach.
-   * @param listener - runs after each change.
-   * @returns disposer that stops the observation.
-   */
   hostOnChange(listener: () => void): () => void
-  /**
-   * Fetch the repository and hold read-only files of a commit.
-   * @returns the lease, naming the commit the ref resolved to.
-   * @throws `not-found` for a missing ref, `unavailable` while no mirror directory is set or git fails.
-   */
   snapshotAcquire(params: SnapshotAcquireParams): Promise<SnapshotLease>
-  /**
-   * Clone the repository into a new workspace and check out its branch at the start commit.
-   * @returns the workspace.
-   * @throws `invalid` for a bad path, branch, or commit; `not-found` for a missing base or commit.
-   */
   workspaceCreate(params: WorkspaceCreateParams): Promise<WorkspaceInfo>
-  /**
-   * Describe what a workspace changed since its start commit.
-   * @throws `not-found` when the path is not a workspace.
-   */
   workspaceStatus(params: { readonly path: string } & CallOptions): Promise<WorkspaceStatus>
-  /**
-   * Commit the uncommitted changes, push the workspace to its branch, and with `mr` open a request unless one is open; the provider authorizes and approves it for the Agent.
-   * @returns the push outcome.
-   * @throws `declined` when the user did not approve; `conflict` when the remote branch moved; `invalid` for nothing to push; `forbidden` when the host or `access/authorize` refused.
-   */
   workspacePush(params: WorkspacePushParams): Promise<WorkspacePushResult>
+  workspaceRemove?(params: WorkspaceRemoveParams): Promise<WorkspaceRemoveResult>
+}
+
+/** Full `dshRepos` v8 contract including MR incremental polling, inline reviews, and discussion management. */
+export interface DshReposV8 extends DshRepos {
+  readonly version: DshReposReviewVersion
+  mrList(params: MrListParams & CallOptions): Promise<Page<MrInfo>>
+  mrGet(params: NumberParams & CallOptions): Promise<MrDetail>
+  mrDiff(params: NumberParams & CallOptions): Promise<MrDiff>
+  mrStatus(params: NumberParams & CallOptions): Promise<MrStatus>
+  mrCompare(params: MrCompareParams & CallOptions): Promise<MrDiff>
+  mrDiscussions(params: MrDiscussionsParams & CallOptions): Promise<Page<MrDiscussion>>
+  mrReview(params: MrReviewParams & WriteOptions): Promise<MrReviewResult>
+  mrDiscussionReply(params: MrDiscussionReplyParams & WriteOptions): Promise<DiscussionNote>
+  mrDiscussionResolve(params: MrDiscussionResolveParams & WriteOptions): Promise<unknown>
+  currentBotUser(params: { readonly repo: string } & CallOptions): Promise<RepoUser>
 }

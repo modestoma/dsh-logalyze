@@ -1,21 +1,21 @@
 /**
- * `/logalyze` 入口 SKILL：用户可以显式调用；开启自动加载且有可用应用时，
+ * `/supervisor` 入口 SKILL：用户可以显式调用；开启自动加载且有可用应用时，
  * 顶层 Agent 也能在任务匹配时自行加载。目录描述列出已就绪的应用，正文中的
  * 应用目录在每次加载时由已就绪仓库的应用描述生成。
  *
- * @module dsh-logalyze/skill/entry
+ * @module dsh-supervisor/skill/entry
  */
 
 import type { SkillDefinition, SkillProvider, SkillProviderControl } from '../host.ts'
 import type { AppManifest } from '../settings/contract.ts'
 import type { BundledSkill } from './bundled.ts'
-import { ADD_REPO_TOOL_NAME, DISPATCH_TOOL_NAME, IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from '../tool-names.ts'
+import { DISPATCH_TOOL_NAME, IMPROVE_TOOL_NAME, SHOW_TOOL_NAME } from '../tool-names.ts'
 
-/** Entry skill name, addressed as `/logalyze`. */
-export const ENTRY_SKILL_NAME = 'logalyze'
+/** Entry skill name, addressed as `/supervisor`. */
+export const ENTRY_SKILL_NAME = 'supervisor'
 
 /** Skill provider name in `ctx.skills`. */
-export const SKILL_PROVIDER_NAME = 'dsh-logalyze'
+export const SKILL_PROVIDER_NAME = 'dsh-supervisor'
 
 /** DSH's precedence rank for packaged skill providers (`BUNDLED_SKILL_RANK`). */
 export const BUNDLED_SKILL_RANK = 600
@@ -35,7 +35,7 @@ const AUTO_DESCRIPTION_TAIL = '。日志与这些应用无关时不要使用。'
  * @returns the description.
  */
 export function describeApps(apps: readonly AppManifest[]): string {
-  const items = apps.map(app => `${app.name}（${[app.id, ...app.aliases, ...app.logHints].join('、')}）`)
+  const items = apps.map(app => `${app.name}（${[app.id, ...app.aliases, ...app.logHints].join('、')}）${app.description === '' ? '' : `：${app.description}`}`)
   for (let shown = items.length; shown > 0; shown -= 1) {
     const rest = items.length - shown
     const list = items.slice(0, shown).join('；') + (rest === 0 ? '' : `；另有 ${rest} 个应用`)
@@ -56,7 +56,7 @@ function cell(text: string): string {
  */
 export function renderCatalog(apps: readonly AppManifest[]): string {
   if (apps.length === 0) {
-    return `当前没有可用的应用，不要自行分析日志。用户给出了应用代码仓库的 https 地址时，用 \`${ADD_REPO_TOOL_NAME}\` 添加并按工具结果继续；否则请用户提供仓库的 https 地址（不支持 ssh 地址和本机路径），或在 dsh-repo 的「代码仓库 → 仓库」中添加仓库并打开「日志分析」，然后结束本次回复。`
+    return '当前没有可用的应用，不要自行分析日志。告诉用户：应用的代码仓库要由管理员在 dsh-repo 的「代码仓库 → 仓库」中添加，并打开「日志分析」；然后结束本次回复。'
   }
   const rows = apps.map(app => `| \`${app.id}\` | ${cell(app.name)} | ${cell(app.description)} | ${cell(app.aliases.join('、') || '—')} | ${cell(app.logHints.map(hint => `\`${hint}\``).join(' ') || '—')} |`)
   return ['| 应用 id | 名称 | 描述 | 别名 | 日志特征 |', '| --- | --- | --- | --- | --- |', ...rows].join('\n')
@@ -90,19 +90,22 @@ export function renderEntrySkill(apps: readonly AppManifest[], maxAppsPerRequest
 
 ${renderCatalog(apps)}
 
+仓库无需 manifest 或指定 SKILL。描述与触发别名在智能监管设置中维护，仓库开关与分支在 dsh-repo 中维护。分析者通过 DSH 的 SKILL 目录按适用性加载；没有适用 SKILL 时直接读取日志与代码。需要创建初版 SKILL 时说明该功能待知识改进接入，不起草旧接入文件。
+
 ## 步骤
 
-1. **读需求。** 从 \`/logalyze\` 之后的文字、消息附带的附件、消息里的下载 URL 中找出：要分析的现象、时间范围、关键标识（用户 id、订单号、请求 id 等）、日志位置。
+1. **读需求。** 从 \`/supervisor\` 之后的文字、消息附带的附件、消息里的下载 URL 中找出：要分析的现象、时间范围、关键标识（用户 id、订单号、请求 id 等）、日志位置。
 2. **确定应用。** 拆分单位是「日志来源 → 应用」。
-   - 用户或调用方已经写明应用 id 时直接使用；该 id 不在上表中时，告诉用户这个应用未注册（列出可用的应用 id），然后结束，不要改用别的应用。用户给出了该应用的 git 地址时，可以用 \`${ADD_REPO_TOOL_NAME}\` 接入。
+   - 首轮消息是分析接口生成的（列出了应用 id 和日志编号表）时，应用已经确定，按其中的「分析要求」派发，不要再按日志内容判断。
+   - 用户或调用方已经写明应用 id 时直接使用；该 id 不在上表中时，告诉用户这个应用未注册（列出可用的应用 id），然后结束，不要改用别的应用。要接入新应用，请管理员在「代码仓库 → 仓库」中添加它的仓库并打开「日志分析」。
    - 否则按名称、别名、描述和日志特征匹配。只有附件文件名或内容能区分时，可以只看日志开头几十行来判断，不要通读或解压整个日志。
-   - 用户没有输入 \`/logalyze\`、是你按任务匹配自行加载了本 SKILL，而日志明显不属于上表任何应用时，不要派发也不要追问，按普通方式完成用户的请求。
+   - 用户没有输入 \`/supervisor\`、是你按任务匹配自行加载了本 SKILL，而日志明显不属于上表任何应用时，不要派发也不要追问，按普通方式完成用户的请求。
    - 其余无法确定或同时匹配多个应用的情况，用 \`ask_user_question\`（不可用时直接在回复中提问并结束）让用户选择，不要猜。
    - 一个文件混有多个应用的输出时，把同一路径分别交给各应用，并在 \`filter\` 里写明区分方式（tag、进程名等）。
 3. **派发。** 一次调用 \`${DISPATCH_TOOL_NAME}\`，把所有任务放进 \`tasks\`（最多 ${maxAppsPerRequest} 个）：
    - \`app\`：上表中的应用 id。
    - \`question\`：给子 Agent 的完整问题。子 Agent 看不到本对话，要写清现象、时间、关键标识和用户的原话要点。
-   - \`logs\`：每项是 \`{ "path": 绝对路径 }\`（附件、本机文件）或 \`{ "url": 下载地址 }\`（对象存储链接，由工具下载），可加 \`filter\`。
+   - \`logs\`：每项是 \`{ "path": 绝对路径 }\`（附件、本机文件）、\`{ "url": 下载地址 }\`（对象存储链接，由工具下载）或 \`{ "ref": "L1" }\`（分析接口话题首轮消息日志表里的编号，由工具向日志平台取链接下载），可加 \`filter\`。
    - 没有任何日志时，先向用户要日志，不要派发。
    工具会等待全部子 Agent 结束后一次返回结果。工具报错（应用不可用、路径不存在、域名不在白名单等）时，把原因告诉用户，不要绕过。
 4. **汇总回复。** 按下面的格式写最终回复：
@@ -142,7 +145,7 @@ export interface EntrySkillSource {
   maxAppsPerRequest(): number
   /** Whether SKILL improvement is enabled. */
   skillUpdates(): boolean
-  /** Whether top-level agents may load the skill without `/logalyze`. */
+  /** Whether top-level agents may load the skill without `/supervisor`. */
   readonly autoInvoke: boolean
   /**
    * Whether a lookup directory lies where children work (the repository
@@ -156,9 +159,9 @@ export interface EntrySkillSource {
 }
 
 /**
- * Build the skill provider serving `/logalyze` and the bundled guide skills.
+ * Build the skill provider serving `/supervisor` and the bundled guide skills.
  * The bundled skills are listed in every directory, including the snapshots
- * and workspaces children work in, where `/logalyze` is not listed.
+ * and workspaces children work in, where `/supervisor` is not listed.
  * @param source - live registry view and the bundled skills.
  * @returns a provider factory for `ctx.skills.registerProvider`, plus the
  *   hook to call after the usable applications may have changed; it
@@ -188,7 +191,7 @@ export function createEntrySkillProvider(source: EntrySkillSource): {
     return {
       name: ENTRY_SKILL_NAME,
       description: automatic ? describeApps(apps) : MANUAL_DESCRIPTION,
-      whenToUse: automatic ? '用户输入 /logalyze，或要分析、排查描述中所列应用的日志时使用。' : '仅在用户输入 /logalyze 时使用。',
+      whenToUse: automatic ? '用户输入 /supervisor，或要分析、排查描述中所列应用的日志时使用。' : '仅在用户输入 /supervisor 时使用。',
       invocation: { modelInvocable: automatic, userInvocable: true },
       source: 'bundled',
       provider: SKILL_PROVIDER_NAME,

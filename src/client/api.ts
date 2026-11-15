@@ -1,11 +1,11 @@
 /**
- * 设置面板的同源 HTTP 客户端，直接请求 Host 半侧注册的 `/logalyze/*` 路由。
+ * 设置面板的同源 HTTP 客户端，直接请求 Host 半侧注册的 `/supervisor/*` 路由。
  *
- * @module dsh-logalyze/client/api
+ * @module dsh-supervisor/client/api
  */
 
-import { REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
-import type { EditableSettings, MutationError, MutationOk, StateWire } from '../settings/contract.ts'
+import { APPLICATION_ROUTE, BREAKER_RESET_ROUTE, ISSUE_CHECK_ROUTE, ISSUE_SYNC_ROUTE, LOG_WATERMARK_ROUTE, OUTBOX_RETRY_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from '../settings/contract.ts'
+import type { ApplicationMetadata, BreakerStatusWire, EditableSettings, MutationError, MutationOk, StateWire } from '../settings/contract.ts'
 
 /**
  * Error text of a value thrown by a request.
@@ -68,15 +68,6 @@ export async function resetSettings(): Promise<StateWire> {
 }
 
 /**
- * Re-sync one repository or all of them.
- * @param url - repository address; omitted syncs all.
- * @returns the state right after the sync started.
- */
-export async function syncRepos(url?: string): Promise<StateWire> {
-  return (await request<MutationOk>(SYNC_ROUTE, { method: 'POST', body: JSON.stringify(url === undefined ? {} : { url }) })).state
-}
-
-/**
  * Store the analyze token in DSH's credential store.
  * @param tokenEnv - the analyze token's credential reference.
  * @param value - token value.
@@ -102,4 +93,34 @@ export async function clearToken(tokenEnv: string): Promise<StateWire> {
  */
 export async function retryReport(id: string): Promise<StateWire> {
   return (await request<MutationOk>(REPORT_UPLOAD_ROUTE, { method: 'POST', body: JSON.stringify({ id }) })).state
+}
+
+/** Save the description and aliases of one enabled catalog repository. */
+export async function saveApplication(url: string, metadata: ApplicationMetadata): Promise<StateWire> {
+  return (await request<MutationOk>(APPLICATION_ROUTE, { method: 'PUT', body: JSON.stringify({ url, ...metadata }) })).state
+}
+
+/** Reset a tripped or active supervision circuit breaker and resume blocked work. */
+export async function resetBreaker(scope: BreakerStatusWire['scope'], key: string): Promise<StateWire> {
+  return (await request<MutationOk>(BREAKER_RESET_ROUTE, { method: 'POST', body: JSON.stringify({ scope, key }) })).state
+}
+
+/** Pause, resume, or rewind the automatic log-platform polling watermark. */
+export async function updateLogWatermark(payload: { action: 'pause' | 'resume' | 'rewind'; cursorTime?: string }): Promise<StateWire> {
+  return (await request<MutationOk>(LOG_WATERMARK_ROUTE, { method: 'POST', body: JSON.stringify(payload) })).state
+}
+
+/** Retry one or all dead-letter platform outbox uploads immediately. */
+export async function retryOutboxDead(key?: string): Promise<StateWire> {
+  return (await request<MutationOk>(OUTBOX_RETRY_ROUTE, { method: 'POST', body: JSON.stringify(key === undefined ? {} : { key }) })).state
+}
+
+/** Manually trigger one Known Issues <-> Feishu Bitable two-way sync pass. */
+export async function syncIssues(): Promise<StateWire> {
+  return (await request<MutationOk>(ISSUE_SYNC_ROUTE, { method: 'POST', body: '{}' })).state
+}
+
+/** Inspect a Feishu Bitable table schema and field mappings against Known Issues columns. */
+export async function checkIssuesBitable(payload: { bitableUrl?: string; table?: string }): Promise<StateWire> {
+  return (await request<MutationOk>(ISSUE_CHECK_ROUTE, { method: 'POST', body: JSON.stringify(payload) })).state
 }

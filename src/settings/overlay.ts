@@ -1,26 +1,27 @@
 /**
- * 面板覆盖文件 `$DSH_HOME/logalyze/settings.json` 的读写。文件只保存与
+ * 面板覆盖文件 `$DSH_HOME/supervisor/settings.json` 的读写。文件只保存与
  * cordis.yml 默认值不同的字段；写入先落临时文件再改名，读到的内容按与
  * 配置相同的规则校验。
  *
- * @module dsh-logalyze/settings/overlay
+ * @module dsh-supervisor/settings/overlay
  */
 
 import { mkdir, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { describeIssue, overlaySchema, resolveDshHome } from '../config.ts'
+import { describeIssue, overlaySchema } from '../config.ts'
 import type { SettingsOverlay } from '../config.ts'
 import { replaceFile } from '../util/files.ts'
 import { EDITABLE_KEYS } from './contract.ts'
 import type { EditableKey, EditableSettings } from './contract.ts'
+import { defaultSupervisorDataDir } from './legacy-migration.ts'
 
 /**
  * Default overlay path.
  * @param env - process environment.
- * @returns `$DSH_HOME/logalyze/settings.json`.
+ * @returns `$DSH_HOME/supervisor/settings.json`.
  */
 export function defaultOverlayPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(resolveDshHome(env), 'logalyze', 'settings.json')
+  return join(defaultSupervisorDataDir(env), 'settings.json')
 }
 
 /** Result of reading the overlay file. */

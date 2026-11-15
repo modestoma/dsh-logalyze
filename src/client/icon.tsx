@@ -1,11 +1,11 @@
 /**
- * 左侧栏「观象」行的装饰图标；行本身负责可访问名称（列表注册的 label）。
+ * 左侧栏「智能监管」行的装饰图标；行本身负责可访问名称（列表注册的 label）。
  *
- * @module dsh-logalyze/client/icon
+ * @module dsh-supervisor/client/icon
  */
 
 /** Owner share of `sidebar.panellist`: requested square edge and selection state. */
-export interface LogalyzeIconProps {
+export interface SupervisorIconProps {
   size: number
   active: boolean
 }
@@ -15,7 +15,7 @@ export interface LogalyzeIconProps {
  * @param props - the sidebar's icon share.
  * @returns decorative icon.
  */
-export function LogalyzeIcon({ size }: LogalyzeIconProps): JSX.Element {
+export function SupervisorIcon({ size }: SupervisorIconProps): JSX.Element {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M2.5 10c2.4-3.6 5.6-5.4 9.5-5.4s7.1 1.8 9.5 5.4c-2.4 3.6-5.6 5.4-9.5 5.4S4.9 13.6 2.5 10Z" />

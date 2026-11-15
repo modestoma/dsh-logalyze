@@ -3,15 +3,15 @@
  * 每个请求先经宿主 `connection.requestRejection`（与 DSH `/api` 相同的
  * Host/Origin 校验和登录 cookie 鉴权）；写操作另做同源校验。
  *
- * @module dsh-logalyze/settings/routes
+ * @module dsh-supervisor/settings/routes
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
-import type { LogalyzeService } from '../service.ts'
+import type { SupervisorService } from '../service.ts'
 import { HttpError, mediaTypeOf, readBody, sendJson } from '../util/http.ts'
 import { SettingsError } from './controller.ts'
-import { REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_ROUTE, TOKEN_ROUTE } from './contract.ts'
+import { APPLICATION_ROUTE, BREAKER_RESET_ROUTE, ISSUE_CHECK_ROUTE, ISSUE_SYNC_ROUTE, LOG_WATERMARK_ROUTE, OUTBOX_RETRY_ROUTE, REPORT_UPLOAD_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, TOKEN_ROUTE } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
@@ -37,12 +37,9 @@ export function isSameOriginRequest(req: IncomingMessage): boolean {
   }
 }
 
-async function readJsonBody(req: IncomingMessage, optional: boolean): Promise<unknown> {
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const text = await readBody(req, MAX_BODY_BYTES)
-  if (text === '') {
-    if (optional) return undefined
-    throw new HttpError(400, '请求体为空')
-  }
+  if (text === '') throw new HttpError(400, '请求体为空')
   if (mediaTypeOf(req) !== 'application/json') throw new HttpError(415, '请求体必须是 application/json')
   try {
     return JSON.parse(text)
@@ -90,8 +87,15 @@ function guarded(gate: HostRequestGate, methods: readonly string[], handler: Web
  * @param service - plugin runtime.
  * @returns disposer removing every route.
  */
-export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: LogalyzeService): () => void {
+export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: SupervisorService): () => void {
   const disposers = [
+    server.register({
+      kind: 'exact',
+      path: APPLICATION_ROUTE,
+      handler: guarded(gate, ['PUT'], async (req, res) => {
+        sendJson(res, 200, { ok: true, state: await service.saveApplication(await readJsonBody(req)) })
+      }),
+    }),
     server.register({
       kind: 'exact',
       path: STATE_ROUTE,
@@ -103,27 +107,15 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
         const state = req.method?.toUpperCase() === 'DELETE'
           ? await service.reset()
-          : await service.save(await readJsonBody(req, false))
+          : await service.save(await readJsonBody(req))
         sendJson(res, 200, { ok: true, state })
-      }),
-    }),
-    server.register({
-      kind: 'exact',
-      path: SYNC_ROUTE,
-      handler: guarded(gate, ['POST'], async (req, res) => {
-        const body = await readJsonBody(req, true)
-        const url = typeof body === 'object' && body !== null && typeof (body as { url?: unknown }).url === 'string'
-          ? (body as { url: string }).url
-          : undefined
-        service.sync(url)
-        sendJson(res, 200, { ok: true, state: await service.state() })
       }),
     }),
     server.register({
       kind: 'exact',
       path: TOKEN_ROUTE,
       handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
-        const body = await readJsonBody(req, false)
+        const body = await readJsonBody(req)
         const state = req.method?.toUpperCase() === 'DELETE' ? await service.clearToken(body) : await service.setToken(body)
         sendJson(res, 200, { ok: true, state })
       }),
@@ -132,7 +124,42 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       kind: 'exact',
       path: REPORT_UPLOAD_ROUTE,
       handler: guarded(gate, ['POST'], async (req, res) => {
-        sendJson(res, 200, { ok: true, state: await service.retryReport(await readJsonBody(req, false)) })
+        sendJson(res, 200, { ok: true, state: await service.retryReport(await readJsonBody(req)) })
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: BREAKER_RESET_ROUTE,
+      handler: guarded(gate, ['POST'], async (req, res) => {
+        sendJson(res, 200, { ok: true, state: await service.resetBreaker(await readJsonBody(req)) })
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: LOG_WATERMARK_ROUTE,
+      handler: guarded(gate, ['POST'], async (req, res) => {
+        sendJson(res, 200, { ok: true, state: await service.controlLogWatermark(await readJsonBody(req)) })
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: OUTBOX_RETRY_ROUTE,
+      handler: guarded(gate, ['POST'], async (req, res) => {
+        sendJson(res, 200, { ok: true, state: await service.retryOutboxDead(await readJsonBody(req)) })
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: ISSUE_SYNC_ROUTE,
+      handler: guarded(gate, ['POST'], async (_req, res) => {
+        sendJson(res, 200, { ok: true, state: await service.syncIssuesNow() })
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: ISSUE_CHECK_ROUTE,
+      handler: guarded(gate, ['POST'], async (req, res) => {
+        sendJson(res, 200, { ok: true, state: await service.checkIssuesBitable(await readJsonBody(req)) })
       }),
     }),
   ]
@@ -144,12 +171,12 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
  * @param ctx - plugin context.
  * @param service - plugin runtime.
  */
-export function mountSettingsRoutes(ctx: HostContext, service: LogalyzeService): void {
+export function mountSettingsRoutes(ctx: HostContext, service: SupervisorService): void {
   const attach = (webCtx: HostContext): void => {
     const server = webCtx.get?.('webServer') as HostWebServer | undefined
     const gate = webCtx.get?.('connection') as HostRequestGate | undefined
     if (server === undefined || gate === undefined) return
-    webCtx.effect(() => registerSettingsRoutes(server, gate, service), 'logalyze: settings routes')
+    webCtx.effect(() => registerSettingsRoutes(server, gate, service), 'supervisor: settings routes')
   }
   if (typeof ctx.inject === 'function') {
     ctx.inject(['webServer', 'connection'], attach)

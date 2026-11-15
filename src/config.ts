@@ -2,57 +2,20 @@
  * 插件配置：cordis.yml 中的 `config`（经 Standard Schema 在加载时校验）与
  * Web 面板覆盖共用同一套字段校验。
  *
- * @module dsh-logalyze/config
+ * @module dsh-supervisor/config
  */
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { z } from 'zod'
-import { TOKEN_ENV_PATTERN, UPLOAD_PLACEHOLDERS } from './settings/contract.ts'
+import { parseBitableUrl } from './deps/bitable.ts'
+import { CHAT_ID_PATTERN, TOKEN_ENV_PATTERN } from './settings/contract.ts'
 import type { EditableKey, EditableSettings } from './settings/contract.ts'
 
 /** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
 
 const HOST_NAME = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]*[a-z0-9])?$/
-
-/**
- * Whether a string is a repository address the `dshRepos` service mirrors:
- * an `https` URL. SSH, scp-like `user@host:path`, `git://`, `file:`, local
- * paths, and other transports are refused.
- * @param value - candidate repository address.
- * @returns whether it is accepted.
- */
-export function isAcceptedGitUrl(value: string): boolean {
-  if (value.startsWith('-') || /\s/.test(value)) return false
-  try {
-    return new URL(value).protocol === 'https:'
-  } catch {
-    // Not a URL (an scp-like address or a local path): refused.
-    return false
-  }
-}
-
-/**
- * Whether a branch name is safe to pass as a git ref argument.
- * @param value - candidate branch name.
- * @returns whether it is accepted.
- */
-export function isAcceptedBranch(value: string): boolean {
-  return value !== ''
-    && !value.startsWith('-')
-    && !value.includes('..')
-    && !/[\s~^:?*[\\]/.test(value)
-    && !value.endsWith('/')
-    && !value.endsWith('.lock')
-}
-
-/** Arguments of `logalyze_add_repo`: git address and optional branch. */
-export const repoSchema = z.object({
-  url: z.string().trim().min(1, 'git 地址不能为空').refine(isAcceptedGitUrl, '不支持的 git 地址（只支持 https 地址，不支持 ssh、user@host:path 和本机路径）'),
-  branch: z.string().trim().optional().transform(value => value === '' ? undefined : value)
-    .refine(value => value === undefined || isAcceptedBranch(value), '分支名不合法'),
-}).strict()
 
 const hostSchema = z.string().trim().toLowerCase()
   .transform(value => value.replace(/^\*\./, ''))
@@ -72,38 +35,88 @@ const skillUpdatesSchema = z.object({
   maxFileBytes: z.number().int().min(1).max(16 * 1024 * 1024).default(256 * 1024),
 }).strict()
 
-/** Default upload command: the log platform's CLI. */
-export const DEFAULT_UPLOAD_COMMAND: readonly string[] = ['cli', 'log-analysis', 'upload', '--log-id', '{logId}', '--dir', '{dir}', '--entry', '{entry}']
+const MIB = 1024 * 1024
 
-const PLACEHOLDER = /\{[^{}]*\}/g
+const optionalUrl = (label: string) => z.string().trim()
+  .transform(value => (value === '' ? undefined : value))
+  .pipe(z.url({ protocol: /^https?$/u, error: `${label}必须是 http(s) 地址` }).max(2048).optional())
+  .optional()
 
-const uploadCommandSchema = z.array(z.string().min(1, '回传命令的参数不能为空').max(4096))
-  .min(1, '回传命令不能为空').max(64, '回传命令最多 64 个参数')
-  .superRefine((argv, issues) => {
-    for (const [index, arg] of argv.entries()) {
-      for (const token of arg.match(PLACEHOLDER) ?? []) {
-        if (!(UPLOAD_PLACEHOLDERS as readonly string[]).includes(token)) issues.addIssue({ code: 'custom', path: [index], message: `未知占位符 ${token}（可用 ${UPLOAD_PLACEHOLDERS.join(' ')}）` })
-      }
-    }
-    if ((argv[0] ?? '').match(PLACEHOLDER) !== null) issues.addIssue({ code: 'custom', path: [0], message: '可执行文件不能包含占位符' })
-    for (const required of ['{logId}', '{dir}']) {
-      if (!argv.some(arg => arg.includes(required))) issues.addIssue({ code: 'custom', message: `回传命令必须包含 ${required}` })
-    }
-  })
+const platformSchema = z.object({
+  baseUrl: optionalUrl('日志平台接口地址'),
+  tokenUrl: optionalUrl('日志平台令牌地址'),
+  clientId: z.string().trim().max(512).transform(value => (value === '' ? undefined : value)).optional(),
+  clientAuth: z.enum(['body', 'basic']).default('body'),
+  scope: z.string().trim().max(1024).default('log:search log:download log:upload'),
+  timeoutMs: durationMs(1000).default(30 * 1000),
+}).strict()
 
 const uploadSchema = z.object({
-  command: uploadCommandSchema.default([...DEFAULT_UPLOAD_COMMAND]),
   timeoutMs: durationMs(1000).default(5 * 60 * 1000),
   retries: z.number().int().min(0).max(20).default(3),
   retryDelayMs: durationMs(1000).default(60 * 1000),
-  maxFiles: z.number().int().min(1).max(10_000).default(200),
-  maxBytes: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(200 * 1024 * 1024),
+  maxFiles: z.number().int().min(1).max(10_000).default(50),
+  maxBytes: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(100 * MIB),
+  maxFileBytes: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(50 * MIB),
+  maxMarkdownBytes: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(20 * MIB),
+  concurrency: z.number().int().min(1).max(16).default(4),
 }).strict()
+
+/** Largest `analyze.maxLogs`: the root card's row limit (one row per log), below the platform's 100 ids per metadata query. */
+export const MAX_LOGS_LIMIT = 50
 
 const analyzeSchema = z.object({
   enabled: z.boolean().default(false),
+  defaultChatId: z.string().trim().regex(CHAT_ID_PATTERN, '默认群必须是飞书群的 chat_id（oc_ 开头）').optional(),
+  maxLogs: z.number().int().min(1).max(MAX_LOGS_LIMIT).default(10),
+  platform: platformSchema.prefault({}),
   upload: uploadSchema.prefault({}),
 }).strict()
+
+const mrReviewSchema = z.object({
+  enabled: z.boolean().default(true),
+  pollIntervalMs: durationMs(1000).default(60 * 1000),
+  debounceMs: durationMs(0).default(45 * 1000),
+  maxConcurrentSessions: z.number().int().min(1).max(16).default(3),
+  skipDraft: z.boolean().default(true),
+  ignoreLabels: z.array(z.string().trim().min(1, '忽略标签不能为空').max(128)).default([]),
+  maxAutoFixAttempts: z.number().int().min(0).max(10).default(2),
+  dailyMrTurnLimit: z.number().int().min(1).max(200).default(12),
+  repoHourlyTurnLimit: z.number().int().min(1).max(500).default(30),
+  customInstructions: z.string().trim().max(4000, '附加评审要求最多 4000 个字符').transform(value => (value === '' ? undefined : value)).optional(),
+  feishuChatId: z.string().trim()
+    .transform(value => (value === '' ? undefined : value))
+    .pipe(z.string().regex(CHAT_ID_PATTERN, 'MR 通知群必须是飞书群的 chat_id（oc_ 开头）').optional())
+    .optional(),
+}).strict()
+
+const issueSyncSchema = z.object({
+  enabled: z.boolean().default(true),
+  bitableUrl: z.string().trim()
+    .transform(value => (value === '' ? undefined : value))
+    .pipe(z.string().max(2048, '飞书多维表格地址过长').refine(value => parseBitableUrl(value) !== undefined, '飞书多维表格地址不合法：请填写 https://…/base/<token> 或 https://…/wiki/<token>').optional())
+    .optional(),
+  table: z.string().trim().max(200, '数据表名称或 ID 最多 200 个字符').transform(value => (value === '' ? undefined : value)).optional(),
+  syncIntervalMs: durationMs(5000).default(5 * 60 * 1000),
+}).strict()
+
+const logSupervisionBaseSchema = z.object({
+  enabled: z.boolean().default(false),
+  pollIntervalMs: durationMs(1000).default(60 * 1000),
+  batchSizeThreshold: z.number().int().min(1).max(50).default(5),
+  maxBatchSize: z.number().int().min(1).max(50).default(20),
+  batchWindowMs: durationMs(0).default(5 * 60 * 1000),
+  maxConcurrentBatches: z.number().int().min(1).max(16).default(4),
+  appHourlyBatchLimit: z.number().int().min(1).max(500).default(15),
+  feishuChatId: z.string().trim().regex(CHAT_ID_PATTERN, '目标群必须是飞书群的 chat_id（oc_ 开头）').optional(),
+  deliveryMode: z.enum(['quiet-until-done', 'topic-on-start']).default('quiet-until-done'),
+  maxUnpackBytes: z.number().int().min(1024).max(Number.MAX_SAFE_INTEGER).default(512 * MIB),
+}).strict()
+
+const logSupervisionSchema = logSupervisionBaseSchema.refine(
+  value => value.batchSizeThreshold <= value.maxBatchSize,
+  { path: ['batchSizeThreshold'], message: '攒批触发条数不能大于单批上限' },
+)
 
 /**
  * The former `repos` key: application repositories are now the dsh-repo
@@ -123,6 +136,9 @@ export const editableFields = {
   download: downloadSchema.prefault({}),
   skillUpdates: skillUpdatesSchema.prefault({}),
   analyze: analyzeSchema.prefault({}),
+  mrReview: mrReviewSchema.prefault({}),
+  logSupervision: logSupervisionSchema.prefault({}),
+  issueSync: issueSyncSchema.prefault({}),
 }
 
 /** A complete editable settings payload, as the panel saves it. */
@@ -140,24 +156,29 @@ const configSchema = z.object({
    * Credential reference (environment-variable name) whose value is the
    * analyze API's bearer token.
    */
-  analyzeTokenRef: z.string().trim().regex(TOKEN_ENV_PATTERN, '令牌名称只能包含字母、数字和下划线，且不能以数字开头').default('LOGALYZE_ANALYZE_TOKEN'),
+  analyzeTokenRef: z.string().trim().regex(TOKEN_ENV_PATTERN, '令牌名称只能包含字母、数字和下划线，且不能以数字开头').default('SUPERVISOR_ANALYZE_TOKEN'),
+  /**
+   * Credential reference (environment-variable name) whose value is the log
+   * platform's OAuth2 client secret.
+   */
+  platformSecretRef: z.string().trim().regex(TOKEN_ENV_PATTERN, '凭据名称只能包含字母、数字和下划线，且不能以数字开头').default('SUPERVISOR_PLATFORM_CLIENT_SECRET'),
   /** Registered `ctx.subagents` provider the children start on. */
   subagentProvider: z.string().trim().min(1).default('spawn'),
   /**
-   * How long loading `/logalyze` waits for the repository refresh before it
+   * How long loading `/supervisor` waits for the repository refresh before it
    * renders the catalog it already has, in milliseconds; the refresh keeps
    * running. 0 never waits.
    */
   refreshWaitMs: durationMs(0).default(15 * 1000),
   /**
-   * Whether top-level agents may load the entry skill without `/logalyze`
+   * Whether top-level agents may load the entry skill without `/supervisor`
    * when a task matches the usable applications its description lists.
    */
   autoInvoke: z.boolean().default(true),
-}).strict()
+}).strict().refine(config => config.platformSecretRef !== config.analyzeTokenRef, { path: ['platformSecretRef'], message: '日志平台 client_secret 与分析接口令牌不能用同一个凭据名称' })
 
 /** Validated plugin configuration. */
-export type LogalyzeConfig = z.output<typeof configSchema>
+export type SupervisorConfig = z.output<typeof configSchema>
 
 /** Standard Schema the Cordis loader validates `config` with before `apply()`. */
 export const pluginConfigSchema = configSchema.prefault({})
@@ -171,6 +192,9 @@ export const overlaySchema = z.object({
   download: downloadSchema.optional(),
   skillUpdates: skillUpdatesSchema.optional(),
   analyze: analyzeSchema.optional(),
+  mrReview: mrReviewSchema.optional(),
+  logSupervision: logSupervisionSchema.optional(),
+  issueSync: issueSyncSchema.optional(),
 }).strict()
 
 /** Validated panel overlay. */
@@ -198,9 +222,9 @@ export function describeIssue(error: z.ZodError): string {
  * @returns validated configuration.
  * @throws when the configuration is invalid.
  */
-export function resolveConfig(raw: unknown): LogalyzeConfig {
+export function resolveConfig(raw: unknown): SupervisorConfig {
   const parsed = pluginConfigSchema.safeParse(raw ?? {})
-  if (!parsed.success) throw new Error(`logalyze: 配置不合法：${describeIssue(parsed.error)}`)
+  if (!parsed.success) throw new Error(`supervisor: 配置不合法：${describeIssue(parsed.error)}`)
   return parsed.data
 }
 
@@ -219,7 +243,7 @@ export function resolveDshHome(env: NodeJS.ProcessEnv = process.env): string {
  * @param config - validated plugin configuration.
  * @returns complete editable settings, sharing nothing with `config`.
  */
-export function defaultsOf(config: LogalyzeConfig): EditableSettings {
+export function defaultsOf(config: SupervisorConfig): EditableSettings {
   // Parsing without `strict` drops the other configuration keys and copies every value.
   return z.object(editableFields).parse(config)
 }

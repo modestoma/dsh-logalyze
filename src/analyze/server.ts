@@ -2,14 +2,14 @@
  * 日志平台分析接口在 DSH Web 服务器上的路由。
  *
  * 只在宿主同时提供 `webServer` 和版本兼容的飞书渠道插件 `feishuTopics`
- * 服务时注册精确路由 `POST /open-api/logalyze`；渠道插件未加载、重载
+ * 服务时注册精确路由 `POST /open-api/supervisor`；渠道插件未加载、重载
  * 中或版本不兼容时不注册。
  * 本模块按顺序做传输层检查：路径、开关、方法、Bearer 令牌、
  * `Idempotency-Key`、媒体类型、请求体大小和 JSON 校验；通过后交给
- * `feishuTopics`。带 `logId` 的请求被接受（包括重放）后交给报告回传记录。
- * 请求体、令牌和提示词都不写日志。
+ * {@link AnalyzeAccept}（查日志平台、核对批次、记录分析、发起话题）。
+ * 请求体和令牌都不写日志。
  *
- * @module dsh-logalyze/analyze/server
+ * @module dsh-supervisor/analyze/server
  */
 
 import { createHash, timingSafeEqual } from 'node:crypto'
@@ -19,16 +19,22 @@ import {
   ANALYZE_MAX_BODY_BYTES, ANALYZE_ROUTE, IDEMPOTENCY_KEY_PATTERN, parseAnalyzeRequest,
 } from './contract.ts'
 import type { AnalyzeRequest, AnalyzeResponse } from './contract.ts'
+import type { FeishuTopicService } from '../deps/topics-contract.ts'
 import { FEISHU_TOPICS_SERVICE, lookupTopics } from '../deps/topics.ts'
 import { HttpError, mediaTypeOf, readBody, sendJson } from '../util/http.ts'
-import { launchAnalysis } from './topics.ts'
 
 /** The plugin side of the route: switch and token, read per request. */
 export interface AnalyzeGate {
+  /** Ensure startup migration and settings overlay loading have completed before reading gate state. */
+  prepare?(): Promise<void>
   /** @returns whether the API is switched on; false answers every request with 404. */
   enabled(): boolean
   /** Credential reference holding the bearer token, named in the 503 answer while it is unset. */
   tokenEnv(): string
+  /** @returns the group a request without `chatId` goes to, or undefined when none is set. */
+  defaultChatId(): string | undefined
+  /** @returns the most `logIds` one request may name. */
+  maxLogs(): number
   /**
    * Resolve the expected bearer token.
    * @returns the token, or undefined when it is not configured or cannot be read.
@@ -39,8 +45,8 @@ export interface AnalyzeGate {
 /** Everything after transport checks: start the analysis of one validated request. */
 export type AnalyzeLaunch = (request: AnalyzeRequest, idempotencyKey: string) => Promise<AnalyzeResponse>
 
-/** Receives every accepted (or replayed) request that carries `logId`. */
-export type AnalyzeAccepted = (request: AnalyzeRequest & { readonly logId: string }, idempotencyKey: string) => Promise<void>
+/** Starts the analysis of one validated request through the loaded `feishuTopics`. */
+export type AnalyzeAccept = (topics: FeishuTopicService, request: AnalyzeRequest, idempotencyKey: string) => Promise<AnalyzeResponse>
 
 function send(res: ServerResponse, response: AnalyzeResponse): void {
   sendJson(res, response.status, response.body)
@@ -84,6 +90,7 @@ export async function handleAnalyzeHttp(
     refuse(res, 404, '未知路径')
     return
   }
+  await gate.prepare?.()
   if (!gate.enabled()) {
     refuse(res, 404, '日志分析接口未开启，请在观象设置面板「分析接口」打开开关')
     return
@@ -122,7 +129,7 @@ export async function handleAnalyzeHttp(
     refuse(res, 400, '请求体不是合法的 JSON')
     return
   }
-  const parsed = parseAnalyzeRequest(raw)
+  const parsed = parseAnalyzeRequest(raw, gate.defaultChatId(), gate.maxLogs())
   if (!parsed.ok) {
     refuse(res, 400, parsed.error)
     return
@@ -136,28 +143,19 @@ export async function handleAnalyzeHttp(
  * login gate on purpose: the bearer token is this API's only credential.
  * @param ctx - the plugin context.
  * @param gate - switch and token.
- * @param accepted - starts report tracking of an accepted request with `logId`; its failure is logged and does not change the answer.
+ * @param accept - starts the analysis of a validated request.
  */
-export function mountAnalyzeRoute(ctx: HostContext, gate: AnalyzeGate, accepted: AnalyzeAccepted): void {
+export function mountAnalyzeRoute(ctx: HostContext, gate: AnalyzeGate, accept: AnalyzeAccept): void {
   const attach = (scope: HostContext): void => {
     const server = scope.get?.('webServer') as HostWebServer | undefined
     if (server === undefined) return
     const topics = lookupTopics(scope.get?.(FEISHU_TOPICS_SERVICE))
     if (topics.availability !== 'ready') {
-      if (topics.availability === 'incompatible') ctx.logger?.warn?.('logalyze: 飞书渠道插件的 feishuTopics 服务版本与观象不兼容，分析接口未注册；请把两者升级到相互兼容的版本')
+      if (topics.availability === 'incompatible') ctx.logger?.warn?.('supervisor: 飞书渠道插件的 feishuTopics 服务版本与智能监管不兼容，分析接口未注册；请把两者升级到相互兼容的版本')
       return
     }
     const { service } = topics
-    const launch: AnalyzeLaunch = async (request, key) => {
-      const response = await launchAnalysis(service, request, key)
-      const { logId } = request
-      if (response.status === 202 && logId !== undefined) {
-        await accepted({ ...request, logId }, key).catch((error: unknown) => {
-          ctx.logger?.warn?.('logalyze: 记录分析报告回传失败：%s', String(error))
-        })
-      }
-      return response
-    }
+    const launch: AnalyzeLaunch = async (request, key) => await accept(service, request, key)
     scope.effect(() => server.register({
       kind: 'exact',
       path: ANALYZE_ROUTE,
@@ -165,12 +163,12 @@ export function mountAnalyzeRoute(ctx: HostContext, gate: AnalyzeGate, accepted:
         try {
           await handleAnalyzeHttp(req, res, gate, launch)
         } catch (error) {
-          ctx.logger?.warn?.('logalyze: 分析请求处理失败：%s', String(error))
+          ctx.logger?.warn?.('supervisor: 分析请求处理失败：%s', String(error))
           if (!res.headersSent) refuse(res, 500, `分析请求处理失败：${String(error)}`)
           else res.destroy()
         }
       },
-    }), 'logalyze: analyze route')
+    }), 'supervisor: analyze route')
   }
   if (typeof ctx.inject === 'function') {
     ctx.inject(['webServer', FEISHU_TOPICS_SERVICE], attach)

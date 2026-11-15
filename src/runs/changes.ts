@@ -10,7 +10,7 @@
  * 改动、删除、重命名或类型变化都让整份改动不合格。文件内容从工作区读取，不跟随
  * 符号链接。
  *
- * @module dsh-logalyze/runs/changes
+ * @module dsh-supervisor/runs/changes
  */
 
 import { join } from 'node:path'

@@ -41,7 +41,7 @@ globalThis.document = {
 await import('../lib/client.js')
 
 assert.ok(loaded, 'bundle did not call window.__ModuleLoader__.load')
-assert.equal(loaded.id, 'dsh-logalyze')
+assert.equal(loaded.id, 'dsh-supervisor')
 const plugin = loaded.module
 assert.equal(typeof plugin.apply, 'function', 'bundle did not export apply()')
 assert.deepEqual(plugin.inject, ['slots'])
@@ -61,9 +61,9 @@ plugin.apply({
 assert.equal(styles.length, 1, 'stylesheet was not installed')
 assert.deepEqual(registrations.map(({ declaration }) => declaration.name), ['main', 'sidebar.panellist'])
 const [page, entry] = registrations
-assert.equal(page.declaration.key, 'logalyze')
-assert.equal(entry.declaration.id, 'logalyze', 'sidebar row id must address the main page key')
-assert.equal(entry.declaration.label(), '观象')
+assert.equal(page.declaration.key, 'supervisor')
+assert.equal(entry.declaration.id, 'supervisor', 'sidebar row id must address the main page key')
+assert.equal(entry.declaration.label(), '智能监管')
 for (const { component } of registrations) assert.equal(typeof component, 'function')
 
 console.log('OK: lib/client.js loads through __ModuleLoader__ and registers the sidebar entry and page')

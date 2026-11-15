@@ -2,11 +2,11 @@
  * 生效设置：cordis.yml 给出默认值，面板覆盖文件只保存与默认值不同的字段。
  * 覆盖文件不可读或不合法时忽略它、在面板上说明原因，下一次保存时替换它。
  *
- * @module dsh-logalyze/settings/controller
+ * @module dsh-supervisor/settings/controller
  */
 
 import { applyOverlay, defaultsOf, describeIssue, editableSettingsSchema } from '../config.ts'
-import type { LogalyzeConfig, SettingsOverlay } from '../config.ts'
+import type { SupervisorConfig, SettingsOverlay } from '../config.ts'
 import type { EditableSettings, StateWire } from './contract.ts'
 import { diffOverlay, overriddenKeys } from './overlay.ts'
 import type { OverlayStore } from './overlay.ts'
@@ -27,7 +27,7 @@ export class SettingsController {
    * @param store - panel overlay file.
    * @param warn - receives the reason an unusable overlay file is ignored.
    */
-  constructor(config: LogalyzeConfig, private readonly store: OverlayStore, private readonly warn: (message: string) => void) {
+  constructor(config: SupervisorConfig, private readonly store: OverlayStore, private readonly warn: (message: string) => void) {
     this.defaults = defaultsOf(config)
     this.current = this.defaults
   }
@@ -40,7 +40,7 @@ export class SettingsController {
       return
     }
     this.overlayError = read.error
-    this.warn(`logalyze: 忽略面板设置：${read.error}`)
+    this.warn(`supervisor: 忽略面板设置：${read.error}`)
   }
 
   /** @returns the effective settings. */

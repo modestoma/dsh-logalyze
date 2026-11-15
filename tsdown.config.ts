@@ -6,7 +6,7 @@ import { defineConfig } from 'tsdown'
  * through the package's own `node_modules`.
  */
 export default defineConfig({
-  name: 'dsh-logalyze/host',
+  name: 'dsh-supervisor/host',
   entry: { index: 'src/index.ts' },
   tsconfig: 'tsconfig.json',
   outDir: 'lib',
