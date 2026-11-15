@@ -195,6 +195,7 @@ export class LogSupervisor {
   private readonly liveTopicWaiters = new Map<string, Set<() => void>>()
   private readonly topicDeliveryLocks = new Map<string, Promise<unknown>>()
   private readonly actionDeliveryLocks = new Map<string, Promise<unknown>>()
+  private readonly supersedeLocks = new Map<string, Promise<unknown>>()
 
   private watermarkEpoch = 0
 
@@ -765,11 +766,19 @@ export class LogSupervisor {
 
   private hasPendingActionDeliveries(): boolean {
     for (const [, task] of this.deps.logTasks.entries()) {
-      if (task.status !== 'completed' || task.revisions.length === 0) continue
+      if (task.revisions.length === 0) continue
       const latestRev = task.revisions.at(-1)
+      if (latestRev === undefined) continue
       if (
-        latestRev !== undefined
-        && latestRev.actionCardKey === undefined
+        task.revisions.some(
+          r => r.revision < latestRev.revision && r.actionCardKey !== undefined && !r.actionCardSuperseded,
+        )
+      ) {
+        return true
+      }
+      if (task.status !== 'completed') continue
+      if (
+        latestRev.actionCardKey === undefined
         && !latestRev.actionCardSkipped
         && latestRev.pendingActionSessionId !== undefined
       ) {
@@ -1855,6 +1864,7 @@ export class LogSupervisor {
             }
           })
         }
+        await this.supersedeStaleActionCards(taskId)
         return
       }
 
@@ -1907,6 +1917,9 @@ export class LogSupervisor {
         || revision.actionCardKey !== undefined
         || revision.actionCardSkipped
       ) {
+        if (task !== undefined && (task.revisions.at(-1)?.revision ?? revisionNumber) > revisionNumber) {
+          await this.supersedeStaleActionCards(taskId)
+        }
         return
       }
 
@@ -1977,7 +1990,7 @@ export class LogSupervisor {
       }
 
       this.actionRetryFailures = 0
-      await this.updateTask(taskId, cur => ({
+      const updatedAfterPost = await this.updateTask(taskId, cur => ({
         ...cur,
         revisions: cur.revisions.map((r) => {
           if (r.revision !== revisionNumber) return r
@@ -1986,8 +1999,66 @@ export class LogSupervisor {
         }),
         updatedAt: this.now(),
       }))
+      if ((updatedAfterPost.revisions.at(-1)?.revision ?? revisionNumber) > revisionNumber) {
+        await this.supersedeStaleActionCards(taskId)
+      }
       if (!this.hasPendingActionDeliveries()) this.clearActionRetryTimer()
     })
+  }
+
+  private async supersedeStaleActionCards(taskId: string): Promise<void> {
+    if (this.closed) return
+    const snapshot = this.deps.logTasks.get(taskId)
+    const snapshotLatest = snapshot?.revisions.at(-1)
+    if (snapshot === undefined || snapshotLatest === undefined) return
+
+    const candidates = snapshot.revisions.filter(
+      r => r.revision < snapshotLatest.revision && r.actionCardKey !== undefined && !r.actionCardSuperseded,
+    )
+    for (const candidate of candidates) {
+      const cardKey = candidate.actionCardKey
+      if (cardKey === undefined || this.closed) continue
+      await this.serializeKeyedLock(this.supersedeLocks, cardKey, async () => {
+        if (this.closed) return
+        const curTask = this.deps.logTasks.get(taskId)
+        const curLatest = curTask?.revisions.at(-1)
+        const curRev = curTask?.revisions.find(r => r.revision === candidate.revision)
+        if (
+          curTask === undefined
+          || curLatest === undefined
+          || curRev === undefined
+          || curRev.revision >= curLatest.revision
+          || curRev.actionCardKey !== cardKey
+          || curRev.actionCardSuperseded
+        ) {
+          return
+        }
+        const actions = this.deps.getActions()
+        if (actions === undefined) {
+          this.scheduleActionRetry()
+          return
+        }
+        try {
+          await actions.supersede(cardKey, `已更新至修订 rev ${curLatest.revision}`)
+        } catch (error) {
+          this.actionRetryFailures = Math.min(this.actionRetryFailures + 1, 10)
+          this.deps.logger?.warn?.('logalyze: 作废旧动作按钮卡片失败（%s）：%s', cardKey, messageOf(error))
+          this.scheduleActionRetry()
+          return
+        }
+        this.actionRetryFailures = 0
+        await this.updateTask(taskId, cur => ({
+          ...cur,
+          revisions: cur.revisions.map(r => (
+            r.revision === candidate.revision && r.actionCardKey === cardKey
+              ? { ...r, actionCardSuperseded: true }
+              : r
+          )),
+          updatedAt: this.now(),
+        }))
+        if (!this.hasPendingActionDeliveries()) this.clearActionRetryTimer()
+      })
+    }
   }
 
   private async notifyThrottle(
@@ -2039,16 +2110,6 @@ export class LogSupervisor {
     readonly app: ReadyApp
   }): Promise<{ readonly enqueuedOutboxKeys: readonly string[]; readonly detailUrlBackfilled: boolean }> {
     const enqueuedKeys: string[] = []
-
-    const priorRevision = params.task.revisions
-      .filter(r => r.revision < params.revision.revision && r.actionCardKey !== undefined)
-      .at(-1)
-    if (priorRevision?.actionCardKey !== undefined) {
-      const actions = this.deps.getActions()
-      if (actions !== undefined) {
-        await actions.supersede(priorRevision.actionCardKey, `已更新至修订 rev ${params.revision.revision}`).catch(() => undefined)
-      }
-    }
 
     if (params.task.source === 'platform') {
       for (const input of params.task.inputs) {
@@ -2105,6 +2166,8 @@ export class LogSupervisor {
         updatedAt: this.now(),
       }
     })
+
+    await this.supersedeStaleActionCards(params.taskId)
 
     if (enqueuedKeys.length > 0) {
       const kick = this.outboxRunner.processDue().catch((error: unknown) => {
@@ -2277,9 +2340,13 @@ export class LogSupervisor {
   private async reconcilePendingActions(): Promise<void> {
     if (this.closed) return
     const topics = this.deps.getTopics()
-    for (const [taskId, task] of this.deps.logTasks.entries()) {
+    for (const [taskId, initialTask] of this.deps.logTasks.entries()) {
       if (this.closed) return
-      if (task.status !== 'completed' || task.revisions.length === 0) continue
+      if (initialTask.revisions.length > 1) {
+        await this.supersedeStaleActionCards(taskId)
+      }
+      const task = this.deps.logTasks.get(taskId)
+      if (task === undefined || task.status !== 'completed' || task.revisions.length === 0) continue
       const latestRev = task.revisions.at(-1)
       if (latestRev === undefined || latestRev.actionCardKey !== undefined || latestRev.actionCardSkipped) continue
 

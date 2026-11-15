@@ -232,10 +232,15 @@ class FakeFeishuActions implements FeishuActionsService {
   readonly attemptKeys: string[] = []
   readonly superseded: { readonly key: string; readonly reason?: string }[] = []
   failNextPropose: { readonly code: 'invalid' | 'not-connected' | 'unrouted-session' | 'send-failed'; readonly message: string } | undefined
+  onBeforePropose: ((spec: ActionProposalSpec) => Promise<void>) | undefined
+  failNextSupersede: Error | undefined
   failedProposals = 0
 
   async propose(spec: ActionProposalSpec) {
     this.attemptKeys.push(spec.key)
+    if (this.onBeforePropose !== undefined) {
+      await this.onBeforePropose(spec)
+    }
     if (this.failNextPropose !== undefined) {
       const failure = this.failNextPropose
       this.failNextPropose = undefined
@@ -251,6 +256,11 @@ class FakeFeishuActions implements FeishuActionsService {
   }
 
   async supersede(key: string, reason?: string): Promise<void> {
+    if (this.failNextSupersede !== undefined) {
+      const err = this.failNextSupersede
+      this.failNextSupersede = undefined
+      throw err
+    }
     this.superseded.push({ key, ...(reason === undefined ? {} : { reason }) })
   }
 }
@@ -2275,5 +2285,99 @@ describe('LogSupervisor & LogalyzeService M3 end-to-end closed loops', () => {
     const restartDomain = await hRestart.service.supervisorDomain()
     expect(restartDomain.logTasks.get(restartTaskId)?.revisions[0]?.actionCardKey).toBe(`log-act:${restartTaskId}:rev1`)
     expect(restartDomain.logTasks.get(restartTaskId)?.revisions[0]?.pendingActionSessionId).toBeUndefined()
+  }, 20_000)
+
+  it('supersedes stale action proposals that finish after a newer revision is submitted and retries failed supersessions', async () => {
+    const h = await createFullHarness({
+      withPlatform: false,
+    })
+
+    const sess = 'feishu-supersede-race-sess'
+    const ws = join(h.dir, 'supersede-race-ws')
+    const logFile = join(h.dir, 'supersede-race.log')
+    await mkdir(ws, { recursive: true })
+    await writeFile(logFile, 'NullPointerException at handleOrder\n')
+
+    const prepare = h.toolNamed('supervisor_log_prepare')
+    const submit = h.toolNamed('supervisor_log_submit')
+    const prep = await prepare.execute({
+      app: 'order-service',
+      logs: [{ path: logFile }],
+    }, h.toolExecCtx(sess, ws, 'c-prep-race')) as {
+      readonly taskId: string
+      readonly workDir: string
+      readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+    }
+
+    const submitRev = async (summary: string, callId: string) => await submit.execute({
+      taskId: prep.taskId,
+      summary,
+      items: prep.slots.map(s => ({
+        ref: s.ref,
+        status: 'diagnosed',
+        rootCauseCategory: 'code_defect',
+        conclusion: summary,
+        evidences: [
+          { source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'NullPointerException' },
+          { source: 'repos/order-service/src/handler.ts', locator: 'L1', excerpt: 'return null' },
+        ],
+      })),
+    }, h.toolExecCtx(sess, prep.workDir, callId)) as { readonly revision: number }
+
+    const rev1 = await submitRev('初版诊断 conclusion rev1', 'c-sub-rev1')
+    expect(rev1.revision).toBe(1)
+
+    let enteredRev1Propose!: () => void
+    const rev1ProposeEntered = new Promise<void>((resolve) => {
+      enteredRev1Propose = resolve
+    })
+    let releaseRev1Propose!: () => void
+    const rev1ProposeGate = new Promise<void>((resolve) => {
+      releaseRev1Propose = resolve
+    })
+    const rev1Key = `log-act:${prep.taskId}:rev1`
+    h.fakeActions.onBeforePropose = async (spec) => {
+      if (spec.key === rev1Key) {
+        enteredRev1Propose()
+        await rev1ProposeGate
+      }
+    }
+
+    const sup = h.service.logSupervisorInstance()!
+    sup.onSessionEvent(sess, 'turn/end', { reason: { kind: 'completed' } })
+    await rev1ProposeEntered
+
+    // Submit rev 2 while rev 1's actionsService.propose() is still in flight.
+    const rev2 = await submitRev('修订诊断 conclusion rev2', 'c-sub-rev2')
+    expect(rev2.revision).toBe(2)
+
+    releaseRev1Propose()
+    sup.onSessionEvent(sess, 'turn/end', { reason: { kind: 'completed' } })
+
+    const rev2Key = `log-act:${prep.taskId}:rev2`
+    await waitFor(() =>
+      h.fakeActions.proposals.some(p => p.key === rev1Key)
+      && h.fakeActions.proposals.some(p => p.key === rev2Key)
+      && h.fakeActions.superseded.some(s => s.key === rev1Key),
+    )
+
+    expect(h.fakeActions.superseded).toEqual([{ key: rev1Key, reason: '已更新至修订 rev 2' }])
+    const domain = await h.service.supervisorDomain()
+    expect(domain.logTasks.get(prep.taskId)?.revisions[0]?.actionCardSuperseded).toBe(true)
+    expect(domain.logTasks.get(prep.taskId)?.revisions[1]?.actionCardSuperseded).toBeUndefined()
+
+    // Inject transient supersede failure when rev 3 arrives -> retried cleanly on actionsAvailable().
+    h.fakeActions.failNextSupersede = new Error('feishu ws glitch')
+    const rev3 = await submitRev('修订诊断 conclusion rev3', 'c-sub-rev3')
+    expect(rev3.revision).toBe(3)
+    expect(domain.logTasks.get(prep.taskId)?.revisions[1]?.actionCardSuperseded).toBeUndefined()
+    expect(h.fakeActions.superseded.some(s => s.key === rev2Key)).toBe(false)
+
+    await h.service.actionsAvailable()
+    expect(h.fakeActions.superseded).toEqual([
+      { key: rev1Key, reason: '已更新至修订 rev 2' },
+      { key: rev2Key, reason: '已更新至修订 rev 3' },
+    ])
+    expect(domain.logTasks.get(prep.taskId)?.revisions[1]?.actionCardSuperseded).toBe(true)
   }, 20_000)
 })
