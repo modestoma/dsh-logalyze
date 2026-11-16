@@ -3,7 +3,7 @@
  * - 共享监管运行时（`dsh_supervisor` 存储域与 `logPool` / `mrPool` 并发隔离池）；
  * - 生效设置、应用注册表与仓库清单跟随（同时注册 `log-analysis` 与 `mr-review` 功能开关）；
  * - 入口 SKILL、分析派发及旧版 SKILL 工具注册；
- * - 分析接口令牌、日志平台客户端、分析请求受理与报告回传；
+ * - 日志平台客户端（client_secret 存在 DSH 凭据库）与已下线分析接口留下的话题的报告回传；
  * - Web 设置面板状态与写入口。
  *
  * @module dsh-supervisor/service
@@ -12,13 +12,6 @@
 import { createHash } from 'node:crypto'
 import { dirname, join, resolve } from 'node:path'
 import { z } from 'zod'
-import { resolveBatch } from './analyze/batch.ts'
-import { analyzeRequestHash } from './analyze/contract.ts'
-import type { AnalyzeRequest, AnalyzeResponse } from './analyze/contract.ts'
-import { newAnalysisRecord } from './analyze/record.ts'
-import type { AnalyzeGate } from './analyze/server.ts'
-import { StoredCredential } from './analyze/token.ts'
-import { analysisTopicSpec, analyzeResponseOf, refused } from './analyze/topics.ts'
 import { SUPERVISOR_APPLICATIONS_SERVICE } from './apps/access.ts'
 import type { ApplicationAccess } from './apps/access.ts'
 import { CatalogFollower } from './apps/catalog.ts'
@@ -43,6 +36,7 @@ import type { LogSessionDriver, LogToolsRuntime } from './log/index.ts'
 import { MrSupervisor, createHostMrSessionDriver, createMrTools } from './mr/index.ts'
 import type { MrSessionDriver } from './mr/index.ts'
 import { PlatformClient, PlatformError, platformProblem } from './platform/client.ts'
+import { StoredCredential } from './platform/credential.ts'
 import { LegacyReports, legacyReportsDir } from './report/legacy.ts'
 import { AnalysisStore, defaultAnalysesDir } from './report/store.ts'
 import { ReportTracker } from './report/tracker.ts'
@@ -55,7 +49,6 @@ import type { SupervisorDomain } from './runtime/domain.ts'
 import { createSupervisionPools } from './runtime/pool.ts'
 import type { SupervisionPools } from './runtime/pool.ts'
 import { ApplicationSettings } from './settings/applications.ts'
-import { ANALYZE_ROUTE } from './settings/contract.ts'
 import type { StateWire } from './settings/contract.ts'
 import { SettingsController, SettingsError } from './settings/controller.ts'
 import { defaultLegacyDataDir, defaultSupervisorDataDir, migrateLegacyData } from './settings/legacy-migration.ts'
@@ -122,12 +115,9 @@ export class SupervisorService {
   private readonly settings: SettingsController
   private readonly repos: ReposClient
   private readonly catalog: CatalogFollower
-  private readonly token: StoredCredential
   private readonly secret: StoredCredential
   private readonly platform: PlatformClient
   private readonly legacy: LegacyReports
-  /** Idempotency key → acceptance in progress (concurrent retries wait for it). */
-  private readonly accepting = new Map<string, Promise<AnalyzeResponse>>()
   private readonly dispatcher: Dispatcher
   private readonly improver: SkillImprover
   private readonly viewer: SkillViewer
@@ -216,13 +206,7 @@ export class SupervisorService {
     this.autoInvoke = config.autoInvoke
     this.repos = new ReposClient(() => ctx.get?.(DSH_REPOS_SERVICE))
     const credentials = (): HostCredentials | undefined => ctx.get?.('credentials') as HostCredentials | undefined
-    const legacyTokenRef = config.analyzeTokenRef === 'SUPERVISOR_ANALYZE_TOKEN' && config.platformSecretRef !== 'LOGALYZE_ANALYZE_TOKEN'
-      ? 'LOGALYZE_ANALYZE_TOKEN'
-      : undefined
-    const legacySecretRef = config.platformSecretRef === 'SUPERVISOR_PLATFORM_CLIENT_SECRET' && config.analyzeTokenRef !== 'LOGALYZE_PLATFORM_CLIENT_SECRET'
-      ? 'LOGALYZE_PLATFORM_CLIENT_SECRET'
-      : undefined
-    this.token = new StoredCredential(config.analyzeTokenRef, '分析接口令牌', credentials, warn, legacyTokenRef)
+    const legacySecretRef = config.platformSecretRef === 'SUPERVISOR_PLATFORM_CLIENT_SECRET' ? 'LOGALYZE_PLATFORM_CLIENT_SECRET' : undefined
     this.secret = new StoredCredential(config.platformSecretRef, '日志平台 client_secret', credentials, warn, legacySecretRef)
     this.platform = new PlatformClient({ settings: () => this.settings.get().analyze.platform, secret: () => this.secret.value(), now: this.clock, ...fetchSeam })
     this.legacy = new LegacyReports(this.legacyReportsDir, warn)
@@ -556,56 +540,6 @@ export class SupervisorService {
     this.issueSyncer?.notifyServiceChanged()
   }
 
-  /** Accept one validated analyze request with idempotency protection. */
-  async acceptAnalysis(topics: FeishuTopicService, request: AnalyzeRequest, key: string): Promise<AnalyzeResponse> {
-    const pending = this.accepting.get(key)
-    if (pending !== undefined) {
-      await pending.catch(() => undefined)
-      return await this.acceptAnalysis(topics, request, key)
-    }
-    const accepting = this.acceptOnce(topics, request, key)
-    this.accepting.set(key, accepting)
-    try {
-      return await accepting
-    } finally {
-      this.accepting.delete(key)
-    }
-  }
-
-  private async acceptOnce(topics: FeishuTopicService, request: AnalyzeRequest, key: string): Promise<AnalyzeResponse> {
-    await this.booted.promise
-    const settings = this.settings.get().analyze
-    const fingerprint = analyzeRequestHash(request)
-    const existing = this.reports.byKey(key)
-    if (existing !== undefined) {
-      if (existing.fingerprint !== fingerprint) return refused(409, 'Idempotency-Key 已被内容不同的请求使用')
-      return analyzeResponseOf(await topics.launch(analysisTopicSpec(existing, settings.upload)))
-    }
-    const problem = platformProblem(settings.platform)
-    if (problem !== undefined) return refused(503, problem)
-    let found
-    try {
-      found = await this.platform.findLogs(request.logIds)
-    } catch (error) {
-      if (!(error instanceof PlatformError)) throw error
-      return refused(error.retryable ? 503 : 502, error.message)
-    }
-    const batch = resolveBatch(request.logIds, found, this.registry.readyApps().map(ready => ready.app))
-    if (!batch.ok) return { status: 422, body: { ok: false, error: batch.error, ...batch.invalidLogs === undefined ? {} : { invalidLogs: batch.invalidLogs } } }
-    const record = newAnalysisRecord(request, key, fingerprint, batch.value, Date.now())
-    await this.reports.accept(record)
-    let response: AnalyzeResponse
-    try {
-      response = analyzeResponseOf(await topics.launch(analysisTopicSpec(record, settings.upload)))
-    } catch (error) {
-      await this.reports.forget(record.id)
-      throw error
-    }
-    if (response.status === 202) await this.reports.launched(record.id)
-    else await this.reports.forget(record.id)
-    return response
-  }
-
   private platformLogsOf(sessionId: string): ((ref: string) => PlatformLogRef) | undefined {
     const key = this.topicsService()?.launchKeyOf(sessionId)
     const record = key === undefined ? undefined : this.reports.byKey(key)
@@ -652,18 +586,15 @@ export class SupervisorService {
   /** @returns the panel state. */
   async state(): Promise<StateWire> {
     await this.ensureSettingsLoaded()
-    const [token, secret] = await Promise.all([this.token.status(), this.secret.status()])
+    const secret = await this.secret.status()
     const problem = platformProblem(this.settings.get().analyze.platform)
     return {
       ...this.settings.panel(),
       repos: this.registry.status(),
       mrRepos: this.registry.mrStatus(),
       dshRepo: this.repos.panelState(),
-      credentialsAvailable: this.token.available(),
+      credentialsAvailable: this.secret.available(),
       analyze: {
-        route: ANALYZE_ROUTE,
-        tokenEnv: this.token.ref,
-        ...(token === undefined ? {} : { token }),
         secretEnv: this.secret.ref,
         ...(secret === undefined ? {} : { secret }),
         ...(problem === undefined ? {} : { platformProblem: problem }),
@@ -676,7 +607,6 @@ export class SupervisorService {
       ...(this.logSupervisor === undefined ? {} : { logSupervision: this.logSupervisor.panelState() }),
       ...(this.issueSyncer === undefined ? {} : { issues: this.issueSyncer.panelState() }),
       runtime: {
-        analyzeTokenRef: this.token.ref,
         platformSecretRef: this.secret.ref,
         subagentProvider: this.subagentProvider,
         refreshWaitMs: this.refreshWaitMs,
@@ -685,19 +615,7 @@ export class SupervisorService {
     }
   }
 
-  /** @returns the analyze route's switch, limits, and bearer token, read per request. */
-  analyzeGate(): AnalyzeGate {
-    return {
-      prepare: () => this.ensureSettingsLoaded(),
-      enabled: () => this.settings.get().analyze.enabled,
-      tokenEnv: () => this.token.ref,
-      defaultChatId: () => this.settings.get().analyze.defaultChatId,
-      maxLogs: () => this.settings.get().analyze.maxLogs,
-      token: () => this.token.value(),
-    }
-  }
-
-  /** Store the analyze API's bearer token or the platform client secret in DSH's credential store. */
+  /** Store the platform client secret in DSH's credential store. */
   async setToken(raw: unknown): Promise<StateWire> {
     await this.credentialOf(raw).set(raw)
     this.platform.reset()
@@ -715,9 +633,8 @@ export class SupervisorService {
   private credentialOf(raw: unknown): StoredCredential {
     const parsed = credentialNameSchema.safeParse(raw)
     if (!parsed.success) throw new SettingsError(describeIssue(parsed.error))
-    const slot = [this.token, this.secret].find(candidate => candidate.ref === parsed.data.tokenEnv)
-    if (slot === undefined) throw new SettingsError(`${parsed.data.tokenEnv} 不是观象管理的凭据名称`)
-    return slot
+    if (parsed.data.tokenEnv !== this.secret.ref) throw new SettingsError(`${parsed.data.tokenEnv} 不是观象管理的凭据名称`)
+    return this.secret
   }
 
   /** Validate and persist a complete settings payload from the panel. */
@@ -849,6 +766,7 @@ export class SupervisorService {
       maxUnpackBytes: () => this.settings.get().logSupervision.maxUnpackBytes,
       issueMemory: () => requireSup().issueMemory(),
       ...(this.fetchImpl === undefined ? {} : { fetch: this.fetchImpl }),
+      listPlatformLogs: params => requireSup().listPlatformLogs(params),
       platformDownload: (log, dir, fileName, download, signal) =>
         requireSup().platformDownload(log, dir, fileName, download, signal),
       resolveTaskForSession: (sessionId, taskId) =>

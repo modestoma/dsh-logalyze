@@ -1,7 +1,8 @@
 /**
- * 分析报告回传：分析接口接受请求后，观象记录这次分析，并在分析话题的每一轮
- * 结束时更新记录，再把报告作为一个新修订传到这批日志的每一份（日志平台的
- * 详情页显示最新完成的修订）。
+ * 接口分析的报告回传：已下线的日志平台分析接口留下的分析记录，在它们的飞书话题
+ * 里每有一轮追问结束，观象就更新记录，再把报告作为一个新修订传到这批日志的每一份
+ * （日志平台的详情页显示最新完成的修订）。不再产生新记录；自动日志监管的回传见
+ * `log/supervisor.ts` 的 Outbox。
  *
  * - 轮次来自 DSH 的 `session/event`：经 `feishuTopics.launchKeyOf` 把 Session
  *   对应到请求，`/renew` 之后的新 Session 也能对上。首轮的最终回复写成整批
@@ -16,15 +17,14 @@
  *   4xx、报告超过上限）标记在这份日志上，等内容变化或在面板手动重传。
  * - 一份日志第一次完成修订后，根卡片表格的「分析报告」列补上它的分析页链接
  *   （每份日志固定，只补一次）。
- * - 启动时和每接受一次新分析时按存储的保留规则清理旧记录；正在上传或更新的
- *   记录这次不清理。
+ * - 启动时按存储的保留规则清理旧记录；正在上传或更新的记录这次不清理。
  *
  * @module dsh-supervisor/report/tracker
  */
 
 import { lstat, mkdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { analysisCardLinks } from '../analyze/topics.ts'
+import { analysisCardLinks } from './links.ts'
 import type { FeishuTopicService, TopicLaunchState } from '../deps/topics-contract.ts'
 import type { SessionEventEnvelope, SessionHeader } from '../host.ts'
 import { PlatformError } from '../platform/client.ts'
@@ -160,32 +160,6 @@ export class ReportTracker {
    */
   byKey(key: string): AnalysisRecord | undefined {
     return this.deps.store.get(analysisIdOf(key))
-  }
-
-  /**
-   * Store a new analysis before its topic is launched, so log numbers resolve
-   * as soon as the first turn runs.
-   * @param record - the new record.
-   */
-  async accept(record: AnalysisRecord): Promise<void> {
-    await this.deps.store.put(record)
-    await this.prune()
-  }
-
-  /**
-   * Drop an analysis whose topic was not launched.
-   * @param id - analysis id.
-   */
-  async forget(id: string): Promise<void> {
-    await this.deps.store.remove(id)
-  }
-
-  /**
-   * Pick up the launch state of a launched analysis.
-   * @param id - analysis id.
-   */
-  async launched(id: string): Promise<void> {
-    await this.reconcileOne(id)
   }
 
   /** Drop expired and excess records that no upload or update is using. */

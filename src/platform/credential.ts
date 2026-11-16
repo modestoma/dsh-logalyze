@@ -1,9 +1,8 @@
 /**
- * 保存在 DSH 凭据库中的凭据：分析接口的 Bearer 令牌（凭据名是配置项
- * `analyzeTokenRef`）和日志平台的 client_secret（`platformSecretRef`）。面板只能
- * 看到是否已配置和来源，看不到值。
+ * 保存在 DSH 凭据库中的凭据：日志平台的 OAuth2 client_secret（凭据名是配置项
+ * `platformSecretRef`）。面板只能看到是否已配置和来源，看不到值。
  *
- * @module dsh-supervisor/analyze/token
+ * @module dsh-supervisor/platform/credential
  */
 
 import { z } from 'zod'
@@ -26,8 +25,8 @@ export class StoredCredential {
   private migrating: Promise<void> | undefined
 
   /**
-   * @param ref - credential reference (`analyzeTokenRef` or `platformSecretRef`).
-   * @param label - what the credential is, in messages (e.g. `分析接口令牌`).
+   * @param ref - credential reference (`platformSecretRef`).
+   * @param label - what the credential is, in messages (e.g. `日志平台 client_secret`).
    * @param credentials - DSH's credential store, looked up per use.
    * @param warn - receives credential store failures.
    * @param legacyRef - optional legacy credential reference to migrate from (`LOGALYZE_*`).

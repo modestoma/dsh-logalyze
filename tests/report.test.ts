@@ -1,15 +1,10 @@
 import { access, mkdir, readFile, symlink, truncate, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { resolveBatch } from '../src/analyze/batch.ts'
-import { analyzeRequestHash } from '../src/analyze/contract.ts'
-import type { AnalyzeRequest } from '../src/analyze/contract.ts'
-import { newAnalysisRecord } from '../src/analyze/record.ts'
 import { defaultsOf, resolveConfig } from '../src/config.ts'
 import type { FeishuTopicService, TopicCardLinks, TopicLaunchState } from '../src/deps/topics-contract.ts'
 import type { SessionEventEnvelope } from '../src/host.ts'
 import { PlatformClient, PlatformError } from '../src/platform/client.ts'
-import type { PlatformLog } from '../src/platform/client.ts'
 import { listReport } from '../src/report/files.ts'
 import { LegacyReports } from '../src/report/legacy.ts'
 import { buildManifest, pathProblem } from '../src/report/manifest.ts'
@@ -18,37 +13,16 @@ import { analysisIdOf, AnalysisStore, MAX_REPORT_RECORDS, REPORT_RETENTION_MS } 
 import type { AnalysisRecord } from '../src/report/store.ts'
 import { INTERRUPTED_REASON, ReportTracker, statusOfTurnEnd } from '../src/report/tracker.ts'
 import { uploadRevision } from '../src/report/upload.ts'
-import type { AppManifest, UploadSettings } from '../src/settings/contract.ts'
-import { FakePlatform, logUuid, orderLog } from './fake-platform.ts'
-import type { FakeLog } from './fake-platform.ts'
+import type { UploadSettings } from '../src/settings/contract.ts'
+import { analysisRecord, FakePlatform, logUuid, orderLog } from './fake-platform.ts'
 import { tempDir } from './helpers.ts'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { await Promise.all(cleanups.splice(0).map(cleanup => cleanup())) })
 
 const DAY = 24 * 60 * 60 * 1000
-const ORDER: AppManifest = { id: 'order-service', name: '订单服务', description: '', aliases: ['order'], logHints: [], skill: 'log-analysis' }
-
-const REQUEST: AnalyzeRequest = {
-  triggerType: 'digital',
-  triggerId: 'u_alice',
-  triggeredAt: '2026-10-28 09:30',
-  chatId: 'oc_group1',
-  logIds: [logUuid(1), logUuid(2)],
-}
-
-function platformLog(log: FakeLog): PlatformLog {
-  return { product_code: null, product_sn: null, hw_version: null, sw_version: null, component_version: null, log_type: null, file_size_bytes: null, created_at: null, archived_at: null, detail_url: null, ...log }
-}
-
 /** A new analysis of the given logs under one key. */
-function analysis(key: string, count = 2, acceptedAt = Date.now()): AnalysisRecord {
-  const logs = Array.from({ length: count }, (_, index) => orderLog(index + 1))
-  const request = { ...REQUEST, logIds: logs.map(log => log.log_id) }
-  const batch = resolveBatch(request.logIds, logs.map(platformLog), [ORDER])
-  if (!batch.ok) throw new Error(batch.error)
-  return newAnalysisRecord(request, key, analyzeRequestHash(request), batch.value, acceptedAt)
-}
+const analysis = analysisRecord
 
 describe('report rendering', () => {
   it('makes report/ links relative to the report directory and reports links the caller cannot open', () => {
@@ -226,8 +200,8 @@ async function harness(options: { storeDir?: string; platform?: FakePlatform } =
     },
     start: async (record = analysis('req-1')) => {
       topic.state ??= { key: record.key, status: 'running', sessionId: topic.sessionId, workDir }
-      await tracker.accept(record)
-      await tracker.launched(record.id)
+      await store.put(record)
+      await tracker.reconcile()
       return record
     },
   }
@@ -482,13 +456,11 @@ describe('report retention', () => {
     expect(store.all()).toHaveLength(MAX_REPORT_RECORDS)
   })
 
-  it('prunes when the tracker boots and when it accepts a new analysis', async () => {
+  it('prunes when the tracker boots', async () => {
     const h = await harness()
     await h.store.put(record('stale', Date.now() - REPORT_RETENTION_MS - DAY))
+    await h.store.put(analysis('req-1', 1))
     await h.tracker.boot()
-    expect(h.store.get(analysisIdOf('stale'))).toBeUndefined()
-    await h.store.put(record('stale', Date.now() - REPORT_RETENTION_MS - DAY))
-    await h.start(analysis('req-1', 1))
     expect(h.store.all().map(item => item.key)).toEqual(['req-1'])
   })
 

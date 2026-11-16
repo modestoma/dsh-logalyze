@@ -35,6 +35,9 @@ export const LOG_PREPARE_TOOL_NAME = 'supervisor_log_prepare'
 /** Searches local IssueMemory for matching historical issues and human conclusions. */
 export const ISSUE_SEARCH_TOOL_NAME = 'supervisor_issue_search'
 
+/** Counts archived platform logs of the bound batch's product/component/error group, with version distribution and first/last archive time. */
+export const LOG_GROUP_STATS_TOOL_NAME = 'supervisor_log_group_stats'
+
 /** Submits or revises structured per-log conclusions, enqueues idempotent platform report uploads, and updates IssueMemory. */
 export const LOG_SUBMIT_TOOL_NAME = 'supervisor_log_submit'
 

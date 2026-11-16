@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { resolveConfig } from '../src/config.ts'
 import { PlatformClient, PlatformError, platformProblem, TOKEN_REFRESH_MARGIN_MS } from '../src/platform/client.ts'
 import type { PlatformSettings } from '../src/settings/contract.ts'
 import { FakePlatform, logUuid, orderLog } from './fake-platform.ts'
@@ -67,6 +68,30 @@ describe('platform client', () => {
     await expect(wrong.client.findLogs([logUuid(1)])).rejects.toThrow('未配置 client_secret')
   })
 
+  it('authenticates with HTTP Basic by default, as the platform refuses credentials in the body', async () => {
+    platform.addLog(orderLog(1))
+    const defaults = resolveConfig({ analyze: { platform: { baseUrl: platform.base, tokenUrl: `${platform.base}/oauth/token`, clientId: 'supervisor' } } }).analyze.platform
+    const { client: api } = client({ clientAuth: defaults.clientAuth })
+    await api.findLogs([logUuid(1)])
+    expect(platform.calls('token')[0]!.headers.authorization).toMatch(/^Basic /u)
+    const body = client({ clientAuth: 'body' })
+    await expect(body.client.findLogs([logUuid(1)])).rejects.toMatchObject({ retryable: false })
+  })
+
+  it('sends only the archive window, status, and the filters it was given when listing a page', async () => {
+    platform.addLog(orderLog(1))
+    platform.addLog(orderLog(2, { error_code: 'E2002' }))
+    const { client: api } = client()
+    const window = { archivedFrom: '2026-11-10T00:00:00Z', archivedTo: '2026-11-11T00:00:00Z' }
+    const page = await api.listLogsPage({ ...window, componentCode: 'order', errorCode: 'E2002', limit: 500 })
+    expect(page.items.map(log => log.log_id)).toEqual([logUuid(2)])
+    expect(page.nextCursor).toBeUndefined()
+    const query = new URLSearchParams(platform.calls('logs')[0]!.path.split('?')[1])
+    expect([...query.keys()].sort()).toEqual(['archived_from', 'archived_to', 'component_code', 'error_code', 'limit', 'status'])
+    expect(query.get('limit')).toBe('100')
+    expect(query.get('status')).toBe('completed')
+  })
+
   it('classifies failures as retryable or not and keeps the request id', async () => {
     platform.addLog(orderLog(1))
     const { client: api } = client()
@@ -98,6 +123,9 @@ describe('platform client', () => {
     expect(replayed.analysis_id).toBe(created.analysis_id)
     await api.put(replayed.uploads[0]!.upload_url, Buffer.from('abc'), 5000)
     expect(await api.completeAnalysis(logUuid(1), created.analysis_id)).toBe(`${platform.base}/logs/${logUuid(1)}/analysis`)
+    // A replay of the completed revision answers `expires_at: null` and no upload links.
+    const completedReplay = await api.createAnalysis(logUuid(1), 'key-1', 'report.md', [{ path: 'report.md', sizeBytes: 3 }])
+    expect(completedReplay).toMatchObject({ analysis_id: created.analysis_id, expires_at: null })
     await expect(api.createAnalysis(logUuid(1), 'key-1', 'report.md', [{ path: 'report.md', sizeBytes: 4 }])).rejects.toMatchObject({ status: 409 })
     platform.fail('put', 403)
     await expect(api.put(replayed.uploads[0]!.upload_url, Buffer.from('abc'), 5000)).rejects.toMatchObject({ status: 403, retryable: true })

@@ -1,9 +1,15 @@
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
+import { analysisIdOf } from '../src/report/store.ts'
+import type { AnalysisRecord } from '../src/report/store.ts'
 import type { PlatformSettings } from '../src/settings/contract.ts'
 
-/** One log the fake platform knows, in the platform's field names. */
+/**
+ * One log the fake platform knows, in the platform's field names. Mirrors
+ * digital_system's `GET /open-api/v1/logs` item, which has no `storage_type`
+ * and carries fields the plugin ignores (`request_id`, `client_code`, …).
+ */
 export interface FakeLog {
   log_id: string
   product_code?: string | null
@@ -14,13 +20,20 @@ export interface FakeLog {
   component_version?: string | null
   error_code: string | null
   file_name: string
-  storage_type: string
   log_type?: string | null
   status: string
   file_size_bytes?: string | null
   created_at?: string | null
   archived_at?: string | null
   detail_url?: string | null
+  request_id?: string
+  client_code?: string
+  client_name?: string
+  factory_code?: string | null
+  hw_level?: string | null
+  hw_region?: string | null
+  file_sha256?: string | null
+  last_error?: string | null
 }
 
 /** One analysis revision created on the fake platform. */
@@ -44,9 +57,11 @@ export interface FakeRequest {
 }
 
 /**
- * A local stand-in for the log platform's open API: the token endpoint,
- * metadata query, download links, and analysis revisions with presigned
- * uploads. Failures are injected per route with {@link FakePlatform.fail}.
+ * A local stand-in for digital_system's open API: the token endpoint (HTTP
+ * Basic only, as digital_system accepts), metadata query (unknown query keys
+ * rejected, archive-time filters matching archived logs only), download
+ * links, and analysis revisions with presigned uploads. Failures are injected
+ * per route with {@link FakePlatform.fail}.
  */
 export class FakePlatform {
   readonly logs = new Map<string, FakeLog>()
@@ -76,7 +91,7 @@ export class FakePlatform {
 
   /** Platform settings pointing at this server. */
   settings(overrides: Partial<PlatformSettings> = {}): PlatformSettings {
-    return { baseUrl: this.base, tokenUrl: `${this.base}/oauth/token`, clientId: 'supervisor', clientAuth: 'body', scope: 'log:search log:download log:upload', timeoutMs: 5000, ...overrides }
+    return { baseUrl: this.base, tokenUrl: `${this.base}/oauth/token`, clientId: 'supervisor', clientAuth: 'basic', scope: 'log:search log:download log:upload', timeoutMs: 5000, ...overrides }
   }
 
   /** Add a log with downloadable content. */
@@ -151,15 +166,18 @@ export class FakePlatform {
 
   private token(request: FakeRequest, res: ServerResponse): void {
     const form = new URLSearchParams(request.body)
+    // digital_system: credentials only in the Basic header; a body credential is invalid_request.
+    if (form.has('client_id') || form.has('client_secret')) return send(res, 400, { error: 'invalid_request' })
     const basic = /^Basic (.+)$/u.exec(request.headers.authorization ?? '')?.[1]
-    const [id, secret] = basic === undefined
-      ? [form.get('client_id'), form.get('client_secret')]
-      : Buffer.from(basic, 'base64').toString('utf8').split(':').map(part => decodeURIComponent(part.replace(/\+/gu, ' ')))
-    if (form.get('grant_type') !== 'client_credentials' || id !== 'supervisor' || secret !== this.secret) return send(res, 401, { error: 'invalid_client' })
+    if (basic === undefined) return send(res, 401, { error: 'invalid_client' })
+    const [id, secret] = Buffer.from(basic, 'base64').toString('utf8').split(':').map(part => decodeURIComponent(part.replace(/\+/gu, ' ')))
+    if (form.get('grant_type') !== 'client_credentials') return send(res, 400, { error: 'unsupported_grant_type' })
+    if ((form.get('scope') ?? '') === '') return send(res, 400, { error: 'invalid_scope' })
+    if (id !== 'supervisor' || secret !== this.secret) return send(res, 401, { error: 'invalid_client' })
     this.issued += 1
     const token = `token-${this.issued}`
     this.valid.add(token)
-    send(res, 200, { access_token: token, token_type: 'Bearer', expires_in: this.expiresIn })
+    send(res, 200, { access_token: token, token_type: 'Bearer', expires_in: this.expiresIn, scope: form.get('scope') })
   }
 
   private create(logId: string, request: FakeRequest, res: ServerResponse): void {
@@ -191,7 +209,8 @@ export class FakePlatform {
     return {
       analysis_id: revision.id,
       status: revision.completed ? 'completed' : 'pending',
-      expires_at: '2026-11-10T11:00:00Z',
+      // digital_system: a replay of a completed revision has no links and `expires_at: null`.
+      expires_at: revision.completed ? null : '2026-11-10T11:00:00Z',
       uploads: revision.completed ? [] : pending.map(path => ({ path, upload_url: `${this.base}/upload/${revision.id}/${path}?sig=x` })),
     }
   }
@@ -284,7 +303,8 @@ export class FakePlatform {
         if (componentCode !== null && log.component_code !== componentCode) return false
         if (errorCode !== null && log.error_code !== errorCode) return false
         if (fromMs !== undefined || toMs !== undefined) {
-          const archivedStr = log.archived_at ?? log.created_at
+          // Archive-time conditions match archived logs only.
+          const archivedStr = log.archived_at
           const archivedMs = archivedStr === undefined || archivedStr === null ? Number.NaN : Date.parse(archivedStr)
           if (Number.isNaN(archivedMs)) return false
           if (fromMs !== undefined && archivedMs < fromMs) return false
@@ -339,12 +359,67 @@ export function orderLog(n: number, overrides: Partial<FakeLog> = {}): FakeLog {
     component_version: '1.4.0',
     error_code: 'E1001',
     file_name: `device-${n}.tar.gz`,
-    storage_type: 'fds',
     log_type: 'crash',
     status: 'completed',
     file_size_bytes: '2048',
     created_at: '2026-11-10T08:00:00Z',
+    archived_at: '2026-11-10T08:01:00Z',
     detail_url: `https://logs.example.com/logs/${n}`,
+    request_id: `device-${n}-req`,
+    client_code: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+    client_name: 'factory-log-uploader',
+    factory_code: '',
+    hw_level: 'P1',
+    hw_region: 'CN',
+    file_sha256: '0'.repeat(64),
+    last_error: null,
     ...overrides,
+  }
+}
+
+/**
+ * An analysis the retired analyze API accepted for `order-service` / `E1001`,
+ * with nothing recorded or uploaded yet.
+ * @param key - its `Idempotency-Key`.
+ * @param count - number of logs.
+ * @param acceptedAt - acceptance time, epoch milliseconds.
+ * @returns the record.
+ */
+export function analysisRecord(key: string, count = 2, acceptedAt = Date.now()): AnalysisRecord {
+  const logs = Array.from({ length: count }, (_, index) => orderLog(index + 1))
+  return {
+    id: analysisIdOf(key),
+    key,
+    fingerprint: `fp-${key}`,
+    triggerType: 'digital',
+    triggerId: 'u_alice',
+    triggeredAt: '2026-10-28 09:30',
+    chatId: 'oc_group1',
+    app: 'order-service',
+    appName: '订单服务',
+    componentCode: 'order',
+    errorCode: 'E1001',
+    logs: logs.map((log, index) => ({
+      ref: `L${index + 1}`,
+      logId: log.log_id,
+      fileName: log.file_name,
+      productSn: log.product_sn ?? null,
+      hwVersion: log.hw_version ?? null,
+      swVersion: log.sw_version ?? null,
+      componentVersion: log.component_version ?? null,
+      logType: log.log_type ?? null,
+      sizeBytes: log.file_size_bytes ?? null,
+      createdAt: log.created_at ?? null,
+      ...log.detail_url === null || log.detail_url === undefined ? {} : { detailUrl: log.detail_url },
+      uploadedRevision: 0,
+      generation: 0,
+    })),
+    acceptedAt,
+    sections: [],
+    turns: {},
+    snapshot: {},
+    warnings: [],
+    skipped: [],
+    revision: 0,
   }
 }

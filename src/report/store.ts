@@ -1,5 +1,5 @@
 /**
- * 分析记录的持久化：每次分析一个 JSON 文件
+ * 已下线分析接口留下的分析记录的持久化：每次分析一个 JSON 文件
  * `$DSH_HOME/supervisor/analyses/<id>.json`，写入先落临时文件再改名；读到的
  * 内容按 {@link analysisRecordSchema} 校验，不合格的文件记日志后跳过。
  *

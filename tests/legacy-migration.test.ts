@@ -3,8 +3,6 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { analyzeRequestHash } from '../src/analyze/contract.ts'
-import type { AnalyzeRequest } from '../src/analyze/contract.ts'
 import { analysisIdOf } from '../src/report/store.ts'
 import type { AnalysisRecord } from '../src/report/store.ts'
 import { defaultsOf, resolveConfig } from '../src/config.ts'
@@ -205,17 +203,10 @@ describe('legacy logalyze state migration', () => {
     const nowMs = Date.now()
     const analysisKey = 'legacy-pending-key'
     const analysisId = analysisIdOf(analysisKey)
-    const pendingReq: AnalyzeRequest = {
-      triggerType: 'digital',
-      triggerId: 'u_alice',
-      triggeredAt: '2026-11-14 10:00',
-      chatId: 'oc_migrated_group',
-      logIds: [log.log_id],
-    }
     const analysisRecord: AnalysisRecord = {
       id: analysisId,
       key: analysisKey,
-      fingerprint: analyzeRequestHash(pendingReq),
+      fingerprint: 'legacy-fingerprint',
       triggerType: 'digital',
       triggerId: 'u_alice',
       triggeredAt: '2026-11-14 10:00',
@@ -286,8 +277,9 @@ describe('legacy logalyze state migration', () => {
     const state = await (await fetch(`${h.base}/supervisor/state`)).json() as StateWire
     expect(state.overridden).toEqual(['maxAppsPerRequest', 'analyze'])
     expect(state.settings.maxAppsPerRequest).toBe(2)
-    expect(state.settings.analyze.enabled).toBe(true)
-    expect(state.settings.analyze.defaultChatId).toBe('oc_migrated_group')
+    // The retired analyze API's switch and default group are dropped from the migrated overlay.
+    expect(state.settings.analyze).not.toHaveProperty('enabled')
+    expect(state.settings.analyze).not.toHaveProperty('defaultChatId')
     expect(state.repos[0]?.app).toMatchObject({
       id: 'custom-panel-id',
       name: '面板应用名称',
@@ -298,7 +290,6 @@ describe('legacy logalyze state migration', () => {
     expect(state.issues?.totalCount).toBe(1)
     expect(state.issues?.items[0]?.title).toBe('历史已知问题')
     expect(state.logSupervision?.watermark?.cursorTime).toBe('2026-11-10T00:00:00Z')
-    expect(state.analyze.token).toMatchObject({ tokenEnv: 'SUPERVISOR_ANALYZE_TOKEN', configured: true, source: 'file' })
     expect(state.analyze.secret).toMatchObject({ tokenEnv: 'SUPERVISOR_PLATFORM_CLIENT_SECRET', configured: true, source: 'file' })
 
     // Pending analysis upload resumed from migrated `$DSH_HOME/supervisor/analyses`.
@@ -306,10 +297,9 @@ describe('legacy logalyze state migration', () => {
     expect(platform.revisions[0]?.completed).toBe(true)
     expect([...platform.revisions[0]!.files.keys()].sort()).toEqual(['chart.png', 'report.md'])
 
-    // Credentials were migrated to `SUPERVISOR_*`.
-    expect(credentials.stored.get('SUPERVISOR_ANALYZE_TOKEN')?.value).toBe('legacy-api-token')
+    // The platform secret was migrated to `SUPERVISOR_*`; the retired analyze API's token is no longer read.
+    expect(credentials.stored.has('SUPERVISOR_ANALYZE_TOKEN')).toBe(false)
     expect(credentials.stored.get('SUPERVISOR_PLATFORM_CLIENT_SECRET')?.value).toBe(platform.secret)
-    expect(credentials.stored.has('LOGALYZE_ANALYZE_TOKEN')).toBe(false)
     expect(credentials.stored.has('LOGALYZE_PLATFORM_CLIENT_SECRET')).toBe(false)
 
     // Persisted files now live under `$DSH_HOME/supervisor` (and fallback `domain/dsh_supervisor.json`).
@@ -322,23 +312,6 @@ describe('legacy logalyze state migration', () => {
     })
     await expect(stat(join(supervisorDir, 'analyses', `${analysisId}.json`))).resolves.toBeDefined()
     await expect(stat(join(supervisorDir, 'reports', `${legacyReportId}.json`))).resolves.toBeDefined()
-
-    // Analyze API works with the migrated bearer token and default group.
-    const postRes = await fetch(`${h.base}/open-api/supervisor`, {
-      method: 'POST',
-      headers: {
-        authorization: 'Bearer legacy-api-token',
-        'idempotency-key': 'post-migration-req',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        triggerType: 'digital',
-        triggerId: 'u_bob',
-        triggeredAt: '2026-11-15 12:00',
-        logIds: [log.log_id],
-      }),
-    })
-    expect(postRes.status).toBe(202)
   })
 
   it('never overwrites existing files in $DSH_HOME/supervisor and never resurrects pruned legacy records on restart', async () => {

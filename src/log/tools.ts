@@ -1,7 +1,8 @@
 /**
- * 观象日志监管（`log-supervisor`）的 4 个核心模型工具：
+ * 观象日志监管（`log-supervisor`）的模型工具：
  * 1. `supervisor_log_prepare`：幂等准备 `<workDir>/{logs,repos,scratch}`（兼容平台自动任务与飞书人工附件/URL），检出可检索代码与仓库 SKILL，并预检索 `IssueMemory`；
  * 2. `supervisor_issue_search`：在分析中随时检索本地已知问题库（`humanConclusion` 人工结论优先展示）；
+ *    `supervisor_log_group_stats`：只读查询平台批次同组 `(product, component, error)` 的历史数量、版本分布与首末归档时间；
  * 3. `supervisor_log_submit`：1:1 槽位覆盖校验 + 证据路径真实性校验 + 附件快照，原子写入 `log_tasks` 修订并触发 `IssueMemory` 更新与 `OutboxRunner` 回传；
  * 4. `supervisor_log_push_mr`：携带调用者 `agent` / `callId` 经 `dshRepos.workspacePush` 提交 `fix_code` 或隔离工作区 `improve_skill` MR，回填 `IssueMemory.fixMrUrl` 并登记进「审微」MR 监管队列。
  *
@@ -17,6 +18,7 @@ import type { ReadyApp } from '../apps/registry.ts'
 import type { DshRepos } from '../deps/repos-contract.ts'
 import type { ContentBlock, ToolDefinition, ToolRunContext } from '../host.ts'
 import type { IssueMemory, SearchedIssue } from '../issues/memory.ts'
+import type { ListLogsPageParams, PlatformLogPage } from '../platform/client.ts'
 import type { RegisterSelfMrInput } from '../mr/supervisor.ts'
 import { pathProblem } from '../report/manifest.ts'
 import { admitUrl, downloadLog, fileNameFor, safeFileName } from '../runs/download.ts'
@@ -36,16 +38,21 @@ import {
 } from '../settings/contract.ts'
 import {
   ISSUE_SEARCH_TOOL_NAME,
+  LOG_GROUP_STATS_TOOL_NAME,
   LOG_PREPARE_TOOL_NAME,
   LOG_PUSH_MR_TOOL_NAME,
   LOG_SUBMIT_TOOL_NAME,
 } from '../tool-names.ts'
 import { messageOf } from '../util/errors.ts'
+import { collectGroupStats, type LogGroup, type LogGroupStats } from './group-stats.ts'
 import { appSlugOf, buildDefaultActionsForRevision } from './prompt.ts'
 import { unpackLogSlot } from './unpack.ts'
 
 const MAX_PREPARED_LOGS = 20
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+const DEFAULT_GROUP_STATS_DAYS = 30
+const MAX_GROUP_STATS_DAYS = 180
+const DAY_MS = 24 * 60 * 60 * 1000
 
 /** Discovered optional skill inside a checked-out application repository. */
 export interface DiscoveredRepoSkill {
@@ -89,6 +96,12 @@ export interface LogToolsRuntime {
     download: DownloadSettings,
     signal: AbortSignal,
   ): Promise<string>
+  /**
+   * Read one page of archived platform logs.
+   * @param params - archive window, exact filters, and paging.
+   * @returns the page's logs and the next cursor.
+   */
+  listPlatformLogs(params: ListLogsPageParams): Promise<PlatformLogPage>
   readonly fetch?: typeof fetch
   resolveTaskForSession(sessionId: string, taskId?: string): { readonly taskId: string; readonly task: LogTaskRecord } | undefined
   withSessionOperation<T>(sessionId: string, fn: () => Promise<T>): Promise<T>
@@ -133,6 +146,11 @@ const issueSearchArgsSchema = z.object({
   query: z.string().trim().min(1, '检索关键词不能为空'),
   app: z.string().trim().min(1).optional(),
   limit: z.number().int().min(1).max(30).optional(),
+}).strict()
+
+const groupStatsArgsSchema = z.object({
+  taskId: z.string().trim().min(1).optional(),
+  days: z.number().int().min(1).max(MAX_GROUP_STATS_DAYS).optional(),
 }).strict()
 
 const issueLinkSchema = z.union([
@@ -483,7 +501,23 @@ function formatIssueCandidates(issues: readonly SearchedIssue[]): unknown[] {
   }))
 }
 
-/** Create the 4 unified `log-supervisor` tools. */
+/**
+ * The batch key of a platform task, read from its first input that carries a component code.
+ * @param task - a log task.
+ * @returns the group, or undefined for a task without platform metadata.
+ */
+function taskGroupOf(task: LogTaskRecord): LogGroup | undefined {
+  if (task.source !== 'platform') return undefined
+  const input = task.inputs.find(entry => entry.componentCode !== undefined)
+  if (input?.componentCode === undefined) return undefined
+  return {
+    componentCode: input.componentCode,
+    ...(input.productCode === undefined ? {} : { productCode: input.productCode }),
+    ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
+  }
+}
+
+/** Create the unified `log-supervisor` tools. */
 export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown>[] {
   const prepareTool: ToolDefinition<{
     readonly taskId: string
@@ -770,6 +804,43 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
         count: hits.length,
         issues: formatIssueCandidates(hits),
       }
+    },
+  }
+
+  const groupStatsTool: ToolDefinition<LogGroupStats & { readonly taskId: string; readonly days: number }> = {
+    name: LOG_GROUP_STATS_TOOL_NAME,
+    description: '只读查询当前平台批次同组（product_code、component_code、error_code 完全相同）在最近若干天内的已归档日志：总数、sw_version / component_version 分布与首末归档时间，用于判断问题是新出现、持续存在还是集中在某些版本。不返回下载链接；飞书人工任务没有分组，不能使用。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        taskId: { type: 'string', description: '可选：当前会话绑定的平台日志任务 ID' },
+        days: { type: 'integer', minimum: 1, maximum: MAX_GROUP_STATS_DAYS, description: `回看天数（默认 ${DEFAULT_GROUP_STATS_DAYS}）` },
+      },
+    },
+    output: {
+      schema: { type: 'object' },
+      render: (_args, value) => textBlock(value),
+    },
+    async execute(rawArgs, exec) {
+      const parsed = groupStatsArgsSchema.safeParse(rawArgs)
+      if (!parsed.success) {
+        throw new Error(`${LOG_GROUP_STATS_TOOL_NAME} 参数无效：${parsed.error.issues[0]?.message ?? parsed.error.message}`)
+      }
+      const args = parsed.data
+      const bound = runtime.resolveTaskForSession(sessionIdOf(exec), args.taskId)
+      if (bound === undefined) {
+        throw new Error('当前会话尚未绑定任何日志监管任务，无法确定要统计的分组')
+      }
+      const group = taskGroupOf(bound.task)
+      if (group === undefined) {
+        throw new Error(`任务 ${bound.taskId} 不是平台日志批次（缺少 component_code），没有可统计的同组历史`)
+      }
+      const days = args.days ?? DEFAULT_GROUP_STATS_DAYS
+      const now = runtime.now()
+      const window = { archivedFrom: new Date(now - days * DAY_MS).toISOString(), archivedTo: new Date(now).toISOString() }
+      const stats = await collectGroupStats(group, window, params => runtime.listPlatformLogs(params))
+      return { taskId: bound.taskId, days, ...stats }
     },
   }
 
@@ -1247,6 +1318,7 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
   return [
     prepareTool as ToolDefinition<unknown>,
     issueSearchTool as ToolDefinition<unknown>,
+    groupStatsTool as ToolDefinition<unknown>,
     submitTool as ToolDefinition<unknown>,
     pushMrTool as ToolDefinition<unknown>,
   ]

@@ -4,7 +4,7 @@
 
 智能监管（npm 包名 `dsh-supervisor`，Cordis 插件名 `supervisor`）是面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的 AI 原生智能监管中心底座与统一交付插件，下辖两大领域监管能力：
 
-- **观象（日志监管）**：`/supervisor` 入口识别应用与派发子 Agent、日志平台分析接口与报告回传、面板归属的应用描述与触发别名设置、可选 DSH SKILL 发现与加载。
+- **观象（日志监管）**：`/supervisor` 入口识别应用与派发子 Agent、从日志平台自动拉取日志分批分析与报告回传、面板归属的应用描述与触发别名设置、可选 DSH SKILL 发现与加载。
 - **审微（MR 自动评审）**：自动跟随 `dsh-repo` 中启用「MR 自动评审」的代码仓库，依托 `dshRepos` v8 行级评审契约与 `dsh_supervisor` 共享运行时提供持续增量评审支撑。
 
 详细架构与设计文档见 [`docs/supervisor/README.md`](docs/supervisor/README.md)。
@@ -15,7 +15,7 @@
 
 - **M1 跨插件底座与共享运行时**：协同 [dsh_channels](https://github.com/modestoma/dsh_channels)（`feishuActions` v1 非阻塞动作提议卡 + `feishuBitable` v1 多维表格服务端读写）与 [dsh-repo](https://github.com/modestoma/dsh-repo)（`dshRepos` v8 行级评审与讨论线程契约），建立 `dsh_supervisor` 存储域（7 张强类型表）、并发隔离池（`logPool` / `mrPool`）、滑动防抖器、滑动窗口熔断器与幂等 Outbox。
 - **M2 审微（MR 自动评审）**：自动跟随启用「MR 自动评审」的仓库，以「1 条 MR = 1 个持久化 `mr-reviewer` Session」完成首次行级评审、Push 增量重审、人类讨论回复与自动 Resolve，以及己方修复 MR（`self-fix` / `self-skill`）的 CI/评审跟进。
-- **M3 观象（日志自动监管与闭环处置）**：支持 `/supervisor` 手动入口、`/open-api/supervisor` 平台接口，以及 `logSupervision` 日志平台增量水位线轮询 + `(product, component, error_code)` 窗口攒批；集成共享镜像克隆（`<workDir>/repos/<app>`）、`IssueMemory` 检索、Outbox 报告回传，以及经 `propose_actions` 触发的一键 `[🔧 修复代码并提 MR]` / `[📚 改进分析流程 / 沉淀案例]` 闭环。
+- **M3 观象（日志自动监管与闭环处置）**：支持 `/supervisor` 手动入口，以及 `logSupervision` 日志平台增量水位线轮询 + `(product, component, error_code)` 窗口攒批；集成共享镜像克隆（`<workDir>/repos/<app>`）、`IssueMemory` 检索、Outbox 报告回传，以及经 `propose_actions` 触发的一键 `[🔧 修复代码并提 MR]` / `[📚 改进分析流程 / 沉淀案例]` 闭环。
 - **M4 问题库双向同步与统一面板**：本地 `IssueMemory` 与飞书多维表格后台双向幂等同步（严格隔离 AI 列与人工列），提供 Web 左侧栏「智能监管」5 标签页（运行总览 / 应用与日志监管 / MR 自动评审 / 已知问题库 / 模型与高级）整页面板。
 
 ## 核心能力
@@ -112,15 +112,12 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
       enabled: true                    # 默认开启；false = 子 Agent 不记录 SKILL 不足，也不询问
       maxFiles: 16                     # 一次改进最多新增或修改的文件数
       maxFileBytes: 262144             # 改进中单个文件和 SKILL 不足记录的大小上限
-    analyze:                           # 日志平台分析接口，见下文
-      enabled: false                   # 默认关闭
-      defaultChatId: oc_xxx            # 请求不带 chatId 时的目标群；不填则 chatId 必填
-      maxLogs: 10                      # 一次请求最多的 logIds（1–50，根卡片每份日志一行）
+    analyze:                           # 日志平台连接与报告回传，见下文（键名沿用旧名）
       platform:                        # 日志平台开放 API（观象是它的 OAuth2 客户端）
         baseUrl: https://logs.example.com           # 在后面拼 /open-api/v1/…
         tokenUrl: https://auth.example.com/oauth/token
         clientId: supervisor
-        clientAuth: body               # body = 表单字段；basic = HTTP Basic
+        clientAuth: basic              # basic = HTTP Basic（默认）；body = 表单字段
         scope: log:search log:download log:upload
         timeoutMs: 30000               # 单次接口调用 / 换令牌超时
       upload:                          # 报告回传，见下文；上限默认与日志平台一致
@@ -135,6 +132,7 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
     logSupervision:                    # 观象日志平台自动轮询、窗口攒批与闭环处置
       enabled: false                   # 默认关闭
       pollIntervalMs: 60000            # 轮询日志平台归档列表间隔
+      pollLagMs: 120000                # 只读取早于「现在 − 该值」归档的日志，容忍时钟偏差与平台迟提交
       batchSizeThreshold: 5            # 同组攒批达到该条数立即发车（1–50）
       maxBatchSize: 20                 # 单批最多容纳日志数（1–50，>= batchSizeThreshold）
       batchWindowMs: 300000            # 首批入槽后最大等待时间（0 表示不额外等待）
@@ -160,7 +158,6 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
       bitableUrl: https://example.feishu.cn/base/bascnxxx  # /base/<token> 或 /wiki/<node_token>
       table: tblxxx                    # 可选：数据表 ID 或表名（覆盖链接中 ?table=）
       syncIntervalMs: 300000           # 后台周期双向同步间隔（最小 5000）
-    analyzeTokenRef: SUPERVISOR_ANALYZE_TOKEN             # 接口访问令牌在 DSH 凭据库中的名称
     platformSecretRef: SUPERVISOR_PLATFORM_CLIENT_SECRET  # 日志平台 client_secret 在 DSH 凭据库中的名称
 ```
 
@@ -184,10 +181,10 @@ DSH Web 左侧栏的 **「智能监管」** 入口打开统一 5 标签页整页
 | 标签页 | ID | 内容与功能 |
 |---|---|---|
 | **运行总览** | `overview` | 日志与 MR 监管域健康总览、活跃任务计数、异常与已触发熔断器一键解除（`POST /supervisor/breakers/reset`）、平台报告死信队列重试及近期任务/MR 活动 |
-| **应用与日志监管** | `log` | 跟随 `dsh-repo` 已开启「日志分析」的应用仓库（支持就地编辑应用描述与单行添加/删除触发别名并保存 `PUT /supervisor/applications`）；`logSupervision` 水位线状态与暂停/恢复/时间回拨控制（`POST /supervisor/log-supervision/watermark`）、攒批参数、`/open-api/supervisor` 接口与 OAuth2 平台凭据（`PUT/DELETE /supervisor/token`）、日志下载/上传限制及最近报告回传与手动重传（`POST /supervisor/reports/upload`） |
+| **应用与日志监管** | `log` | 跟随 `dsh-repo` 已开启「日志分析」的应用仓库（支持就地编辑应用描述与单行添加/删除触发别名并保存 `PUT /supervisor/applications`）；`logSupervision` 水位线状态与暂停/恢复/时间回拨控制（`POST /supervisor/log-supervision/watermark`）、攒批参数与轮询安全滞后、日志平台连接与 OAuth2 client_secret（`PUT/DELETE /supervisor/token`）、日志下载/上传限制及最近报告回传与手动重传（`POST /supervisor/reports/upload`） |
 | **MR 自动评审** | `mr` | 跟随 `dsh-repo` 已开启「MR 自动评审」的仓库清单（含目标分支与只读/可写标记）、审微运行状态与熔断器、受监管 MR 列表（`open`/`merged`/`closed`/`draft_skipped`、origin 标记及待处理信号）、`mrReview` 并发/防抖/忽略标签/熔断阈值、`customInstructions` 与可选 `feishuChatId` 告警群 |
 | **已知问题库** | `issues` | `feishuBitable` v1 就绪状态、一键「立即同步」（`POST /supervisor/issues/sync`）与「检查字段映射」（`POST /supervisor/issues/check` 对 16 列标准 Schema 逐列诊断）、`issueSync` 表格链接/表名/周期配置、本地 `IssueMemory` 问题检索列表与 `humanConclusion` / `fixMrUrl` 状态 |
-| **模型与高级** | `advanced` | 只读展示 `cordis.yml` 运行时配置（`analyzeTokenRef`、`platformSecretRef`、`subagentProvider`、`refreshWaitMs`、`autoInvoke`）、仓库读取间隔与派发上限、`skillUpdates` 开关与文件限制，以及清除覆盖恢复默认值（`DELETE /supervisor/settings`） |
+| **模型与高级** | `advanced` | 只读展示 `cordis.yml` 运行时配置（`platformSecretRef`、`subagentProvider`、`refreshWaitMs`、`autoInvoke`）、仓库读取间隔与派发上限、`skillUpdates` 开关与文件限制，以及清除覆盖恢复默认值（`DELETE /supervisor/settings`） |
 
 面板读取状态走 `GET /supervisor/state`，保存设置走 `PUT /supervisor/settings`（写入 `$DSH_HOME/supervisor/settings.json`，仅保存与 `cordis.yml` 不同的覆盖键并共用同一 Zod 校验），所有 `/supervisor/*` 路由均经过宿主 `connection.requestRejection` 登录与来源校验，写操作另做同源校验。
 
@@ -226,110 +223,46 @@ DSH Web 左侧栏的 **「智能监管」** 入口打开统一 5 标签页整页
 
 > 除对话式触发 `supervisor_improve_skill` 外，在 `LogSupervisor` 监管话题中也可直接点击非阻塞动作按钮 **`[📚 改进分析流程 / 沉淀案例]`**，在隔离的知识工作区（`repos/<app>-knowledge`）中就地完善 SKILL/解析脚本与 `cases/` 案例，并通过 `supervisor_log_push_mr` 发起独立合并请求。
 
-## 日志平台分析接口
+## 日志平台连接
 
-日志平台调用观象的分析接口，传一批同一应用、同一错误码的日志 id（`logIds`）。观象作为 OAuth2 客户端向日志平台查出这批日志的元数据，按 `component_code` 找到应用，经飞书渠道插件的 `feishuTopics` 服务（例如由 [dsh_channels](https://github.com/modestoma/dsh_channels) 提供）在指定群里发一张分析卡，在卡片下开话题，用观象生成的首轮消息（`/supervisor` 加日志表和分析要求）开始分析，过程在话题内流式输出。每一轮结束后，观象把报告作为新修订传到这批日志的每一份（见[报告回传](#报告回传)）。群里通过准入的成员都可以在该话题内追问，追问的结论同样回传。
+观象是日志平台（如 digital_system）开放 API 的 OAuth2 client_credentials 客户端，只主动拉取，不对外开放任何接口：DSH 不提供 `/open-api/supervisor`，网关不需要为观象放行路径。日志何时分析、怎样分批，全部由[日志自动监管](#日志自动监管与闭环处置观象)决定。
 
-**前提**：
+**前提**：日志平台为观象开一个客户端，授权范围 `log:search log:download log:upload`，挂在能看到相关日志的账号下。
 
-- 飞书渠道插件已加载并提供 `feishuTopics` 服务：版本 3，且带 `state`、`launchKeyOf`、`updateLinks`（更新根卡片链接表）。没有这个服务时观象不注册接口；服务版本不兼容或缺少这些方法时观象记一条警告，也不注册。设置面板「分析接口」分页显示飞书渠道是否就绪。
-- 日志平台为观象开了一个 OAuth2 client_credentials 客户端，授权范围 `log:search log:download log:upload`，挂在能下载相关日志的账号下。
-- 只有带 Web 的 profile（web、desktop）有这个接口，headless 没有。
-
-**开启**：在设置面板「分析接口」打开开关（`analyze.enabled`，默认关，保存后立即生效），可以填一个默认群（`analyze.defaultChatId`，`oc_` 开头，请求不带 `chatId` 时用它），并在同一页保存访问令牌（建议 32 位以上随机串）。令牌存入 DSH 凭据库的 `SUPERVISOR_ANALYZE_TOKEN`（名称可用 `analyzeTokenRef` 修改），也可以设置同名环境变量或写进 `.env`。接口挂在 DSH Web 服务上（与 Web 界面同一端口），路径 `/open-api/supervisor` 放在 DSH 的 `/api` 之外，网关可以把它与需要登录的 DSH 接口分开放行；DSH 通过反向代理挂在前缀下时，地址随之带上前缀（如 `https://<域名>/dsh/open-api/supervisor`）。该路由不走 DSH 登录 cookie，访问令牌是唯一凭据。开关关闭时所有请求返回 404；令牌每次请求都重新读取，轮换后下一次请求生效；令牌未设置时所有请求返回 503。
-
-**日志平台**：同一页「日志平台」一节填接口地址（`analyze.platform.baseUrl`，观象在后面拼 `/open-api/v1/…`）、令牌地址（`tokenUrl`）、`client_id`，并保存 `client_secret`（存入 DSH 凭据库的 `SUPERVISOR_PLATFORM_CLIENT_SECRET`，名称可用 `platformSecretRef` 修改，不能和访问令牌同名）。客户端认证方式默认把 `client_id` / `client_secret` 放在表单里，也可以改成 HTTP Basic。访问令牌缓存在内存里，剩余不到 60 秒或接口返回 401 时重新换取（401 只重试一次）。三项没填齐时接口返回 503，面板写明缺什么。观象调用的平台接口：
+**配置**：在设置面板「应用与日志监管 → 日志平台连接」填接口地址（`analyze.platform.baseUrl`，观象在后面拼 `/open-api/v1/…`）、令牌地址（`tokenUrl`）、`client_id`，并保存 `client_secret`（存入 DSH 凭据库的 `SUPERVISOR_PLATFORM_CLIENT_SECRET`，名称可用 `platformSecretRef` 修改）。客户端认证默认用 HTTP Basic（digital_system 只接受这种方式），也可以改成表单字段（`clientAuth: body`）。访问令牌缓存在内存里，剩余不到 60 秒或接口返回 401 时重新换取（401 只重试一次）。三项没填齐时自动监管不轮询，面板写明缺什么。观象调用的平台接口：
 
 | 用途 | 接口 | scope |
 | --- | --- | --- |
+| 增量拉取归档日志 | `GET /open-api/v1/logs?archived_from=…&archived_to=…&status=completed` | `log:search` |
+| 同组历史统计 | 同上，加 `product_code`、`component_code`、`error_code` | `log:search` |
 | 按 id 查日志元数据 | `GET /open-api/v1/logs?log_id=…&log_id=…` | `log:search` |
 | 取 10 分钟下载链接 | `GET /open-api/v1/logs/{log_id}/download-url` | `log:download` |
 | 创建分析修订 | `POST /open-api/v1/logs/{log_id}/analyses`（带 `Idempotency-Key`） | `log:upload` |
 | 直传文件 | `PUT <uploads[].upload_url>`（不带平台令牌） | — |
 | 完成分析修订 | `POST /open-api/v1/logs/{log_id}/analyses/{analysis_id}/complete` | `log:upload` |
 
-**请求**：
+列表接口只带平台接受的查询参数，平台对未知或空参数返回 400。列表项的 `detail_url`（平台 Web 详情页）用作飞书卡片与报告里的日志链接；平台没给时退回 `<baseUrl>/logs/<log_id>`。
 
-```http
-POST /open-api/supervisor
-Authorization: Bearer <令牌>
-Idempotency-Key: <平台生成的唯一值，1-200 个可见 ASCII 字符>
-Content-Type: application/json
-
-{
-  "triggerType": "digital",
-  "triggerId": "a1b2c3d4",
-  "triggeredAt": "2026-10-22 19:30",
-  "chatId": "oc_xxx",
-  "logIds": ["019a42e0-0000-7000-8000-000000000001", "019a42e0-0000-7000-8000-000000000002"],
-  "instructions": "两台设备都在升级后出现，重点看升级流程"
-}
-```
-
-- `triggerType`：发起方类型，`digital` 或 `machine`。
-  - `digital`：从数字化平台发起，`triggerId` 是发起人的飞书 user_id（不能是 `ou_` / `on_` 开头的 open_id / union_id）。分析卡 @ 此人，首轮以此人为发言人提交，所以此人要在飞书渠道插件的用户表里有对话权限（否则返回 `403`）。
-  - `machine`：从拿不到飞书 user_id 的平台发起（例如 APP），`triggerId` 是该平台自己的标识（1–128 字符、单行）。分析卡开头显示为 `[machine] <triggerId>`，不 @ 任何人，也不检查飞书权限（访问令牌就是凭据）；首轮以群身份提交、没有发言人，首轮里提交的代码只带群的尾注。
-- `triggeredAt`：平台上发起分析的时间，1–64 字符，原样显示在分析卡上（时区和格式由平台决定）。
-- `chatId`：可选，目标群，机器人需在群内。不带时发到设置面板的默认群；两者都没有时返回 `400`。群本身不需要授权，群话题的知识库与代码改动权限在飞书渠道插件设置面板的群权限里按群配置。
-- `logIds`：日志平台的日志 id（UUID，不区分大小写），1 到 `analyze.maxLogs`（默认 10，最多 50）个，不能重复。一个 log_id 是一个日志包（通常是 ZIP）。
-- `instructions`：可选，调用方说明（1–20000 字符），放进首轮消息的「调用方说明」一节。
-- 除 `chatId` 和 `instructions` 外都必填，`triggerType`、`triggerId`、`triggeredAt`、最终用的群、`logIds`、`instructions` 共同组成幂等指纹。只接受以上 6 个字段；旧格式的 `prompt`、`logDetails`、`logId`、`app`、`errorCode` 返回 400 并说明改用什么，其他多余字段也返回 400。
-
-**核对日志**：参数校验通过后，观象按 `logIds` 查日志平台，下面任何一条不满足都返回 `422`，不发卡片：
-
-- 每份日志都查得到（查不到或客户端无权查看的会列出），`storage_type` 是 `fds` 且 `status` 是 `completed`，`component_code` 不为空。
-- 整批的 `component_code` 一致，`error_code` 一致（整批都为空也可以，卡片上显示「未标注」）。
-- `component_code` 与应用目录里恰好一个应用的 id 或 `aliases`（`.agents/logalyze.yaml`）逐字相等。没有对应的应用时，在该应用的 `aliases` 里加上它；同时对应多个应用时只保留一个。应用的仓库也要在 dsh-repo 中打开「日志分析」并同步完成。
-
-`422` 的响应除了 `error` 还有 `invalidLogs`（`[{ logId, reason }]`），列出不能分析的日志。日志平台不可达或暂时出错时返回 `503`，拒绝请求（如凭据无效）时返回 `502`。
-
-**响应**：分析卡发出后立即返回 `202`：
-
-```json
-{ "ok": true, "chatId": "oc_xxx", "messageId": "om_xxx" }
-```
-
-`messageId` 是分析卡的消息 id，分析话题挂在它下面。同步错误都带中文 `error`：`401` 令牌无效、`404` 接口开关未打开（或接口未注册）、`405` 不是 POST、`400` 参数或 `Idempotency-Key` 不合法、`403` 发起人（`digital` 的 `triggerId`）没有对话权限、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 256 KiB、`415` 不是 JSON、`422` 日志不能分析（见上）、`502` 日志平台拒绝或分析卡发送失败（如机器人不在群里）、`503` 飞书未连接、令牌或日志平台未配置、日志平台暂时不可用。
-
-**去重**：同一个 `Idempotency-Key` 再次请求（包括并发重试）原样返回第一次的结果，不会再查平台、再发卡、再分析。观象的分析记录和飞书渠道插件的发起记录都按这个键保存。分析卡发出后的失败（话题创建、Session 创建）不会回滚记录：分析卡的状态变成「失败」并写明原因，需要重试时请换一个新的 `Idempotency-Key`。
-
-**首轮消息**：观象生成，以 `/supervisor` 开头，依次是应用（及对应的 `component_code`）、错误码和发起时间，日志表（编号 L1…Ln、文件名、设备 SN、硬件 / 软件 / 组件版本、类型、大小、上传时间），「调用方说明」，「分析要求」（应用已确定，一次派发把全部编号交给该应用；多份日志时按根因分组，最终回复附「日志归属」表），以及「报告文件」的规则。下载链接不写进消息：入口 SKILL 派发时日志项写成 `{ "ref": "L1" }`，`supervisor_dispatch` 按本话题的分析记录找到 log_id，现取 10 分钟的下载链接，立刻下载到运行目录，文件名用平台给的 `file_name`（前面加编号），大小和超时沿用「日志下载」的设置；平台给的下载地址不受下载白名单限制。编号只在分析接口发起的话题里可用。
-
-**群里看到的**：先是分析卡「@发起人 于 <triggeredAt> 发起了对 X 应用 Y 错误码 N 份日志的分析」（`machine` 发起时开头是 `[machine] <triggerId>`），下面的表格每份日志一行：「编号 · 文件名 · 设备 SN」、「详情页」（日志平台元数据里的 `detail_url`）和「分析报告」（这份日志第一次完成修订后补上 complete 返回的 `detail_url`，每份日志固定，只补一次）。标题栏标签为「分析中」；紧接着话题内一张流式卡片，首轮分析在这里流式输出，带停止按钮。首轮结束后分析卡的标签变成「已完成」「已停止」或「失败」；DSH 在首轮进行中重启时，重新连上飞书后仍是「分析中」的分析卡会改成「已中断」，在话题内回复即可继续。分析话题是群内共享的：群里任何通过 dsh_channels 准入的成员都可以在话题内追问、停止或回答审批卡。卡片、话题与权限的细节见 dsh_channels README 的「群话题服务（feishuTopics）」。
+**已下线的分析接口**：以前由日志平台调用 `/open-api/supervisor` 发起分析，现在不再注册这个路由。cordis.yml 里旧的 `analyze.enabled`、`analyze.defaultChatId`、`analyze.maxLogs` 与 `analyzeTokenRef` 仍能加载，但不生效，加载时记一条警告，可以删除；凭据库里的 `SUPERVISOR_ANALYZE_TOKEN` 也不再使用。升级前已经开出的分析话题仍可继续追问：追问的结论照旧回传到对应日志，话题里的日志编号（`{ "ref": "L1" }`）仍可派发。这些分析记录保存在 `$DSH_HOME/supervisor/analyses/`，最多保留 200 份，最近一次活动超过 30 天的在启动时清理。
 
 ## 报告回传
 
-分析话题的每一轮结束后，观象为这批日志的每一份生成一份报告，作为这份日志的一个新分析修订传到日志平台；平台详情页显示最新完成的修订，追问后的结论就这样回刷。
+自动监管批次经 `supervisor_log_submit` 提交结论后，`OutboxRunner` 为批次中的每份日志生成一份 `report.md`（加上提交时附带的 `attachments`），作为这份日志的一个新分析修订传到日志平台：创建修订（`entry_path` 为 `report.md`，幂等键由任务、修订号和日志 id 组成）→ 按返回的 `uploads[]` 直传文件（不带平台令牌）→ 完成修订，并把平台返回的报告页 `detail_url` 回填到已知问题库。追问后再次提交会产生新修订，平台详情页显示最新完成的修订；修订号只增不减，旧修订不会覆盖新修订。暂时性失败按退避重试，多次失败进入死信，可在面板「运行总览」重试。
 
-**报告目录**：话题工作目录下的 `report/`（`<渠道 baseDir>/groups/<chat_id>/<话题 id>/report/`）；话题没能建立时改用 `$DSH_HOME/supervisor/analyses/<分析 id>/report/`。分析 Agent 按首轮消息「报告文件」一节的要求写入：
+**文件规则**（日志平台的要求，固定）：路径最多 255 字节、1–4 段，每段只含英文字母、数字和 `. _ -` 且不以点开头；扩展名为 md/png/jpg/jpeg/gif/webp/csv/txt/json/log；文件不能为空。数量和大小按 `analyze.upload` 的上限（默认与平台一致：每个修订最多 50 个文件含 `report.md`、共 100 MiB，单文件 50 MiB，Markdown 20 MiB）。不符合规则或超出上限的文件、符号链接和特殊文件都不上传，列在报告末尾。
 
-- 图片、日志片段、较长的分析过程等附件放进 `report/`，在回复中用 `report/` 开头的相对路径引用。生成报告时这些链接去掉 `report/` 前缀，变成相对报告根的路径。本轮新增或改动、回复里却没有引用的文件，追加在该节末尾的「本轮文件」里。
-- 多份日志时，每份日志一份简短结论 `report/logs/L1.md`、`report/logs/L2.md`…，每轮结束时读取最新内容。
-- 回复或结论引用本机绝对路径、`report/` 以外的路径或不存在的文件时照常上传，并在回传记录里列出这些链接。
-
-**每份日志的 `report.md`**：只由观象生成，不写进报告目录（目录根下的同名文件不上传）。开头是这份日志的编号、文件名、应用、错误码、发起时间、首轮状态、日志 id、设备 SN 和版本；多份日志时接着是「本日志结论」（`report/logs/<编号>.md`，没有时提示见整批结论）和「整批结论」（首轮的最终回复，含日志归属表），只有一份日志时是「分析结论」；之后每有一轮追问就追加一节「追问 N」（用户的问题加这一轮的最终回复）。首轮失败、被停止或话题没能建立时，首轮一节写明状态和原因；DSH 在首轮进行中重启时写明已中断。没有上传的文件列在最后的「未上传的文件」里。
-
-**文件规则**（日志平台的要求，固定）：路径最多 255 字节、1–4 段，每段只含英文字母、数字和 `. _ -` 且不以点开头；扩展名为 md/png/jpg/jpeg/gif/webp/csv/txt/json/log；文件不能为空。数量和大小按 `analyze.upload` 的上限（默认与平台一致：每个修订最多 50 个文件含 `report.md`、共 100 MiB，单文件 50 MiB，Markdown 20 MiB）。不符合规则或超出上限的文件、符号链接和特殊文件都不上传，列在报告末尾和回传记录里；报告入口本身超限时这份日志不上传，回传记录写明原因。
-
-**上传**：每份日志依次：创建修订（`entry_path` 为 `report.md`，`files` 是 `report.md` 加选中的附件，幂等键由分析 id、编号和记录版本组成）→ 按返回的 `uploads[]` 直传文件（同时最多 `concurrency` 个，不带平台令牌）→ 完成修订，记下 `detail_url`。
-
-- 同一次分析的上传串行执行，日志逐份上传；上传进行中又有新的轮次结束时，结束后再上传一次最新内容。
-- 网络错误、超时、408、429 和 5xx 按 `retryDelayMs` 起步、每次加倍的间隔重试 `retries` 次；重试用同一个幂等键，平台返回同一个修订并重新签发还没上传的文件的链接，所以链接过期或完成时缺文件也能续上。平台以 409 拒绝同一个键配不同的文件（重试之间目录变了）时，换下一个键立即重来一次。
-- 其他失败（凭据无效、4xx、响应字段不符、报告超限）标在这份日志上，不再自动重试，等下一轮结束或在面板点「重新回传」。
-- 一份日志第一次完成修订后，观象经 `feishuTopics.updateLinks` 把它的分析页补进分析卡的「分析报告」列；飞书暂时不可用时，下次上传成功或飞书渠道重新加载时再补。
-- 分析记录保存在 `$DSH_HOME/supervisor/analyses/`，DSH 重启后继续上传没有完成的报告，并核对仍在等待首轮的分析：首轮在观象未运行时结束的，首轮一节注明没有记录到回复。
-- 分析记录最多保留 200 份，最近活动（接受请求或记录一轮）超过 30 天的记录被清理；启动时和每接受一次新分析时清理，正在上传的记录这次跳过。清理删除记录文件和 `$DSH_HOME/supervisor/analyses/<分析 id>/`，话题工作目录里的 `report/` 归话题所有，不删除。
-- 旧版回传命令留下的记录（`$DSH_HOME/supervisor/reports/`）只在面板展示，不再上传，30 天无活动后在启动时删除。
+旧版回传命令留下的记录（`$DSH_HOME/supervisor/reports/`）只在面板展示，不再上传，30 天无活动后在启动时删除。
 
 ## 日志自动监管与闭环处置（观象）
 
-除被动 `/supervisor` 与 `/open-api/supervisor` 接口外，开启 `logSupervision.enabled`（需配置好日志平台与 `feishuChatId` 通知群；不填 `feishuChatId` 时以无头模式后台诊断并回传平台）后，`LogSupervisor` 以持久化状态机持续监管日志平台：
+除手动 `/supervisor` 入口外，开启 `logSupervision.enabled`（需配置好日志平台与 `feishuChatId` 通知群；不填 `feishuChatId` 时以无头模式后台诊断并回传平台）后，`LogSupervisor` 以持久化状态机持续监管日志平台：
 
-- **增量水位线轮询与分组攒批**：按 `archived_at` 水位游标 `[cursorTime, T1)`（保存于 `dsh_supervisor` 存储域 `watermarks` 表，支持在面板「应用与日志监管」或 `POST /supervisor/log-supervision/watermark` 执行暂停、恢复与时间回拨）分页拉取已归档日志，并按 `(product_code, component_code, error_code)` 在 `pending_batches` 表持续攒批：同组累计达到 `batchSizeThreshold`（默认 5，单批上限 `maxBatchSize` 默认 20）或距首发入槽超过 `batchWindowMs`（默认 5 分钟）即切片发车。
+- **增量水位线轮询与分组攒批**：按 `archived_at` 水位游标 `[cursorTime, 现在 − pollLagMs)`（保存于 `dsh_supervisor` 存储域 `watermarks` 表，支持在面板「应用与日志监管」或 `POST /supervisor/log-supervision/watermark` 执行暂停、恢复与时间回拨）分页拉取已归档日志，并按 `(product_code, component_code, error_code)` 在 `pending_batches` 表持续攒批：同组累计达到 `batchSizeThreshold`（默认 5，单批上限 `maxBatchSize` 默认 20）或距首发入槽超过 `batchWindowMs`（默认 5 分钟）即切片发车。
 - **并发隔离、安全解压与单应用熔断**：全部批次在独立并发池 `logPool`（`maxConcurrentBatches` 默认 4）中调度；单应用滚动 1 小时内批次数超过 `appHourlyBatchLimit`（默认 15）触发 `log:<appId>` 熔断，推送飞书告警并阻塞该应用后续自动发车，直到冷却期结束或在面板「运行总览」点击恢复，不波及其他应用。
 - **`log-supervisor` 会话内诊断工具链**：每次批次分配 1 个持久化主 Agent Session（使用内置 `/log-supervisor` 指南）：
   - `supervisor_log_prepare`：幂等下载日志、`maxUnpackBytes` 防 Zip Slip / BOM 限制解压到 `<workDir>/logs/L1..Ln/`，经 `dshRepos.workspaceCreate` 在 `<workDir>/repos/<appSlug>` 创建或更新共享镜像克隆工作区，并预检索 `IssueMemory`（优先透传已有 `humanConclusion`）。
   - `supervisor_issue_search`：在诊断过程中按关键词、错误码或 `issueId` 随时查询本地已知问题库。
+  - `supervisor_log_group_stats`：只读查询本批次同 `(product_code, component_code, error_code)` 最近若干天（默认 30，最多 180）的已归档日志数、`sw_version` / `component_version` 分布与首末归档时间，帮助判断问题是新出现还是持续存在；最多扫描 1000 条，超出时标明计数是下限，不返回下载链接。
   - `supervisor_log_submit`：校核 1:1 全槽位覆盖与证据路径真实性后写入 `log_tasks` 修订，写入/更新 `IssueMemory`，并通过单调防倒退的 `OutboxRunner`（`outbox_platform` 表）幂等上传每份日志的 `report.md` 与附件。
   - `supervisor_log_push_mr`：针对 `fix_code`（原地代码分支）或 `improve_skill`（隔离工作区 `<appSlug>-knowledge`），经 `dshRepos.workspacePush` 创建合并请求并自动登记入「审微」MR 持续监管队列。
 - **两种飞书投递模式与非阻塞动作闭环**：
@@ -360,7 +293,7 @@ Content-Type: application/json
 
 在飞书里使用 `/supervisor` 不需要与飞书渠道插件之间的耦合依赖：渠道插件把不在自己命令表中的 `/` 开头消息作为普通 prompt 交给 dsh，dsh 识别 `/supervisor` 后展开入口 SKILL。智能监管均以运行时按服务名动态查找的方式消费 `dsh_channels` 提供的公开契约（定义均本地镜像在 `src/deps/`）：
 
-- **`feishuTopics`（v3）**：用于 `/open-api/supervisor` 分析接口、`LogSupervisor` 自动批次播报/总结卡，以及 `MrSupervisor` 告警通知。
+- **`feishuTopics`（v3）**：用于 `LogSupervisor` 自动批次播报/总结卡、旧分析话题的报告链接更新，以及 `MrSupervisor` 告警通知。
 - **`feishuActions`（v1）**：用于观象在分析结束卡片挂出非阻塞后续按钮（如 `[🔧 修复代码并提 MR]` / `[📚 改进分析流程 / 沉淀案例]`），并在点击后按渠道权限判权唤醒原 Session。
 - **`feishuBitable`（v1）**：用于 `IssueBitableSyncer` 后台读写用户配置的飞书多维表格（支持 `/base/<token>` 与 `/wiki/<node_token>`），与渠道 `feishu_wiki_base_edit` 共用表级写队列。
 - **权限与提交身份事件**：写操作授权与 Git 提交署名经 `access/authorize`、`repo/commit-trailers` 中立事件由渠道插件回答，不直接耦合渠道实现。
@@ -400,9 +333,8 @@ pnpm check        # 类型检查（Host 与 Client）+ 单元测试 + 构建 + �
 | `src/improve/` | SKILL 查看工具、SKILL 不足记录、改进工具与改进子 Agent 首条消息 |
 | `src/skill/` | `/supervisor` 入口 SKILL、快照可选 SKILL 发现封装与 4 个随包指南（`supervisor-kit`、`supervisor-improve`、`log-supervisor`、`mr-reviewer`） |
 | `skills/` | `supervisor-kit`、`supervisor-improve`、`log-supervisor`、`mr-reviewer` SKILL 正文 |
-| `src/analyze/` | 日志平台分析接口 `/open-api/supervisor`：请求校验、令牌、到 `feishuTopics` 的转换 |
-| `src/platform/` | 日志平台开放 API OAuth2 客户端（令牌缓存、元数据查询、下载签发与修订上传） |
-| `src/report/` | 报告回传：轮次记录、每份日志的 `report.md` 生成、文件清单、修订上传、持久化 |
+| `src/platform/` | 日志平台开放 API OAuth2 客户端（令牌缓存、增量列表与元数据查询、下载签发与修订上传）与 client_secret 凭据读写 |
+| `src/report/` | 报告生成与文件清单；旧分析话题的轮次记录、修订上传与持久化 |
 | `src/settings/` | 面板契约、应用元数据 `applications.json`、生效设置与覆盖文件、HTTP 路由（含 `/supervisor/issues/*`） |
 | `src/client/` | 左侧栏「智能监管」5 标签页整页面板（运行总览 / 应用与日志监管 / MR 自动评审 / 已知问题库 / 模型与高级） |
 | `docs/supervisor/` | AI 原生智能监管中心（观象 + 审微）架构、跨插件契约与存储运维设计规格 |

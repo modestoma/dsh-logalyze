@@ -21,6 +21,7 @@ describe('configuration', () => {
     expect(defaultsOf(config).logSupervision).toEqual({
       enabled: false,
       pollIntervalMs: 60_000,
+      pollLagMs: 120_000,
       batchSizeThreshold: 5,
       maxBatchSize: 20,
       batchWindowMs: 300_000,

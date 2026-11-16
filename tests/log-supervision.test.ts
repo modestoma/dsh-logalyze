@@ -632,6 +632,7 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
     readonly batchSizeThreshold?: number
     readonly maxBatchSize?: number
     readonly batchWindowMs?: number
+    readonly pollLagMs?: number
     readonly maxConcurrentBatches?: number
     readonly appHourlyBatchLimit?: number
     readonly origin?: string
@@ -753,6 +754,7 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       logSupervision: {
         enabled: true,
         pollIntervalMs: 60_000,
+        pollLagMs: options.pollLagMs ?? 0,
         batchSizeThreshold: options.batchSizeThreshold ?? 5,
         maxBatchSize: options.maxBatchSize ?? 20,
         batchWindowMs: options.batchWindowMs ?? 300_000,
@@ -894,7 +896,7 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
     // Rewind cursor before populating multi-page logs (105 eligible logs -> page 100 + page 5, sliced into 20-cap batches!)
     await h.service.controlLogWatermark({ action: 'rewind', cursorTime: '2026-11-12T09:50:00.000Z' })
 
-    // Add 105 eligible archived logs in NFKC alias 'Ｏｒｄｅｒ－ｃｏｍｐ' + 1 non-fds log that must be ignored.
+    // Add 105 eligible archived logs in NFKC alias 'Ｏｒｄｅｒ－ｃｏｍｐ' + 1 unarchived log that must be ignored.
     for (let i = 1; i <= 25; i += 1) {
       const zip = buildZipBuffer([{ name: 'app.log', content: `NullPointerException log #${i}\n` }])
       h.fakePlatform.addLog({
@@ -903,21 +905,19 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
         component_code: 'Ｏｒｄｅｒ－ｃｏｍｐ',
         error_code: 'E_NPE',
         file_name: `log-${i}.zip`,
-        storage_type: 'fds',
         status: 'completed',
         archived_at: '2026-11-12T09:55:00.000Z',
       }, zip)
     }
-    // Non-FDS log should be ignored by client filter
+    // A log that is still being archived must be ignored
     h.fakePlatform.addLog({
       log_id: 'log-non-fds',
       product_code: 'P1',
       component_code: 'order-comp',
       error_code: 'E_NPE',
       file_name: 'ignored.log',
-      storage_type: 's3',
-      status: 'completed',
-      archived_at: '2026-11-12T09:55:00.000Z',
+      status: 'finalizing',
+      archived_at: null,
     }, 'ignored')
 
     // No Feishu topic launched before diagnosis completes (quiet-until-done!)
@@ -1002,7 +1002,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
         component_code: 'order-comp',
         error_code: 'E_MP',
         file_name: `mp-${i}.log`,
-        storage_type: 'fds',
         status: 'completed',
         archived_at: '2026-11-12T10:11:00.000Z',
       }, `multi-page log #${i}\n`)
@@ -1052,7 +1051,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
         component_code: 'order-service',
         error_code: 'E_WIN',
         file_name: `win-${i}.log`,
-        storage_type: 'fds',
         status: 'completed',
         archived_at: '2026-11-12T09:52:00.000Z',
       }, 'missing env')
@@ -1071,7 +1069,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       component_code: 'order-service',
       error_code: 'E_WIN',
       file_name: 'win-3.log',
-      storage_type: 'fds',
       status: 'completed',
       archived_at: new Date(h.getNow() - 1000).toISOString(),
     }, 'missing env')
@@ -1091,7 +1088,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
         component_code: 'order-service',
         error_code: i <= 5 ? 'E_S1' : 'E_S2',
         file_name: `s-${i}.log`,
-        storage_type: 'fds',
         status: 'completed',
         archived_at: new Date(h.getNow() - 500).toISOString(),
       }, 'missing env')
@@ -1132,7 +1128,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
         component_code: 'order-service',
         error_code: 'E_TIMER',
         file_name: `timer-cd-${i}.log`,
-        storage_type: 'fds',
         status: 'completed',
         archived_at: new Date(h.getNow() - 100).toISOString(),
       }, 'missing env')
@@ -1158,7 +1153,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
         component_code: 'order-service',
         error_code: 'E_RESET',
         file_name: `manual-reset-${i}.log`,
-        storage_type: 'fds',
         status: 'completed',
         archived_at: new Date(h.getNow() - 100).toISOString(),
       }, 'missing env')
@@ -1492,7 +1486,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
         component_code: 'order-service',
         error_code: 'E_LIVE',
         file_name: `tos-${i}.log`,
-        storage_type: 'fds',
         status: 'completed',
         archived_at: '2026-11-12T09:55:00.000Z',
       }, 'live log error line\n')
@@ -1555,7 +1548,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       component_code: 'order-service',
       error_code: 'E_CONC_1',
       file_name: 'conc-1.log',
-      storage_type: 'fds',
       status: 'completed',
       archived_at: '2026-11-12T09:55:00.000Z',
     }, 'err 1\n')
@@ -1565,7 +1557,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       component_code: 'order-service',
       error_code: 'E_CONC_2',
       file_name: 'conc-2.log',
-      storage_type: 'fds',
       status: 'completed',
       archived_at: '2026-11-12T09:55:00.000Z',
     }, 'err 2\n')
@@ -1698,7 +1689,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
           component_code: 'order-service',
           error_code: 'E_CRASH',
           file_name: 'crash-1.log',
-          storage_type: 'fds',
           status: 'completed',
           archived_at: '2026-11-12T09:55:00.000Z',
         }, 'recovered log\n')
@@ -1708,7 +1698,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
           component_code: 'order-service',
           error_code: 'E_ORPHAN',
           file_name: 'orphan.log',
-          storage_type: 'fds',
           status: 'completed',
           archived_at: '2026-11-12T09:55:00.000Z',
         }, 'orphan outbox log\n')
@@ -1858,7 +1847,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       component_code: 'order-service',
       error_code: 'E_REWIND',
       file_name: 'rewind-midpoll.log',
-      storage_type: 'fds',
       status: 'completed',
       archived_at: '2026-11-12T09:30:00.000Z',
     }, 'mid-poll rewind error\n')
@@ -1883,7 +1871,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       component_code: 'order-service',
       error_code: 'E_THROW',
       file_name: 'thrown-turn.log',
-      storage_type: 'fds',
       status: 'completed',
       archived_at: new Date(h.getNow() - 500).toISOString(),
     }, 'thrown turn log\n')
@@ -1948,7 +1935,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       component_code: 'order-service',
       error_code: 'E_INIT_POLL',
       file_name: 'first-boundary.log',
-      storage_type: 'fds',
       status: 'completed',
       archived_at: '2026-11-12T09:59:30.000Z',
     }, 'initial boundary error\n')
@@ -1992,6 +1978,78 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
     expect(domain.logTasks.get(phase1TaskId)?.workDir).toBe(followupWs)
   }, 20_000)
 
+  it('waits pollLagMs before reading an archive window, links each log by its detail_url, and reports same-group history', async () => {
+    let taskId = ''
+    let stats: Record<string, unknown> | undefined
+    const h = await createFullHarness({
+      batchSizeThreshold: 1,
+      pollLagMs: 120_000,
+      onLogTurn: async (req) => {
+        taskId = req.taskId
+        const ctx = h.toolExecCtx(req.existingSessionId!, req.workDir)
+        const prepared = await h.toolNamed('supervisor_log_prepare').execute({ taskId: req.taskId }, ctx) as {
+          readonly slots: readonly { readonly ref: string; readonly files: readonly string[] }[]
+        }
+        stats = await h.toolNamed('supervisor_log_group_stats').execute({ days: 7 }, ctx) as Record<string, unknown>
+        await h.toolNamed('supervisor_log_submit').execute({
+          taskId: req.taskId,
+          summary: '同组历史已核对',
+          items: prepared.slots.map(s => ({
+            ref: s.ref,
+            status: 'diagnosed',
+            rootCauseCategory: 'config_or_env',
+            conclusion: 'lagged log analysed',
+            evidences: [{ source: `logs/${s.ref}/${s.files[0]}`, locator: 'L1', excerpt: 'lag error' }],
+          })),
+        }, ctx)
+      },
+    })
+    const group = { product_code: 'P1', component_code: 'order-service', error_code: 'E_LAG', status: 'completed' }
+    h.fakePlatform.addLog({ ...group, log_id: 'hist-1', file_name: 'h1.log', sw_version: 'V1.0', component_version: 'C1', archived_at: '2026-11-10T08:00:00.000Z' })
+    h.fakePlatform.addLog({ ...group, log_id: 'hist-2', file_name: 'h2.log', sw_version: 'V1.0', component_version: 'C1', archived_at: '2026-11-10T09:00:00.000Z' })
+    h.fakePlatform.addLog({ ...group, log_id: 'hist-3', file_name: 'h3.log', sw_version: 'V1.1', component_version: null, archived_at: '2026-11-11T09:00:00.000Z' })
+    // Outside the 7-day window, another error code, and a log not yet archived: none count.
+    h.fakePlatform.addLog({ ...group, log_id: 'hist-old', file_name: 'old.log', archived_at: '2026-10-01T09:00:00.000Z' })
+    h.fakePlatform.addLog({ ...group, log_id: 'hist-other', file_name: 'other.log', error_code: 'E_OTHER', archived_at: '2026-11-11T09:00:00.000Z' })
+    h.fakePlatform.addLog({ ...group, log_id: 'hist-pending', file_name: 'pending.log', status: 'finalizing', archived_at: null })
+    // Archived 30 s before now: inside the 2-minute lag, so the first poll must not read it yet.
+    h.fakePlatform.addLog({
+      ...group,
+      log_id: 'lag-1',
+      file_name: 'lag.log',
+      sw_version: 'V2.0',
+      component_version: 'C2',
+      archived_at: '2026-11-12T09:59:30.000Z',
+      detail_url: 'https://web.example.com/device-logs/lag-1',
+    }, 'lag error\n')
+
+    const sup = h.service.logSupervisorInstance()!
+    await sup.pollNow()
+    const firstWindow = new URL(`http://x${h.fakePlatform.calls('logs').at(-1)!.path}`).searchParams
+    expect(firstWindow.get('archived_to')).toBe('2026-11-12T09:58:00.000Z')
+    expect(h.logTurns).toHaveLength(0)
+
+    h.advanceNow(120_000)
+    await sup.pollNow()
+    await waitFor(async () => taskId !== '' && stats !== undefined && (await h.service.state()).logSupervision?.running === 0)
+
+    const domain = await h.service.supervisorDomain()
+    expect(domain.logTasks.get(taskId)?.inputs.map(input => input.detailUrl)).toEqual(['https://web.example.com/device-logs/lag-1'])
+    expect(stats).toEqual({
+      taskId,
+      days: 7,
+      group: { productCode: 'P1', componentCode: 'order-service', errorCode: 'E_LAG' },
+      window: { archivedFrom: '2026-11-05T10:02:00.000Z', archivedTo: '2026-11-12T10:02:00.000Z' },
+      count: 4,
+      truncated: false,
+      firstArchivedAt: '2026-11-10T08:00:00.000Z',
+      lastArchivedAt: '2026-11-12T09:59:30.000Z',
+      swVersions: { top: [{ value: 'V1.0', count: 2 }, { value: 'V1.1', count: 1 }, { value: 'V2.0', count: 1 }], otherCount: 0 },
+      componentVersions: { top: [{ value: 'C1', count: 2 }, { value: 'C2', count: 1 }, { value: null, count: 1 }], otherCount: 0 },
+    })
+    expect(JSON.stringify(stats)).not.toContain('http')
+  }, 20_000)
+
   it('preserves Feishu summary + action proposal delivery when topic-on-start falls back to headless while feishuTopics is unavailable or transiently fails', async () => {
     const h = await createFullHarness({
       deliveryMode: 'topic-on-start',
@@ -2029,7 +2087,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       component_code: 'order-service',
       error_code: 'E_FALLBACK_UNAVAIL',
       file_name: 'fallback-unavail-1.log',
-      storage_type: 'fds',
       status: 'completed',
       archived_at: '2026-11-12T09:55:00.000Z',
     }, 'NullPointerException at handleOrder\n')
@@ -2069,7 +2126,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       component_code: 'order-service',
       error_code: 'E_FALLBACK_TRANSIENT',
       file_name: 'fallback-transient-2.log',
-      storage_type: 'fds',
       status: 'completed',
       archived_at: '2026-11-12T10:00:30.000Z',
     }, 'NullPointerException at handleOrder\n')
@@ -2136,7 +2192,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       component_code: 'order-service',
       error_code: 'E_ACT_1',
       file_name: 'action-retry-1.log',
-      storage_type: 'fds',
       status: 'completed',
       archived_at: '2026-11-12T09:55:00.000Z',
     }, 'NullPointerException at handleOrder\n')
@@ -2180,7 +2235,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       component_code: 'order-service',
       error_code: 'E_ACT_2',
       file_name: 'action-recover-2.log',
-      storage_type: 'fds',
       status: 'completed',
       archived_at: '2026-11-12T10:02:30.000Z',
     }, 'NullPointerException at handleOrder\n')
@@ -2469,7 +2523,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       component_code: 'Ｂｉｌｌｉｎｇ-Ｗｏｒｋｅｒ',
       error_code: 'E_BILL',
       file_name: 'billing.log',
-      storage_type: 'fds',
       status: 'completed',
       archived_at: '2026-11-12T09:55:00.000Z',
     }, 'BillingError: null pointer\n')
@@ -2509,7 +2562,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       component_code: 'billing-worker',
       error_code: 'E_BILL',
       file_name: 'billing-2.log',
-      storage_type: 'fds',
       status: 'completed',
       archived_at: '2026-11-12T10:00:05.000Z',
     }, 'BillingError ambiguous\n')
@@ -2569,7 +2621,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
         component_code: 'order-comp',
         error_code: 'E_RET',
         file_name: `${logId}.log`,
-        storage_type: 'fds',
         status: 'completed',
         archived_at: archivedAt,
       }, `NullPointerException ${logId}\n`)

@@ -51,7 +51,6 @@ const logItemSchema = z.object({
   component_version: nullableText,
   error_code: nullableText,
   file_name: z.string().min(1),
-  storage_type: z.string(),
   log_type: nullableText,
   status: z.string(),
   file_size_bytes: z.union([z.string(), z.number()]).nullable().optional().transform(value => (value === undefined || value === null ? null : String(value))),
@@ -80,7 +79,8 @@ export type PlatformDownload = z.output<typeof downloadUrlSchema>
 const createdAnalysisSchema = z.object({
   analysis_id: z.string().min(1),
   status: z.string(),
-  expires_at: z.string().optional(),
+  // A replay of an already completed revision carries no links and `expires_at: null`.
+  expires_at: z.string().nullable().optional(),
   uploads: z.array(z.object({ path: z.string().min(1), upload_url: z.string().min(1) })),
 })
 
@@ -104,11 +104,15 @@ export interface RevisionFile {
   readonly sizeBytes: number
 }
 
-/** One incremental `GET /open-api/v1/logs` query page. */
+/** One `GET /open-api/v1/logs` query page over an archive-time window. */
 export interface ListLogsPageParams {
   readonly archivedFrom: string
   readonly archivedTo: string
   readonly status?: string
+  /** Exact-match filters; an undefined filter is omitted, because the platform rejects blank values. */
+  readonly productCode?: string
+  readonly componentCode?: string
+  readonly errorCode?: string
   readonly limit?: number
   readonly cursor?: string
 }
@@ -153,7 +157,7 @@ export function platformProblem(settings: PlatformSettings): string | undefined 
     settings.tokenUrl === undefined ? '令牌地址' : undefined,
     settings.clientId === undefined ? 'client_id' : undefined,
   ].filter(item => item !== undefined)
-  return missing.length === 0 ? undefined : `日志平台未配置：缺少${missing.join('、')}，请在观象设置面板「分析接口」填写`
+  return missing.length === 0 ? undefined : `日志平台未配置：缺少${missing.join('、')}，请在观象设置面板「日志平台连接」填写`
 }
 
 /** Calls the log platform's open API as an OAuth2 client. */
@@ -197,15 +201,23 @@ export class PlatformClient {
   }
 
   /**
-   * Poll one page of archived logs in `[archivedFrom, archivedTo)`.
-   * Sends only `LogQuery`-accepted query fields (`archived_from`, `archived_to`,
-   * `status`, `limit`, `cursor`) so strict OpenAPI servers never reject unknown fields.
+   * Read one page of archived logs in `[archivedFrom, archivedTo)`, optionally
+   * narrowed by exact product, component, and error code.
+   * Sends only query fields the platform accepts (`archived_from`, `archived_to`,
+   * `status`, `product_code`, `component_code`, `error_code`, `limit`, `cursor`),
+   * because it rejects unknown or blank ones.
+   * @param params - window, filters, and paging.
+   * @returns the page's logs and the cursor of the next page, if any.
+   * @throws PlatformError when the platform cannot be queried.
    */
   async listLogsPage(params: ListLogsPageParams): Promise<PlatformLogPage> {
     const query = new URLSearchParams()
     query.set('archived_from', params.archivedFrom)
     query.set('archived_to', params.archivedTo)
     query.set('status', params.status ?? 'completed')
+    if (params.productCode !== undefined) query.set('product_code', params.productCode)
+    if (params.componentCode !== undefined) query.set('component_code', params.componentCode)
+    if (params.errorCode !== undefined) query.set('error_code', params.errorCode)
     const limit = Math.min(MAX_LOG_IDS_PER_QUERY, Math.max(1, Math.trunc(params.limit ?? MAX_LOG_IDS_PER_QUERY)))
     query.set('limit', String(limit))
     if (params.cursor !== undefined) query.set('cursor', params.cursor)
@@ -363,7 +375,7 @@ export class PlatformClient {
 
   private async requestToken(settings: PlatformSettings, identity: string): Promise<CachedToken> {
     const secret = await this.deps.secret()
-    if (secret === undefined || secret === '') throw new PlatformError('日志平台未配置 client_secret，请在观象设置面板「分析接口」保存', false)
+    if (secret === undefined || secret === '') throw new PlatformError('日志平台未配置 client_secret，请在观象设置面板「日志平台连接」保存', false)
     const clientId = settings.clientId ?? ''
     const form = new URLSearchParams({ grant_type: 'client_credentials' })
     if (settings.scope !== '') form.set('scope', settings.scope)
