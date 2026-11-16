@@ -81,10 +81,6 @@ interface Draft {
   skillUpdatesEnabled: boolean
   skillMaxFiles: string
   skillMaxKb: string
-  analyzeEnabled: boolean
-  /** Default group chat id; blank means none. */
-  analyzeDefaultChatId: string
-  maxLogs: string
   platformBaseUrl: string
   platformTokenUrl: string
   platformClientId: string
@@ -112,6 +108,7 @@ interface Draft {
   mrFeishuChatId: string
   logEnabled: boolean
   logPollIntervalSec: string
+  logPollLagSec: string
   logBatchSizeThreshold: string
   logMaxBatchSize: string
   logBatchWindowMin: string
@@ -141,9 +138,6 @@ function toDraft(settings: EditableSettings): Draft {
     skillUpdatesEnabled: settings.skillUpdates.enabled,
     skillMaxFiles: String(settings.skillUpdates.maxFiles),
     skillMaxKb: trimNumber(settings.skillUpdates.maxFileBytes / KB),
-    analyzeEnabled: settings.analyze.enabled,
-    analyzeDefaultChatId: settings.analyze.defaultChatId ?? '',
-    maxLogs: String(settings.analyze.maxLogs),
     platformBaseUrl: settings.analyze.platform.baseUrl ?? '',
     platformTokenUrl: settings.analyze.platform.tokenUrl ?? '',
     platformClientId: settings.analyze.platform.clientId ?? '',
@@ -171,6 +165,7 @@ function toDraft(settings: EditableSettings): Draft {
     mrFeishuChatId: settings.mrReview.feishuChatId ?? '',
     logEnabled: settings.logSupervision.enabled,
     logPollIntervalSec: trimNumber(settings.logSupervision.pollIntervalMs / 1000),
+    logPollLagSec: trimNumber(settings.logSupervision.pollLagMs / 1000),
     logBatchSizeThreshold: String(settings.logSupervision.batchSizeThreshold),
     logMaxBatchSize: String(settings.logSupervision.maxBatchSize),
     logBatchWindowMin: trimNumber(settings.logSupervision.batchWindowMs / MINUTE),
@@ -211,10 +206,6 @@ function fromDraft(draft: Draft): EditableSettings {
   if (!Number.isInteger(maxApps)) throw new Error('单次应用数上限必须是整数')
   const maxFiles = positive(draft.skillMaxFiles, '改进文件数上限')
   if (!Number.isInteger(maxFiles)) throw new Error('改进文件数上限必须是整数')
-  const defaultChatId = draft.analyzeDefaultChatId.trim()
-  if (defaultChatId !== '' && !CHAT_ID_PATTERN.test(defaultChatId)) {
-    throw new Error('默认群必须是飞书群的 chat_id（oc_ 开头）')
-  }
   const logFeishuChatId = draft.logFeishuChatId.trim()
   if (logFeishuChatId !== '' && !CHAT_ID_PATTERN.test(logFeishuChatId)) {
     throw new Error('日志监管目标群必须是飞书群的 chat_id（oc_ 开头）')
@@ -251,9 +242,6 @@ function fromDraft(draft: Draft): EditableSettings {
       maxFileBytes: Math.round(positive(draft.skillMaxKb, '改进单文件大小上限') * KB),
     },
     analyze: {
-      enabled: draft.analyzeEnabled,
-      ...defaultChatId === '' ? {} : { defaultChatId },
-      maxLogs: integer(draft.maxLogs, '单次日志数上限'),
       platform: {
         ...optionalText(draft.platformBaseUrl, 'baseUrl'),
         ...optionalText(draft.platformTokenUrl, 'tokenUrl'),
@@ -289,6 +277,7 @@ function fromDraft(draft: Draft): EditableSettings {
     logSupervision: {
       enabled: draft.logEnabled,
       pollIntervalMs: Math.round(positive(draft.logPollIntervalSec, '日志轮询间隔') * 1000),
+      pollLagMs: Math.round(positive(draft.logPollLagSec, '轮询安全滞后', true) * 1000),
       batchSizeThreshold: logBatchSizeThreshold,
       maxBatchSize: logMaxBatchSize,
       batchWindowMs: Math.round(positive(draft.logBatchWindowMin, '攒批等待窗口', true) * MINUTE),
@@ -390,12 +379,6 @@ const BITABLE_STATUS_LABEL: Readonly<Record<BitableAvailability, { pill: string;
   ready: { pill: 'lz__pill--ok', text: '多维表格能力就绪' },
   missing: { pill: 'lz__pill--warn', text: '未检测到 dsh-channels 多维表格能力' },
   incompatible: { pill: 'lz__pill--bad', text: '多维表格服务版本不兼容' },
-}
-
-const TOPICS_STATUS: Readonly<Record<AnalyzeWire['topics'], { pill: string; text: string }>> = {
-  ready: { pill: 'lz__pill--ok', text: '飞书渠道就绪' },
-  missing: { pill: 'lz__pill--bad', text: '未找到飞书渠道' },
-  incompatible: { pill: 'lz__pill--bad', text: '飞书渠道版本不兼容' },
 }
 
 const REPORT_STATUS: Readonly<Record<ReportStatus, { pill: string; text: string }>> = {
@@ -566,7 +549,7 @@ export function SupervisorPanel({ openRepoSettings }: SupervisorPageProps): JSX.
               onResetBreaker={(scope, key) => { void run(() => resetBreaker(scope, key), '已解除熔断并恢复等待任务', false) }}
               onUpdateWatermark={(payload) => { void run(() => updateLogWatermark(payload), '已更新日志轮询水位线', false) }}
               onRetryOutbox={(key) => { void run(() => retryOutboxDead(key), '已重新入队死信报告', false) }}
-              onSaveCredential={async (tokenEnv, value) => await run(() => saveToken(tokenEnv, value), tokenEnv === state.analyze.tokenEnv ? '已保存分析接口令牌，下一个请求起生效' : '已保存日志平台 client_secret', false) !== undefined}
+              onSaveCredential={async (tokenEnv, value) => await run(() => saveToken(tokenEnv, value), '已保存日志平台 client_secret', false) !== undefined}
               onClearCredential={(tokenEnv) => { void run(() => clearToken(tokenEnv), '已清除面板保存的值', false) }}
               onRetry={(id) => { void run(() => retryReport(id), '已开始重新回传', false) }}
             />
@@ -725,7 +708,7 @@ function OverviewTab({
                 {state.runtime?.subagentProvider ?? 'spawn'}
               </span>
             </div>
-            <div className="lz__cardVal">{state.settings.analyze.enabled ? '接口开启' : '接口关闭'}</div>
+            <div className="lz__cardVal">{state.settings.logSupervision.enabled ? '自动轮询开启' : '自动轮询关闭'}</div>
             <div className="lz__cardMeta">
               dsh-repo: {state.dshRepo.availability} · 飞书话题: {state.analyze.topics}
             </div>
@@ -993,8 +976,6 @@ function LogSupervisionAndConfigTab({
   const tasks = supervision?.tasks ?? []
   const dead = supervision?.outboxDead ?? []
   const breakers = supervision?.breakers ?? []
-  const topics = TOPICS_STATUS[analyze.topics]
-  const endpoint = new URL(analyze.route.slice(1), document.baseURI).href
 
   const addHost = (): void => {
     const trimmed = host.trim().toLowerCase()
@@ -1159,6 +1140,7 @@ function LogSupervisionAndConfigTab({
             </div>
           </div>
           <NumberRow label="平台轮询间隔" unit="秒" value={draft.logPollIntervalSec} onChange={(value) => { setDraft({ ...draft, logPollIntervalSec: value }) }} />
+          <NumberRow label="轮询安全滞后" summary="每轮只拉取归档时间早于「当前时间减该值」的日志，避开平台晚提交与两边时钟偏差。" unit="秒" value={draft.logPollLagSec} onChange={(value) => { setDraft({ ...draft, logPollLagSec: value }) }} />
           <NumberRow label="攒批触发条数" summary="同组日志累计达到该条数时立即发车（不超过单批上限）。" unit="份" value={draft.logBatchSizeThreshold} onChange={(value) => { setDraft({ ...draft, logBatchSizeThreshold: value }) }} />
           <NumberRow label="单批日志上限" unit="份" value={draft.logMaxBatchSize} onChange={(value) => { setDraft({ ...draft, logMaxBatchSize: value }) }} />
           <NumberRow label="攒批等待窗口" summary="首条日志进入窗口后的最长等待时间（0 表示立即发车）。" unit="分钟" value={draft.logBatchWindowMin} onChange={(value) => { setDraft({ ...draft, logBatchWindowMin: value }) }} />
@@ -1169,31 +1151,10 @@ function LogSupervisionAndConfigTab({
       </section>
 
       <section className="lz__sec">
-        <h2 className="lz__secTitle">日志平台分析接口与凭据 <Overridden keys={overridden} name="analyze" /></h2>
+        <h2 className="lz__secTitle">日志平台连接 <Overridden keys={overridden} name="analyze" /></h2>
         <div className="lz__list">
-          <div className="lz__row">
-            <div className="lz__rowText">
-              <div className="lz__rowLabel">开启外部推送分析接口（POST {analyze.route}）<span className={`lz__pill ${topics.pill}`}><span className="lz__dot" />{topics.text}</span></div>
-              <div className="lz__rowSummary">日志平台传来一批 log_id 时，经飞书渠道在目标群发出分析卡片并在话题中开始分析。关闭时接口回复 404。</div>
-              {analyze.topics === 'ready' ? null : <div className="lz__rowError">{analyze.topics === 'missing' ? '接口需要加载 dsh-channels。' : '请升级 dsh-channels 到兼容版本。'}</div>}
-            </div>
-            <div className="lz__rowCtl"><input type="checkbox" className="lz__check" aria-label="开启分析接口" checked={draft.analyzeEnabled} onChange={(event) => { setDraft({ ...draft, analyzeEnabled: event.target.checked }) }} /></div>
-          </div>
-          <CredentialRow
-            label="访问令牌"
-            summary={<>外部以 <span className="lz__mono">Authorization: Bearer &lt;令牌&gt;</span> 调用 <span className="lz__mono">{endpoint}</span>。</>}
-            tokenEnv={analyze.tokenEnv}
-            status={analyze.token}
-            credentialsAvailable={credentialsAvailable}
-            busy={busy}
-            placeholder="粘贴令牌"
-            onSave={async value => await onSaveCredential(analyze.tokenEnv, value)}
-            onClear={() => { onClearCredential(analyze.tokenEnv) }}
-          />
-          <TextRow label="默认群" summary="请求体不带 chatId 时，分析卡片发到这个群（oc_ 开头）。" placeholder="oc_xxx" value={draft.analyzeDefaultChatId} onChange={(value) => { setDraft({ ...draft, analyzeDefaultChatId: value }) }} />
-          <NumberRow label="单次日志数上限" summary="一次分析请求最多传的 logIds 个数（最多 50）。" unit="份" value={draft.maxLogs} onChange={(value) => { setDraft({ ...draft, maxLogs: value }) }} />
           {analyze.platformProblem === undefined ? null : <div className="lz__notice lz__notice--error">{analyze.platformProblem}</div>}
-          <TextRow label="日志平台接口地址" summary="开放 API 的地址，观象在它后面拼 /open-api/v1/…" placeholder="https://logs.example.com" value={draft.platformBaseUrl} onChange={(value) => { setDraft({ ...draft, platformBaseUrl: value }) }} />
+          <TextRow label="日志平台接口地址" summary="开放 API 的地址，观象在它后面拼 /open-api/v1/…；自动轮询与报告回传都走这里。" placeholder="https://logs.example.com" value={draft.platformBaseUrl} onChange={(value) => { setDraft({ ...draft, platformBaseUrl: value }) }} />
           <TextRow label="令牌地址" summary="OAuth2 client_credentials 的令牌端点。" placeholder="https://auth.example.com/oauth/token" value={draft.platformTokenUrl} onChange={(value) => { setDraft({ ...draft, platformTokenUrl: value }) }} />
           <TextRow label="client_id" value={draft.platformClientId} onChange={(value) => { setDraft({ ...draft, platformClientId: value }) }} />
           <CredentialRow
@@ -1210,12 +1171,12 @@ function LogSupervisionAndConfigTab({
           <div className="lz__row">
             <div className="lz__rowText">
               <div className="lz__rowLabel">客户端认证方式</div>
-              <div className="lz__rowSummary">表单字段或 HTTP Basic。</div>
+              <div className="lz__rowSummary">HTTP Basic（默认）或表单字段，按日志平台的令牌端点要求选。</div>
             </div>
             <div className="lz__rowCtl">
               <select className="lz__input" aria-label="客户端认证方式" value={draft.platformClientAuth} onChange={(event) => { setDraft({ ...draft, platformClientAuth: event.target.value === 'basic' ? 'basic' : 'body' }) }}>
-                <option value="body">表单字段</option>
                 <option value="basic">HTTP Basic</option>
+                <option value="body">表单字段</option>
               </select>
             </div>
           </div>
@@ -1250,20 +1211,23 @@ function LogSupervisionAndConfigTab({
         </div>
       </section>
 
-      <section className="lz__sec">
-        <h2 className="lz__secTitle">接口回传记录（{analyze.reports.length}）</h2>
-        <div className="lz__list">
-          {analyze.reports.length === 0 ? <div className="lz__emptyRow">还没有外部分析请求。</div> : null}
-          {analyze.reports.map(report => <AnalysisRow key={report.id} report={report} busy={busy} onRetry={onRetry} />)}
-        </div>
-        {analyze.legacyReports.length === 0
-          ? null
-          : (
+      {analyze.reports.length === 0 && analyze.legacyReports.length === 0
+        ? null
+        : (
+            <section className="lz__sec">
+              <h2 className="lz__secTitle">历史接口分析回传记录（{analyze.reports.length}）</h2>
               <div className="lz__list">
-                {analyze.legacyReports.map(report => <LegacyRow key={report.id} report={report} />)}
+                {analyze.reports.map(report => <AnalysisRow key={report.id} report={report} busy={busy} onRetry={onRetry} />)}
               </div>
-            )}
-      </section>
+              {analyze.legacyReports.length === 0
+                ? null
+                : (
+                    <div className="lz__list">
+                      {analyze.legacyReports.map(report => <LegacyRow key={report.id} report={report} />)}
+                    </div>
+                  )}
+            </section>
+          )}
     </>
   )
 }
@@ -1701,10 +1665,9 @@ function AdvancedTab({
           <div className="lz__row">
             <div className="lz__rowText">
               <div className="lz__rowLabel">凭据环境变量引用</div>
-              <div className="lz__rowSummary">分析接口令牌与日志平台 OAuth2 client_secret 的凭据名（不可相同）。</div>
+              <div className="lz__rowSummary">日志平台 OAuth2 client_secret 的凭据名。</div>
             </div>
             <div className="lz__rowCtl">
-              <span className="lz__tag lz__mono">{runtime?.analyzeTokenRef ?? state.analyze.tokenEnv}</span>
               <span className="lz__tag lz__mono">{runtime?.platformSecretRef ?? state.analyze.secretEnv}</span>
             </div>
           </div>

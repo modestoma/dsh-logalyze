@@ -149,6 +149,21 @@ function extractBreakerAppId(storageKey: string): string | undefined {
   return storageKey.startsWith('log:') ? storageKey.slice(4) : undefined
 }
 
+/**
+ * The log's page on the platform's web host, as the list item names it.
+ * @param item - one platform log.
+ * @returns its `detail_url` when it is an http(s) URL of sane length, else undefined.
+ */
+function itemDetailUrl(item: PlatformLog): string | undefined {
+  const url = item.detail_url
+  if (url === null || url.length > 2048 || !/^https?:\/\//iu.test(url)) return undefined
+  return url
+}
+
+/**
+ * Fallback page URL for records written before list items carried `detail_url`;
+ * derived from the API address, which may differ from the web host.
+ */
 function platformLogDetailUrl(baseUrl: string | undefined, logId: string): string | undefined {
   if (baseUrl === undefined || baseUrl.trim() === '') return undefined
   try {
@@ -692,6 +707,7 @@ export class LogSupervisor {
       maxUnpackBytes: () => this.deps.getSettings().maxUnpackBytes,
       issueMemory: () => this.deps.issueMemory,
       fetch: this.deps.fetch,
+      listPlatformLogs: params => this.deps.platform.listLogsPage(params),
       platformDownload: async (log, dir, fileName, download, signal) => {
         let link
         try {
@@ -922,8 +938,10 @@ export class LogSupervisor {
     const resumingBackfill = wm.backfillFrom !== undefined && wm.backfillTo !== undefined
     const fromIso = resumingBackfill
       ? wm.backfillFrom!
-      : (wm.cursorTime ?? new Date(currentNow - Math.max(settings.pollIntervalMs, 60_000)).toISOString())
-    const toIso = resumingBackfill ? wm.backfillTo! : new Date(currentNow).toISOString()
+      : (wm.cursorTime ?? new Date(currentNow - settings.pollLagMs - Math.max(settings.pollIntervalMs, 60_000)).toISOString())
+    // The upper bound trails the clock: the platform stamps `archived_at` before its
+    // transaction commits, and the two hosts' clocks may differ.
+    const toIso = resumingBackfill ? wm.backfillTo! : new Date(currentNow - settings.pollLagMs).toISOString()
 
     const fromMs = Date.parse(fromIso)
     const toMs = Date.parse(toIso)
@@ -970,9 +988,7 @@ export class LogSupervisor {
         })
         if (!isEpochCurrent()) return
 
-        const eligible = page.items.filter(
-          item => item.storage_type === 'fds' && item.status === 'completed',
-        )
+        const eligible = page.items.filter(item => item.status === 'completed' && item.archived_at !== null)
         if (eligible.length > 0) {
           await this.ingestPolledLogs(eligible)
         }
@@ -1095,7 +1111,7 @@ export class LogSupervisor {
       const productCode = normalizeOptional(item.product_code)
       const errorCode = normalizeOptional(item.error_code)
       const bKey = batchKeyFor(productCode, componentCode, errorCode)
-      const detailUrl = platformLogDetailUrl(baseUrl, item.log_id)
+      const detailUrl = itemDetailUrl(item) ?? platformLogDetailUrl(baseUrl, item.log_id)
 
       knownIds.add(logIdLower)
       await this.withBatchLock(bKey, async () => {

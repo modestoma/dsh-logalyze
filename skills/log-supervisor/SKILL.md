@@ -22,6 +22,7 @@ description: 智能监管（观象）统一日志监管与问题闭环规范，�
 - 若某个槽位 `unpackStatus === 'corrupted'`（归档损坏），在结论中直接以 `status: "corrupted_log"` 如实报告，切勿影响同批其余有效槽位的分析。
 - 使用 `bash`、`rg` 或在 `scratch/` 编写解析脚本逐份核验 `logs/L1..Ln/`。**严禁未经逐份核对就把 `L1` 的结论直接复制给整个批次！**
 - 排查过程中提取到新异常类名、错误码或特征时，随时调用 `supervisor_issue_search` 查询历史相似问题、匹配条件与排除条件。
+- 平台自动批次需要判断问题是新出现还是持续存在、是否集中在某些软件/组件版本时，调用 `supervisor_log_group_stats`（可传 `days`，默认 30 天），它返回同 `(product_code, component_code, error_code)` 的已归档日志数量、版本分布与首末归档时间；把结论写进 `summary`，不要据此跳过逐份核验。
 
 ### 3. 显式提交结构化结论（`supervisor_log_submit`）
 - 所有结论只能通过 `supervisor_log_submit` 正式落盘与回传日志平台，禁止只在文本中口头总结而不调用该工具。

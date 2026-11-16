@@ -4,16 +4,17 @@
  * 从 `dsh-repo` 的仓库目录读取启用「日志分析」与「MR 自动评审」的代码仓库，提供：
  * - `dsh_supervisor` 共享监管运行时（7 张强类型状态表、并发池、键控防抖器、滑动窗口熔断器、单调修订 Outbox）；
  * - 跨插件窄契约（`dshRepos` v7/v8 与 `feishuActions` v1）；
- * - 面板归属的应用描述与触发别名设置、可选 DSH SKILL 发现与加载、分析派发与报告回传。
+ * - 面板归属的应用描述与触发别名设置、可选 DSH SKILL 发现与加载、分析派发、日志平台轮询与报告回传。
+ *
+ * 插件不对外开放 HTTP 接口：日志由观象定时轮询日志平台取得。
  *
  * Cordis 插件名与配置 ID 为 `supervisor`，npm 包名为 `dsh-supervisor`。
  *
  * @module dsh-supervisor
  */
 
-import { mountAnalyzeRoute } from './analyze/server.ts'
 import { SUPERVISOR_APPLICATIONS_SERVICE } from './apps/access.ts'
-import { resolveConfig } from './config.ts'
+import { resolveConfig, retiredConfigKeys } from './config.ts'
 import { FEISHU_ACTIONS_SERVICE, FEISHU_ACTIONS_VERSION, lookupActions } from './deps/actions.ts'
 import { FEISHU_BITABLE_SERVICE, FEISHU_BITABLE_VERSION, lookupBitable, parseBitableUrl } from './deps/bitable.ts'
 import { DSH_REPOS_SERVICE, LOG_ANALYSIS_FEATURE, lookupRepos, lookupReposV8, MR_REVIEW_FEATURE } from './deps/repos.ts'
@@ -71,7 +72,7 @@ export interface SupervisorPluginOptions extends ServiceOptions {
 
 /**
  * Install the supervision runtime, entry skill, bundled guide skills, analysis and
- * SKILL improvement tools, settings routes, and analyze route, then follow `dsh-repo`
+ * SKILL improvement tools, and settings routes, then follow `dsh-repo`
  * catalog and host changes for both `log-analysis` and `mr-review` features.
  * @param ctx - plugin context.
  * @param config - loader-validated configuration.
@@ -79,11 +80,14 @@ export interface SupervisorPluginOptions extends ServiceOptions {
  */
 export function apply(ctx: HostContext, config?: unknown, options: SupervisorPluginOptions = {}): void {
   const bundled = loadBundledSkills(new URL('../skills/', import.meta.url))
+  const retired = retiredConfigKeys(config)
+  if (retired.length > 0) {
+    ctx.logger?.warn?.('supervisor: 日志平台分析接口已下线，配置项 %s 不再生效，可以删除', retired.join('、'))
+  }
   const service = new SupervisorService(ctx, resolveConfig(config), new OverlayStore(options.overlayPath ?? defaultOverlayPath()), { bundled }, options)
   service.registerSkill()
   service.registerTools()
   mountSettingsRoutes(ctx, service)
-  mountAnalyzeRoute(ctx, service.analyzeGate(), async (topics, request, key) => await service.acceptAnalysis(topics, request, key))
   ctx.effect(() => {
     void service.boot().catch((error: unknown) => {
       ctx.logger?.error?.('supervisor: 启动失败：%s', messageOf(error))

@@ -677,7 +677,6 @@ describe('IssueBitableSyncer two-way synchronization', () => {
     const initial = await (await fetch(`${base}${STATE_ROUTE}`)).json() as StateWire
     expect(initial.issues?.bitableAvailable).toBe('missing')
     expect(initial.runtime).toEqual({
-      analyzeTokenRef: 'SUPERVISOR_ANALYZE_TOKEN',
       platformSecretRef: 'SUPERVISOR_PLATFORM_CLIENT_SECRET',
       subagentProvider: 'custom-provider',
       refreshWaitMs: 15000,

@@ -13,7 +13,7 @@ export const SETTINGS_ROUTE = '/supervisor/settings'
 export const APPLICATION_ROUTE = '/supervisor/applications'
 /** POST：body `{ id }` 立即把一次分析的报告重新上传到它的每份日志，不论上次是否成功。 */
 export const REPORT_UPLOAD_ROUTE = '/supervisor/reports/upload'
-/** PUT：body `{ tokenEnv, value }` 把凭据存入 DSH 凭据库；DELETE：body `{ tokenEnv }` 删除已存的值。只接受分析接口令牌和日志平台 client_secret 的名称。 */
+/** PUT：body `{ tokenEnv, value }` 把凭据存入 DSH 凭据库；DELETE：body `{ tokenEnv }` 删除已存的值。只接受日志平台 client_secret 的名称。 */
 export const TOKEN_ROUTE = '/supervisor/token'
 /** POST：body `{ scope, key }` 重置（un-trip）指定的熔断器，恢复受阻的 MR/日志自动监管。 */
 export const BREAKER_RESET_ROUTE = '/supervisor/breakers/reset'
@@ -25,12 +25,6 @@ export const OUTBOX_RETRY_ROUTE = '/supervisor/outbox/retry'
 export const ISSUE_SYNC_ROUTE = '/supervisor/issues/sync'
 /** POST：body `{ bitableUrl?, table? }` 对指定（或已保存）飞书多维表格执行字段映射自检。 */
 export const ISSUE_CHECK_ROUTE = '/supervisor/issues/check'
-
-/**
- * POST：日志平台分析接口（Bearer 令牌鉴权，不走 DSH 登录）。它在 DSH 的
- * `/api` 命名空间之外，网关可以把它和需要登录的 DSH 接口分开暴露。
- */
-export const ANALYZE_ROUTE = '/open-api/supervisor'
 
 /** One application repository: a dsh-repo catalog repository with the log analysis feature turned on. */
 export interface RepoSpec {
@@ -123,14 +117,11 @@ export interface UploadSettings {
   concurrency: number
 }
 
-/** The log-platform analyze API ({@link ANALYZE_ROUTE}). */
+/**
+ * Log platform connection and report upload. The settings key stays `analyze`
+ * so existing configurations keep loading after the analyze API was retired.
+ */
 export interface AnalyzeSettings {
-  /** Whether the API accepts requests; switched off it answers 404. */
-  enabled: boolean
-  /** Feishu group (`oc_…`) a request without `chatId` goes to; absent makes `chatId` required. */
-  defaultChatId?: string
-  /** Most logs one request may name. */
-  maxLogs: number
   /** The log platform the logs are read from and the reports uploaded to. */
   platform: PlatformSettings
   /** Report upload. */
@@ -184,6 +175,8 @@ export interface LogSupervisionSettings {
   enabled: boolean
   /** Polling interval across archived platform logs, in milliseconds. */
   pollIntervalMs: number
+  /** How far each poll's archive-time upper bound trails the clock, in milliseconds; covers late commits and clock skew. */
+  pollLagMs: number
   /** Batch size trigger threshold (immediate dispatch when reached). */
   batchSizeThreshold: number
   /** Maximum number of logs included in a single dispatched batch. */
@@ -399,14 +392,8 @@ export interface LegacyReportWire {
   error?: string
 }
 
-/** Analyze API view of the panel. */
+/** Log platform view of the panel. */
 export interface AnalyzeWire {
-  /** Route the log platform posts to. */
-  route: string
-  /** Credential reference (`analyzeTokenRef`) holding the bearer token. */
-  tokenEnv: string
-  /** Token status; absent while the DSH composition has no credential store. */
-  token?: TokenStatusWire
   /** Credential reference (`platformSecretRef`) holding the platform client secret. */
   secretEnv: string
   /** Client secret status; absent while the DSH composition has no credential store. */
@@ -416,7 +403,7 @@ export interface AnalyzeWire {
   topics: TopicsAvailability
   /** `feishuActions` v1 availability for semi-automatic action cards. */
   actions?: ActionsAvailability
-  /** Most recently accepted analyses, newest first. */
+  /** Analyses the retired analyze API accepted, newest first; their topics may still upload follow-ups. */
   reports: AnalysisWire[]
   /** Reports of the former command upload, newest first. */
   legacyReports: LegacyReportWire[]
@@ -598,7 +585,6 @@ export interface IssueOverviewWire {
 
 /** Read-only cordis runtime settings summary rendered in the Advanced tab. */
 export interface RuntimeInfoWire {
-  analyzeTokenRef: string
   platformSecretRef: string
   subagentProvider: string
   refreshWaitMs: number

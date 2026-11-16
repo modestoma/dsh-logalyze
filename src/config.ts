@@ -46,7 +46,7 @@ const platformSchema = z.object({
   baseUrl: optionalUrl('日志平台接口地址'),
   tokenUrl: optionalUrl('日志平台令牌地址'),
   clientId: z.string().trim().max(512).transform(value => (value === '' ? undefined : value)).optional(),
-  clientAuth: z.enum(['body', 'basic']).default('body'),
+  clientAuth: z.enum(['body', 'basic']).default('basic'),
   scope: z.string().trim().max(1024).default('log:search log:download log:upload'),
   timeoutMs: durationMs(1000).default(30 * 1000),
 }).strict()
@@ -62,16 +62,22 @@ const uploadSchema = z.object({
   concurrency: z.number().int().min(1).max(16).default(4),
 }).strict()
 
-/** Largest `analyze.maxLogs`: the root card's row limit (one row per log), below the platform's 100 ids per metadata query. */
-export const MAX_LOGS_LIMIT = 50
+/**
+ * Keys of the retired analyze API. Older cordis.yml files and panel overlays
+ * still carry them, so they are accepted and dropped.
+ */
+const retiredAnalyzeFields = {
+  enabled: z.unknown().optional(),
+  defaultChatId: z.unknown().optional(),
+  maxLogs: z.unknown().optional(),
+}
 
+/** Log platform connection and report upload; the key stays `analyze` so existing configurations keep loading. */
 const analyzeSchema = z.object({
-  enabled: z.boolean().default(false),
-  defaultChatId: z.string().trim().regex(CHAT_ID_PATTERN, '默认群必须是飞书群的 chat_id（oc_ 开头）').optional(),
-  maxLogs: z.number().int().min(1).max(MAX_LOGS_LIMIT).default(10),
+  ...retiredAnalyzeFields,
   platform: platformSchema.prefault({}),
   upload: uploadSchema.prefault({}),
-}).strict()
+}).strict().transform(({ platform, upload }) => ({ platform, upload }))
 
 const mrReviewSchema = z.object({
   enabled: z.boolean().default(true),
@@ -103,6 +109,7 @@ const issueSyncSchema = z.object({
 const logSupervisionBaseSchema = z.object({
   enabled: z.boolean().default(false),
   pollIntervalMs: durationMs(1000).default(60 * 1000),
+  pollLagMs: durationMs(0).default(2 * 60 * 1000),
   batchSizeThreshold: z.number().int().min(1).max(50).default(5),
   maxBatchSize: z.number().int().min(1).max(50).default(20),
   batchWindowMs: durationMs(0).default(5 * 60 * 1000),
@@ -152,11 +159,8 @@ void editableSettingsMatch
 const configSchema = z.object({
   repos: retiredRepos,
   ...editableFields,
-  /**
-   * Credential reference (environment-variable name) whose value is the
-   * analyze API's bearer token.
-   */
-  analyzeTokenRef: z.string().trim().regex(TOKEN_ENV_PATTERN, '令牌名称只能包含字母、数字和下划线，且不能以数字开头').default('SUPERVISOR_ANALYZE_TOKEN'),
+  /** Credential reference of the retired analyze API's bearer token; accepted and ignored. */
+  analyzeTokenRef: z.unknown().optional(),
   /**
    * Credential reference (environment-variable name) whose value is the log
    * platform's OAuth2 client secret.
@@ -175,7 +179,7 @@ const configSchema = z.object({
    * when a task matches the usable applications its description lists.
    */
   autoInvoke: z.boolean().default(true),
-}).strict().refine(config => config.platformSecretRef !== config.analyzeTokenRef, { path: ['platformSecretRef'], message: '日志平台 client_secret 与分析接口令牌不能用同一个凭据名称' })
+}).strict()
 
 /** Validated plugin configuration. */
 export type SupervisorConfig = z.output<typeof configSchema>
@@ -226,6 +230,25 @@ export function resolveConfig(raw: unknown): SupervisorConfig {
   const parsed = pluginConfigSchema.safeParse(raw ?? {})
   if (!parsed.success) throw new Error(`supervisor: 配置不合法：${describeIssue(parsed.error)}`)
   return parsed.data
+}
+
+/**
+ * Keys of the retired analyze API that a raw configuration still sets. They
+ * load without effect; the caller warns about them.
+ * @param raw - the raw `config` object, possibly undefined.
+ * @returns dotted key paths, empty when none is set.
+ */
+export function retiredConfigKeys(raw: unknown): string[] {
+  if (typeof raw !== 'object' || raw === null) return []
+  const record = raw as Record<string, unknown>
+  const keys = record.analyzeTokenRef === undefined ? [] : ['analyzeTokenRef']
+  const analyze = record.analyze
+  if (typeof analyze === 'object' && analyze !== null) {
+    for (const key of Object.keys(retiredAnalyzeFields)) {
+      if ((analyze as Record<string, unknown>)[key] !== undefined) keys.push(`analyze.${key}`)
+    }
+  }
+  return keys
 }
 
 /**

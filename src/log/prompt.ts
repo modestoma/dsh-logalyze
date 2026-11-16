@@ -15,6 +15,7 @@ import type { LogDeliveryMode } from '../settings/contract.ts'
 import { UNLABELED_ERROR_CODE } from '../report/render.ts'
 import {
   ISSUE_SEARCH_TOOL_NAME,
+  LOG_GROUP_STATS_TOOL_NAME,
   LOG_PREPARE_TOOL_NAME,
   LOG_PUSH_MR_TOOL_NAME,
   LOG_SUBMIT_TOOL_NAME,
@@ -76,7 +77,7 @@ export function buildPlatformDiagnosisPrompt(params: {
     '',
     '请按以下步骤执行：',
     `1. 首先调用 \`${LOG_PREPARE_TOOL_NAME}\`（传入 \`taskId: "${params.taskId}"\`）下载并安全解压 \`L1..L${params.inputs.length}\`、检出代码并读取候选已知问题；`,
-    `2. 结合日志目录与代码逐份核验（严禁跳过核验或将单份结论盲目复制到整批），需要时调用 \`${ISSUE_SEARCH_TOOL_NAME}\` 核对 \`IssueMemory\`（人工确认结论 \`humanConclusion\` 优先于历史 AI 诊断）；`,
+    `2. 结合日志目录与代码逐份核验（严禁跳过核验或将单份结论盲目复制到整批），需要时调用 \`${ISSUE_SEARCH_TOOL_NAME}\` 核对 \`IssueMemory\`（人工确认结论 \`humanConclusion\` 优先于历史 AI 诊断）；需要了解同组历史数量与版本分布时调用 \`${LOG_GROUP_STATS_TOOL_NAME}\`；`,
     `3. 完成排查后调用 \`${LOG_SUBMIT_TOOL_NAME}\` 提交覆盖全部 ${params.inputs.length} 份槽位的结构化结论与证据（若归因 \`code_defect\` 须附真实代码文件行号；若某槽位包损坏则提交 \`corrupted_log\`）；`,
     `4. ${actionNote}`,
   ].join('\n')

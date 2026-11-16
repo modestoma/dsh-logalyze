@@ -152,6 +152,7 @@ describe('plugin', () => {
       'supervisor_mr_checkpoint',
       'supervisor_log_prepare',
       'supervisor_issue_search',
+      'supervisor_log_group_stats',
       'supervisor_log_submit',
       'supervisor_log_push_mr',
     ])
