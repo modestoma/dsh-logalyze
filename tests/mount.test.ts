@@ -16,9 +16,11 @@ import { commitFile, createAppRepo, tempDir } from './helpers.ts'
 let server: Server
 let port = 0
 beforeAll(async () => {
-  server = createServer((_req, res) => {
-    res.writeHead(200)
-    res.end('packed-log')
+  server = createServer((req, res) => {
+    setTimeout(() => {
+      res.writeHead(200)
+      res.end('packed-log')
+    }, req.url?.startsWith('/slow/') === true ? 600 : 0)
   })
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   port = (server.address() as { port: number }).port
@@ -96,6 +98,14 @@ describe('supervisor_mount_apps', () => {
     expect(moved.apps[0]!.commit).not.toBe(first.apps[0]!.commit)
     expect(moved.apps[0]!.dir).not.toBe(first.apps[0]!.dir)
     expect(repos.heldSnapshots()).toBe(1)
+  })
+
+  it('returns held snapshots when downloading the logs outlasts the hold time', async () => {
+    const { repos, mounter, exec } = await setup(250)
+    const value = await mounter.execute({ apps: ['order-service'], logs: [{ url: `http://127.0.0.1:${port}/slow/app.log` }] }, exec)
+    expect(repos.heldSnapshots()).toBe(1)
+    expect((await stat(join(value.apps[0]!.dir, '.agents', 'skills', 'log-analysis', 'SKILL.md'))).isFile()).toBe(true)
+    expect(value.apps[0]!.skills).toHaveLength(1)
   })
 
   it('shares one snapshot between sessions and releases each session after its hold time', async () => {

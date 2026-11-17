@@ -238,12 +238,15 @@ export class AppMounter {
     const { effectiveDir, baseDir } = await resolveRunBase(parent, this.deps.workingDirectory(), exec.signal)
     const refs = this.deps.platformLogs?.(parent.session.header.id)
     const sources = await admitLogs(parsed.data.logs ?? [], effectiveDir, settings.download, refs)
-    const mounted = await this.deps.mounts.mount(parent.session.header.id, apps)
+    // Mounting before the downloads refuses unusable applications without downloading anything.
+    await this.deps.mounts.mount(parent.session.header.id, apps)
     exec.signal.throwIfAborted()
     const runId = newRunId(this.deps.now?.() ?? new Date())
     const runDir = join(baseDir, ...RUNS_SEGMENTS, runId)
     await mkdir(runDir, { recursive: true })
     const logs = await materializeLogs(sources, runDir, settings.download, exec.signal, this.deps.fetch, this.deps.platform)
+    // Mounting again after the downloads restarts the hold period, and acquires the snapshots again when a long download outlasted it.
+    const mounted = await this.deps.mounts.mount(parent.session.header.id, apps)
     return {
       runId,
       runDir,
