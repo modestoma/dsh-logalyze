@@ -377,9 +377,11 @@ const MR_STATE_LABEL: Readonly<Record<SupervisedMrWire['state'], { pill: string;
 
 const BITABLE_STATUS_LABEL: Readonly<Record<BitableAvailability, { pill: string; text: string }>> = {
   ready: { pill: 'lz__pill--ok', text: '多维表格能力就绪' },
-  missing: { pill: 'lz__pill--warn', text: '未检测到 dsh-channels 多维表格能力' },
+  missing: { pill: 'lz__pill--warn', text: '未检测到 dsh-channels 多维表格能力（需要 dsh-channels 0.10.0 及以上）' },
   incompatible: { pill: 'lz__pill--bad', text: '多维表格服务版本不兼容' },
 }
+
+const ISSUES_UNAVAILABLE_LABEL = { pill: 'lz__pill--bad', text: '已知问题库未启动（监管存储域未就绪）' } as const
 
 const REPORT_STATUS: Readonly<Record<ReportStatus, { pill: string; text: string }>> = {
   done: { pill: 'lz__pill--ok', text: '已完成' },
@@ -524,6 +526,7 @@ export function SupervisorPanel({ openRepoSettings }: SupervisorPageProps): JSX.
         </div>
       </header>
       {state.overlayError === undefined ? null : <div className="lz__notice lz__notice--error">面板设置文件未生效：{state.overlayError}。保存一次会用当前内容覆盖它。</div>}
+      {state.storageError === undefined ? null : <div className="lz__notice lz__notice--error">监管存储域打开失败：{state.storageError}。MR 评审、日志监管和已知问题库都已停用，排除原因后重启 DSH。</div>}
       <div className="lz__body" role="tabpanel">
         {tab === 'overview'
           ? <OverviewTab
@@ -688,7 +691,7 @@ function OverviewTab({
               <span>已知问题库</span>
               <span className={`lz__pill ${issues?.bitableAvailable === 'ready' ? 'lz__pill--ok' : 'lz__pill--warn'}`}>
                 <span className="lz__dot" />
-                {issues?.enabled ? (state.settings.issueSync.bitableUrl === undefined ? '未填表' : issues.bitableAvailable === 'ready' ? '就绪' : '离线') : '已关'}
+                {issues === undefined ? '未启动' : issues.enabled ? (state.settings.issueSync.bitableUrl === undefined ? '未填表' : issues.bitableAvailable === 'ready' ? '就绪' : '离线') : '已关'}
               </span>
             </div>
             <div className="lz__cardVal">{issues?.totalCount ?? 0} 条</div>
@@ -1450,7 +1453,7 @@ function IssuesTab({
   const [onlyDirty, setOnlyDirty] = useState(false)
   const [expandedId, setExpandedId] = useState<string | undefined>()
 
-  const avail = BITABLE_STATUS_LABEL[overview?.bitableAvailable ?? 'missing']
+  const avail = overview === undefined ? ISSUES_UNAVAILABLE_LABEL : BITABLE_STATUS_LABEL[overview.bitableAvailable]
   const canSyncSaved = !dirty && savedSettings.enabled && savedSettings.bitableUrl !== undefined && overview?.bitableAvailable === 'ready'
   const items = (overview?.items ?? []).filter((item) => {
     if (onlyDirty && !item.syncDirty) return false

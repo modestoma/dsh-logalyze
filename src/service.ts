@@ -141,6 +141,8 @@ export class SupervisorService {
   private breakers: CircuitBreakerRegistry | undefined
   private issueMemory: IssueMemory | undefined
   private issueSyncer: IssueBitableSyncer | undefined
+  /** Why the `dsh_supervisor` storage domain failed to open at boot; MR, log, and issue supervision stay off. */
+  private storageError: string | undefined
   private mrSupervisor: MrSupervisor | undefined
   private logSupervisor: LogSupervisor | undefined
   private supervisorPromise: Promise<SupervisorDomain> | undefined
@@ -386,7 +388,8 @@ export class SupervisorService {
     try {
       await this.ensureSettingsLoaded()
       const domain = await this.supervisorDomain().catch((error: unknown) => {
-        this.ctx.logger?.error?.('supervisor: 打开监管存储域失败：%s', messageOf(error))
+        this.storageError = messageOf(error)
+        this.ctx.logger?.error?.('supervisor: 打开监管存储域失败：%s', this.storageError)
         return undefined
       })
       if (domain !== undefined) {
@@ -609,6 +612,7 @@ export class SupervisorService {
     const problem = platformProblem(this.settings.get().analyze.platform)
     return {
       ...this.settings.panel(),
+      ...(this.storageError === undefined ? {} : { storageError: this.storageError }),
       repos: this.registry.status(),
       mrRepos: this.registry.mrStatus(),
       dshRepo: this.repos.panelState(),

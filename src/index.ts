@@ -59,7 +59,7 @@ export type { SupervisorConfig } from './config.ts'
 export const name = 'supervisor'
 
 /** Host services the plugin needs before `apply()`. */
-export const inject = ['tools', 'skills', 'subagents'] as const
+export const inject = ['tools', 'skills', 'subagents', 'storageDomain'] as const
 
 /** Standard Schema the loader validates `config` with before `apply()`. */
 export { pluginConfigSchema as Config } from './config.ts'

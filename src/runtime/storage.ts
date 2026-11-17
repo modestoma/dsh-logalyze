@@ -28,12 +28,16 @@ export interface DomainSpec<Tables extends Record<string, DomainTableSpec> = Rec
   readonly tables: Tables
 }
 
-/** Untyped key-value table handle returned by a domain handle. */
+/**
+ * Untyped key-value table handle returned by a domain handle. DSH's
+ * `storageDomain` tables return iterators from `entries()` and `keys()`;
+ * {@link typedTable} materializes them as arrays.
+ */
 export interface RawTable {
   readonly size: number
   get(key: string): unknown
-  entries(): [string, unknown][]
-  keys(): string[]
+  entries(): Iterable<[string, unknown]>
+  keys(): Iterable<string>
   put(key: string, value: unknown): Promise<void>
   update(key: string, fn: (current: unknown) => unknown): Promise<unknown>
   delete(key: string): Promise<boolean>
@@ -91,9 +95,9 @@ export function typedTable<V>(raw: RawTable): DomainTable<V> {
     get size() { return raw.size },
     has: key => raw.get(key) !== undefined,
     get: key => raw.get(key) as V | undefined,
-    entries: () => raw.entries() as [string, V][],
-    values: () => raw.entries().map(([, value]) => value as V),
-    keys: () => raw.keys(),
+    entries: () => Array.from(raw.entries()) as [string, V][],
+    values: () => Array.from(raw.entries(), ([, value]) => value as V),
+    keys: () => Array.from(raw.keys()),
     put: (key, value) => raw.put(key, value),
     update: (key, fn) => raw.update(key, current => fn(current as V)) as Promise<V>,
     delete: key => raw.delete(key),

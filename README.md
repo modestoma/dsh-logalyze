@@ -81,6 +81,8 @@
 
 观象以 dsh bundle 交付（`package.json` 的 `dsh.bundle.patch` 指向 `cordis.patch.yml`），Host 半侧运行 `lib/index.js`，浏览器半侧运行 `lib/client.js`。
 
+插件声明依赖宿主服务 `tools`、`skills`、`subagents` 与 `storageDomain`，在它们全部就绪后才启动；监管状态（水位线、批次、MR 跟踪、熔断器、已知问题库）保存在宿主 `storageDomain` 的 `dsh_supervisor` 存储域。存储域打开失败时，设置面板顶部显示失败原因，MR 评审、日志监管和已知问题库保持停用。
+
 安装已发布的 npm 版本（推荐）：
 
 ```bash
