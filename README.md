@@ -4,7 +4,7 @@
 
 智能监管（npm 包名 `dsh-supervisor`，Cordis 插件名 `supervisor`）是面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的 AI 原生智能监管中心底座与统一交付插件，下辖两大领域监管能力：
 
-- **观象（日志监管）**：`/supervisor` 入口识别应用与派发子 Agent、从日志平台自动拉取日志分批分析与报告回传、面板归属的应用描述与触发别名设置、可选 DSH SKILL 发现与加载。
+- **观象（日志监管）**：`/supervisor` 入口识别应用、挂载应用代码由主会话直接分析（可选派发子 Agent 并行分析）、从日志平台自动拉取日志分批分析与报告回传、面板归属的应用描述与触发别名设置、可选 DSH SKILL 发现与加载。
 - **审微（MR 自动评审）**：自动跟随 `dsh-repo` 中启用「MR 自动评审」的代码仓库，依托 `dshRepos` v8 行级评审契约与 `dsh_supervisor` 共享运行时提供持续增量评审支撑。
 
 详细架构与设计文档见 [`docs/supervisor/README.md`](docs/supervisor/README.md)。
@@ -15,7 +15,7 @@
 
 - **M1 跨插件底座与共享运行时**：协同 [dsh_channels](https://github.com/modestoma/dsh_channels)（`feishuActions` v1 非阻塞动作提议卡 + `feishuBitable` v1 多维表格服务端读写）与 [dsh-repo](https://github.com/modestoma/dsh-repo)（`dshRepos` v8 行级评审与讨论线程契约），建立 `dsh_supervisor` 存储域（7 张强类型表）、并发隔离池（`logPool` / `mrPool`）、滑动防抖器、滑动窗口熔断器与幂等 Outbox。
 - **M2 审微（MR 自动评审）**：自动跟随启用「MR 自动评审」的仓库，以「1 条 MR = 1 个持久化 `mr-reviewer` Session」完成首次行级评审、Push 增量重审、人类讨论回复与自动 Resolve，以及己方修复 MR（`self-fix` / `self-skill`）的 CI/评审跟进。
-- **M3 观象（日志自动监管与闭环处置）**：支持 `/supervisor` 手动入口，以及 `logSupervision` 日志平台增量水位线轮询 + `(product, component, error_code)` 窗口攒批；集成共享镜像克隆（`<workDir>/repos/<app>`）、`IssueMemory` 检索、Outbox 报告回传，以及经 `propose_actions` 触发的一键 `[🔧 修复代码并提 MR]` / `[📚 改进分析流程 / 沉淀案例]` 闭环。
+- **M3 观象（日志自动监管与闭环处置）**：支持 `/supervisor` 手动入口，以及 `logSupervision` 日志平台增量水位线轮询 + `(product, component, error_code)` 窗口攒批；诊断时 `<workDir>/repos/<app>` 链接到多会话共享的只读代码快照、修代码时才创建可写工作区、`IssueMemory` 检索、Outbox 报告回传，以及经 `propose_actions` 触发的一键 `[🔧 修复代码并提 MR]` / `[📚 改进分析流程 / 沉淀案例]` 闭环。
 - **M4 问题库双向同步与统一面板**：本地 `IssueMemory` 与飞书多维表格后台双向幂等同步（严格隔离 AI 列与人工列），提供 Web 左侧栏「智能监管」5 标签页（运行总览 / 应用与日志监管 / MR 自动评审 / 已知问题库 / 模型与高级）整页面板。
 
 ## 核心能力
@@ -48,32 +48,34 @@
 
 ## 工作方式
 
-观象是分体结构：插件只负责识别与派发，各应用的日志分析知识跟着应用代码放在应用自己的仓库里。
+观象是分体结构：插件负责识别应用、挂载代码与准备日志，各应用的日志分析知识跟着应用代码放在应用自己的仓库里。
 
 ```
 用户：/supervisor 订单服务昨晚 21 点下单报 500，日志见附件
         │
         ▼
-入口 SKILL（意图识别）── 先 fetch 各仓库，应用目录由远端最新提交的 .agents/logalyze.yaml 生成
-        │  supervisor_dispatch({ tasks: [{ app, question, logs }] })
+入口 SKILL（意图识别）── 先 fetch 各仓库，应用目录由各仓库最新提交生成
+        │  supervisor_mount_apps({ apps, logs })
         ▼
-派发工具：校验应用 id → 下载 URL 日志 → 并行启动子 Agent，等待全部结束
-        │  子 Agent 工作目录 = 应用仓库，首条消息以 /<skill> 开头加载该应用的日志分析 SKILL
+挂载工具：校验应用 id → 为本会话持有各应用的只读代码快照（多会话共享）→ 下载 URL 日志到运行目录
+        │  返回代码目录、仓库与提交、仓库 SKILL 路径和日志路径
         ▼
-父 Agent 按应用分节汇总，涉及多个应用时给出跨应用的推演
+主会话按仓库 SKILL 读日志和代码分析，按应用分节汇总，涉及多个应用时给出跨应用的推演
+（可选：多个应用、日志都很大时改用 supervisor_dispatch 交给子 Agent 并行分析，子 Agent 读同一份快照）
 ```
 
-- **一个入口，两种触发。** 入口 SKILL 是 `/supervisor`，dsh 在 Web、TUI、ACP 以及经飞书渠道插件的飞书消息中都能识别它。有可用应用且 `autoInvoke` 开启（默认）时，模型也能自行加载：dsh 给顶层 Agent 的 skill 目录里，智能监管的描述会列出每个可用应用的名称、id、别名和日志特征（总长不超过 500 字，放不下的只计数），用户说「分析这份订单服务的日志」或贴出带 `OrderController` 的报错时，模型会先加载它。日志明显不属于任何已注册应用时，入口 SKILL 让模型按普通方式处理，不派发也不追问。分析子 Agent 的工作目录在 `dshRepos` 服务的镜像目录内，改进与起草子 Agent 的工作区在运行目录内，这些位置都不列出入口 SKILL。应用增删时 dsh 会追加一条新的 skill 目录消息；想要确定触发时仍用 `/supervisor`。
-- **派发由代码完成。** 模型只给出应用 id、问题和日志位置；仓库目录、应用 SKILL、并发上限都由插件决定。应用 id 必须与注册表一一对应，否则整次派发被拒绝。
-- **日志一律以绝对路径交给子 Agent。** 附件和本机文件直接传路径；消息里的对象存储下载链接由派发工具下载（只允许白名单域名，不带鉴权，限制大小与耗时）。日志包不解压，由应用的日志分析 SKILL 在运行目录里解压。
+- **一个入口，两种触发。** 入口 SKILL 是 `/supervisor`，dsh 在 Web、TUI、ACP 以及经飞书渠道插件的飞书消息中都能识别它。有可用应用且 `autoInvoke` 开启（默认）时，模型也能自行加载：dsh 给顶层 Agent 的 skill 目录里，智能监管的描述会列出每个可用应用的名称、id、别名和日志特征（总长不超过 500 字，放不下的只计数），用户说「分析这份订单服务的日志」或贴出带 `OrderController` 的报错时，模型会先加载它。日志明显不属于任何已注册应用时，入口 SKILL 让模型按普通方式处理，不挂载也不追问。分析子 Agent 的工作目录在 `dshRepos` 服务的镜像目录内，改进与起草子 Agent 的工作区在运行目录内，这些位置都不列出入口 SKILL。应用增删时 dsh 会追加一条新的 skill 目录消息；想要确定触发时仍用 `/supervisor`。
+- **主会话直接读代码。** 默认由主会话自己分析：`supervisor_mount_apps` 只接受应用 id 和日志位置，代码目录、提交和上限都由插件决定，应用 id 必须与注册表一一对应，否则整次调用被拒绝。主会话的 SKILL 目录不包含快照里的仓库 SKILL，工具按路径列出 `.dsh/skills` 与 `.agents/skills` 下的 SKILL，模型直接读取。
+- **可选派发。** 同时分析多个应用、每个应用的日志都很大时，入口 SKILL 允许改用 `supervisor_dispatch` 交给子 Agent 并行分析；子 Agent 的工作目录是同一份共享快照。
+- **日志一律以绝对路径给出。** 附件和本机文件直接传路径；消息里的对象存储下载链接由工具下载（只允许白名单域名，不带鉴权，限制大小与耗时）。日志包不解压，分析时在运行目录里解压。
 - **应用目录随时最新。** 每次加载 `/supervisor` 都先经 `dshRepos` 服务取各仓库日志分析分支最新提交的只读快照（dsh-repo 取快照前从远端拉取；间隔由 `fetchIntervalMs` 控制，默认每次），读取应用描述生成应用目录。新提交有自己的快照，所以正在进行的分析不会挡住更新。最多等待 `refreshWaitMs`，超时就先用已有的目录，读取在后台继续。
-- **代码快照不可变。** 分析子 Agent 在 `dshRepos` 服务按提交创建的只读快照里工作，派发期间持有快照，结束后释放。
-- **运行目录。** 每次派发在父会话目录下创建 `.supervisor/runs/<runId>/<序号>-<应用 id>/`，下载的日志放在这里，分析子 Agent 也只在这里写文件；代码快照对分析子 Agent 只读。
+- **代码快照不可变、多会话共享。** 代码目录是 `dshRepos` 服务按提交创建的只读快照（`<镜像目录>/.snapshots/` 下），同一提交只有一份，多个会话和子 Agent 共用。挂载由会话持有：同一会话再次挂载时沿用未变的快照，仓库有新提交时换到新快照；会话最后一次挂载后 `snapshotHoldMs`（默认 4 小时）内没有再挂载就释放，之后读取需要重新挂载。派发期间子 Agent 另外持有快照，结束后释放。
+- **运行目录。** 每次挂载或派发在会话目录下创建 `.supervisor/runs/<runId>/`（派发时每个应用一个 `<序号>-<应用 id>/`），下载的日志放在这里，解压结果和中间文件也只写在这里；代码快照只读。
 - **等待式派发。** 工具等待所有子 Agent 结束后一次返回，一条消息对应一张完整回复；超过派发超时或调用被取消时停止仍在运行的子 Agent。子会话中不提供派发工具。
 - **结果带仓库和提交。** 每个应用的结果写明应用仓库地址和分析的提交（「仓库 <地址>，提交 <前 12 位>」）。用户随后要求修复分析发现的代码问题时，入口 SKILL 让模型按普通编码任务处理，从这个仓库地址和提交开始，不在运行目录或代码快照里改代码。
 - **仓库只在 dsh-repo 中配置。** 应用仓库就是 dsh-repo 仓库清单中打开了「日志分析」功能的仓库：观象启动时向 dsh-repo 注册这个功能，读取清单，清单变化（加仓库、删仓库、改分支、开关功能）后立即重新配置并读取应用描述。仓库只能在 dsh-repo 的设置页添加，镜像的拉取和拉取状态也在那里；观象自己不保存仓库列表，也不提供拉取按钮。
 - **在对话中起草接入。** 清单里的可写仓库缺少应用描述或 SKILL 时，模型可以派一个子 Agent 在工作区里起草，经 dsh-repo 的审批推送为合并请求，见[在对话中起草接入](#在对话中起草接入)。
-- **SKILL 改进（默认开启）。** 子 Agent 觉得应用的日志分析 SKILL 没能支撑这次分析时，父 Agent 先给出分析结论，在回复末尾附上 SKILL 改进建议；用户在之后的消息里同意（或主动指出 SKILL 的记录有误、要求改进）后，由一个改进子 Agent 把该应用的所有改进点一次改进完，在工作区里修改 SKILL 并把问题整理为 `cases/` 下的案例，观象经 `dshRepos` 服务（推送前由 dsh-repo 审批）推送到应用仓库的新分支并创建合并请求（GitLab MR 或 GitHub PR）供评审，见 [SKILL 改进](#skill-改进)。
+- **SKILL 改进（默认开启）。** 主会话或子 Agent 觉得应用的日志分析 SKILL 没能支撑这次分析时，先给出分析结论，在回复末尾附上 SKILL 改进建议；用户在之后的消息里同意（或主动指出 SKILL 的记录有误、要求改进）后，由一个改进子 Agent 把该应用的所有改进点一次改进完，在工作区里修改 SKILL 并把问题整理为 `cases/` 下的案例，观象经 `dshRepos` 服务（推送前由 dsh-repo 审批）推送到应用仓库的新分支并创建合并请求（GitLab MR 或 GitHub PR）供评审，见 [SKILL 改进](#skill-改进)。
 
 ## 安装与配置
 
@@ -107,6 +109,7 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
       timeoutMs: 600000
     subagentProvider: spawn            # 子 Agent 使用的 ctx.subagents provider
     subagentMaxDepth: 1                # 子 Agent 委派深度上限；0 = 子 Agent 不能再委派；provider-managed = 不传上限，由 provider 自己控制
+    snapshotHoldMs: 14400000           # 会话最后一次挂载应用代码后保留只读快照的时长（最少 60000）
     refreshWaitMs: 15000               # 加载 /supervisor 时等待 fetch 的上限；0 = 不等待
     autoInvoke: true                   # 任务匹配已注册应用时模型可自行加载入口 SKILL；false = 只能输入 /supervisor
     skillUpdates:                      # SKILL 改进，见下文
@@ -172,8 +175,8 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
 
 - 插件在 `dshRepos` 服务出现时注册两项仓库级功能：`log-analysis`（标题「日志分析」，`dshRepos` v7/v8 均可）与 `mr-review`（标题「MR 自动评审」，需 `dshRepos` **v8** 提供行级评审、增量 compare 与讨论线程接口；版本为 v7 时面板「MR 自动评审」标出升级提示），插件卸载时撤销注册。
 - 启用「日志分析」的仓库不再要求提交 `.agents/logalyze.yaml`：仓库在 dsh-repo 中打开「日志分析」即可被收录，应用描述（`description`）与触发别名（`aliases` / 平台原始 `component_code`）直接在智能监管 Web 面板配置并持久化在 `$DSH_HOME/supervisor/applications.json`；若仓库历史保留 `.agents/logalyze.yaml` 且本地尚无记录，首次同步时自动一次性迁移其描述与别名。
-- 日志分析与 MR 自动评审均支持通过 `dshRepos.workspaceCreate` 在当前会话工作目录下创建镜像克隆工作区（`<workDir>/repos/<slug>`），从本地裸镜像秒级检出并共享 Git 对象；写操作推送均由 `dshRepos.workspacePush` 经过 dsh-repo 的 `access/authorize` 与写权限门控完成。
-- 仓库在清单里的权限决定能做什么：「只读」仅允许分析与 MR 评审，面板标出「只读」；修改代码、改进 SKILL 与提交合并请求需要「可改代码」或「可合并」。Linux 沙箱环境下镜像目录不能放在 `/tmp` 下；飞书会话中需要将代码快照目录 `<镜像目录>/.snapshots` 加入渠道插件可读目录以支持传统只读快照派发。
+- 日志分析读代码用 `dshRepos.snapshotAcquire` 的只读快照（多会话共享，`<workDir>/repos/<slug>` 在诊断时是指向快照的链接）；修代码、改进 SKILL 和 MR 自动评审通过 `dshRepos.workspaceCreate` 在当前会话工作目录下创建镜像克隆工作区（`<workDir>/repos/<slug>`），从本地裸镜像秒级检出并共享 Git 对象；写操作推送均由 `dshRepos.workspacePush` 经过 dsh-repo 的 `access/authorize` 与写权限门控完成。
+- 仓库在清单里的权限决定能做什么：「只读」仅允许分析与 MR 评审，面板标出「只读」；修改代码、改进 SKILL 与提交合并请求需要「可改代码」或「可合并」。Linux 沙箱环境下镜像目录不能放在 `/tmp` 下；飞书会话中读代码需要在渠道插件里放开代码快照目录：把 `<镜像目录>/.snapshots` 加入 `readFence.readableRoots`，并在沙箱 runner 的 `--expose` 中加入同一目录（快照路径带随机后缀、随提交变化，所以要加整个目录）。
 
 ### 设置面板
 
@@ -185,7 +188,7 @@ DSH Web 左侧栏的 **「智能监管」** 入口打开统一 5 标签页整页
 | **应用与日志监管** | `log` | 跟随 `dsh-repo` 已开启「日志分析」的应用仓库（支持就地编辑应用描述与单行添加/删除触发别名并保存 `PUT /supervisor/applications`）；`logSupervision` 水位线状态与暂停/恢复/时间回拨控制（`POST /supervisor/log-supervision/watermark`）、攒批参数与轮询安全滞后、日志平台连接与 OAuth2 client_secret（`PUT/DELETE /supervisor/token`）、日志下载/上传限制及最近报告回传与手动重传（`POST /supervisor/reports/upload`） |
 | **MR 自动评审** | `mr` | 跟随 `dsh-repo` 已开启「MR 自动评审」的仓库清单（含目标分支与只读/可写标记）、审微运行状态与熔断器、受监管 MR 列表（`open`/`merged`/`closed`/`draft_skipped`、origin 标记及待处理信号）、`mrReview` 并发/防抖/忽略标签/熔断阈值、`customInstructions` 与可选 `feishuChatId` 告警群 |
 | **已知问题库** | `issues` | `feishuBitable` v1 就绪状态、一键「立即同步」（`POST /supervisor/issues/sync`）与「检查字段映射」（`POST /supervisor/issues/check` 对 16 列标准 Schema 逐列诊断）、`issueSync` 表格链接/表名/周期配置、本地 `IssueMemory` 问题检索列表与 `humanConclusion` / `fixMrUrl` 状态 |
-| **模型与高级** | `advanced` | 只读展示 `cordis.yml` 运行时配置（`platformSecretRef`、`subagentProvider`、`subagentMaxDepth`、`refreshWaitMs`、`autoInvoke`）、仓库读取间隔与派发上限、`skillUpdates` 开关与文件限制，以及清除覆盖恢复默认值（`DELETE /supervisor/settings`） |
+| **模型与高级** | `advanced` | 只读展示 `cordis.yml` 运行时配置（`platformSecretRef`、`subagentProvider`、`subagentMaxDepth`、`snapshotHoldMs`、`refreshWaitMs`、`autoInvoke`）、仓库读取间隔与派发上限、`skillUpdates` 开关与文件限制，以及清除覆盖恢复默认值（`DELETE /supervisor/settings`） |
 
 面板读取状态走 `GET /supervisor/state`，保存设置走 `PUT /supervisor/settings`（写入 `$DSH_HOME/supervisor/settings.json`，仅保存与 `cordis.yml` 不同的覆盖键并共用同一 Zod 校验），所有 `/supervisor/*` 路由均经过宿主 `connection.requestRejection` 登录与来源校验，写操作另做同源校验。
 
@@ -206,7 +209,7 @@ DSH Web 左侧栏的 **「智能监管」** 入口打开统一 5 标签页整页
 
 `skillUpdates.enabled` 默认开启（设置面板「高级」→「SKILL 改进」可以关闭）。分析中 SKILL 没覆盖到的问题，以及用户指出的 SKILL 错误，经用户同意后沉淀为 SKILL 修改和案例，以合并请求的形式交给仓库维护者评审。改进有两个来源：分析子 Agent 记录的不足，和用户的反馈。分析结论总是先给出，改进放在用户同意之后的回合里；同一应用的所有改进点由一个改进子 Agent 一次完成。工作区、推送和创建合并请求经 `dshRepos` 服务完成，应用仓库所在的主机要在提供该服务的插件中配置令牌；没有该服务或版本不符时工具报错。
 
-1. **分析子 Agent 记录不足。** 子 Agent 的任务消息多出一节说明：分析完成后，只有 SKILL 写错了或缺了内容、让它走了弯路或差点得出错误结论时（日志格式描述不对、缺少这类故障的排查方法或排除规则、代码路径过时），才在运行目录写 `skill-gap.md`，记下 SKILL 哪里不足、实际怎样定位、关键日志行（去掉具体数据）和代码位置；只是多查了几步，或缺的是只在这一次出现的细节，不算不足。子 Agent 不修改 SKILL，SKILL 足够时不写这个文件。
+1. **记录不足。** 主会话自己分析（默认流程）时按同样的标准判断 SKILL 是否不足，在回复末尾给出改进建议；用户同意后把不足、定位步骤、关键日志行（去掉具体数据）和代码位置写进 `supervisor_improve_skill` 的 `feedback`，日志放进 `logs`。派发给子 Agent 时，子 Agent 的任务消息多出一节说明：分析完成后，只有 SKILL 写错了或缺了内容、让它走了弯路或差点得出错误结论时（日志格式描述不对、缺少这类故障的排查方法或排除规则、代码路径过时），才在运行目录写 `skill-gap.md`，记下 SKILL 哪里不足、实际怎样定位、关键日志行（去掉具体数据）和代码位置；只是多查了几步，或缺的是只在这一次出现的细节，不算不足。子 Agent 不修改 SKILL，SKILL 足够时不写这个文件。
 2. **先给结论，再给改进建议。** 派发结束后，观象检查已完成任务的记录（普通文件、UTF-8 文本、大小不超过 `maxFileBytes`），在结果中标出「SKILL 不足」和记录摘要。顶层 Agent 照常写完分析结论，在回复末尾附一节「SKILL 改进建议」，每个应用一两句，问用户是否改进，然后结束这一回合，用户不用等改进。观象记住本次 DSH 运行中每个已完成的派发任务，供之后的改进引用。
 3. **用户也可以主动要求。** 分析按 SKILL 已有的记录走了，用户事后指出那条记录有错；或者在新会话里直接说「优化一下订单服务的日志分析 SKILL」。这时顶层 Agent 先用 `supervisor_show_skill` 读出现有 SKILL（日志分析分支最新读取的提交中的文件列表和某个文件，默认 `SKILL.md`，只读），对照着和用户确认哪部分不对、正确做法是什么、有没有样例日志，问清后再进入下一步。改进子 Agent 不能和用户对话，所以讨论放在改进之前。
 4. **用户同意后改进。** 用户在对话中同意后，顶层 Agent 为每个要改的应用调用一次 `supervisor_improve_skill`；工具本身不询问，推送前 dsh-repo 按它的「写操作」设置可能再弹出一次审批（见第 6 步）。参数是 `app`，加上可选的 `feedback`（用户的纠正或补充，尽量保留原话）、`workDirs`（作为依据的分析运行目录）和 `logs`。省略 `workDirs` 时，工具自动取本会话中该应用记录了 `skill-gap.md`、还没改进过的全部分析，所以同一应用的多次分析和用户的补充合并在一次改进里；没有这样的分析时 `feedback` 必填。下面几条由工具保证，不只靠提示词：该应用有本回合派发的分析时工具报错，分析回合不会开始改进（观象从 DSH 的 `session/event` 中数会话结束的 `turn/end`）；同一会话同一应用每回合只发起一次改进、同时只运行一次；发起改进就把用到的分析记为已改进，无论成败之后都不再自动取用，用户要求重试时用 `workDirs` 指定。
@@ -261,7 +264,7 @@ DSH Web 左侧栏的 **「智能监管」** 入口打开统一 5 标签页整页
 - **增量水位线轮询与分组攒批**：按 `archived_at` 水位游标 `[cursorTime, 现在 − pollLagMs)`（保存于 `dsh_supervisor` 存储域 `watermarks` 表，支持在面板「应用与日志监管」或 `POST /supervisor/log-supervision/watermark` 执行暂停、恢复与时间回拨）分页拉取已归档日志，并按 `(product_code, component_code, error_code)` 在 `pending_batches` 表持续攒批：同组累计达到 `batchSizeThreshold`（默认 5，单批上限 `maxBatchSize` 默认 20）或距首发入槽超过 `batchWindowMs`（默认 5 分钟）即切片发车。
 - **并发隔离、安全解压与单应用熔断**：全部批次在独立并发池 `logPool`（`maxConcurrentBatches` 默认 4）中调度；单应用滚动 1 小时内批次数超过 `appHourlyBatchLimit`（默认 15）触发 `log:<appId>` 熔断，推送飞书告警并阻塞该应用后续自动发车，直到冷却期结束或在面板「运行总览」点击恢复，不波及其他应用。
 - **`log-supervisor` 会话内诊断工具链**：每次批次分配 1 个持久化主 Agent Session（使用内置 `/log-supervisor` 指南）：
-  - `supervisor_log_prepare`：幂等下载日志、`maxUnpackBytes` 防 Zip Slip / BOM 限制解压到 `<workDir>/logs/L1..Ln/`，经 `dshRepos.workspaceCreate` 在 `<workDir>/repos/<appSlug>` 创建或更新共享镜像克隆工作区，并预检索 `IssueMemory`（优先透传已有 `humanConclusion`）。
+  - `supervisor_log_prepare`：幂等下载日志、`maxUnpackBytes` 防 Zip Slip / BOM 限制解压到 `<workDir>/logs/L1..Ln/`，诊断时把 `<workDir>/repos/<appSlug>` 链接到本会话挂载的只读代码快照（`repoKind: "snapshot"`，多会话共享），`workspace: "fix"` 时才换成经 `dshRepos.workspaceCreate` 创建的可写工作区，并预检索 `IssueMemory`（优先透传已有 `humanConclusion`）。
   - `supervisor_issue_search`：在诊断过程中按关键词、错误码或 `issueId` 随时查询本地已知问题库。
   - `supervisor_log_group_stats`：只读查询本批次同 `(product_code, component_code, error_code)` 最近若干天（默认 30，最多 180）的已归档日志数、`sw_version` / `component_version` 分布与首末归档时间，帮助判断问题是新出现还是持续存在；最多扫描 1000 条，超出时标明计数是下限，不返回下载链接。
   - `supervisor_log_submit`：校核 1:1 全槽位覆盖与证据路径真实性后写入 `log_tasks` 修订，写入/更新 `IssueMemory`，并通过单调防倒退的 `OutboxRunner`（`outbox_platform` 表）幂等上传每份日志的 `report.md` 与附件。
@@ -269,7 +272,7 @@ DSH Web 左侧栏的 **「智能监管」** 入口打开统一 5 标签页整页
 - **两种飞书投递模式与非阻塞动作闭环**：
   - `quiet-until-done`（默认）：第 1 阶段后台无头完成分析与报告生成，第 2 阶段通过 `feishuTopics` 在目标群发送摘要根卡与精简总结并附带动作按钮；适合高噪异常降噪。
   - `topic-on-start`：批次发车即在飞书开话题流式直播诊断过程，支持人工中途插话追问。
-  - 回合结束通过 `feishuActions` v1 / `propose_actions` 自动挂出独立动作卡片：**`[🔧 修复代码并提 MR]`**（要求群/本人具备 `code-write` 权限）与 **`[📚 改进分析流程 / 沉淀案例]`**；点击后零阻塞唤醒同一 Session 直接在 `<workDir>/repos/<appSlug>` 就地改代码、跑测试、发 MR。终态 `log_tasks` 记录及工作区默认留存 90 天（被 `IssueMemory` 代表报告引用的记录豁免清理）。
+  - 回合结束通过 `feishuActions` v1 / `propose_actions` 自动挂出独立动作卡片：**`[🔧 修复代码并提 MR]`**（要求群/本人具备 `code-write` 权限）与 **`[📚 改进分析流程 / 沉淀案例]`**；点击后零阻塞唤醒同一 Session，先以 `workspace: "fix"` 把 `<workDir>/repos/<appSlug>` 换成可写工作区，再改代码、跑测试、发 MR。终态 `log_tasks` 记录及工作区默认留存 90 天（被 `IssueMemory` 代表报告引用的记录豁免清理）。
 
 ## MR 自动评审（审微）
 
@@ -329,8 +332,8 @@ pnpm check        # 类型检查（Host 与 Client）+ 单元测试 + 构建 + �
 | `src/log/` | **观象域**：`LogSupervisor` 轮询/攒批、`unpack` 安全解压、`supervisor_log_*` 工具、提示词与报告渲染 |
 | `src/mr/` | **审微域**：`MrSupervisor` 增量轮询/防抖、信号去重与自滤、`supervisor_mr_*` 工具与工作区管理 |
 | `src/issues/` | `IssueMemory` 本地已知问题库检索与 `IssueBitableSyncer` 飞书多维表格双向同步器 |
-| `src/runs/` | 运行目录、日志准入与下载、子 Agent 运行、工作区准备、改动检查、推送与合并请求 |
-| `src/dispatch/` | `/supervisor` 传统派发工具与分析子 Agent 首条消息 |
+| `src/runs/` | 运行目录、日志准入与下载、会话代码快照挂载、子 Agent 运行、工作区准备、改动检查、推送与合并请求 |
+| `src/dispatch/` | `/supervisor` 代码挂载工具、可选派发工具与分析子 Agent 首条消息 |
 | `src/improve/` | SKILL 查看工具、SKILL 不足记录、改进工具与改进子 Agent 首条消息 |
 | `src/skill/` | `/supervisor` 入口 SKILL、快照可选 SKILL 发现封装与 4 个随包指南（`supervisor-kit`、`supervisor-improve`、`log-supervisor`、`mr-reviewer`） |
 | `skills/` | `supervisor-kit`、`supervisor-improve`、`log-supervisor`、`mr-reviewer` SKILL 正文 |

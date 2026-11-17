@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
-import { lstat, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, readlink, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { deflateRawSync, gzipSync } from 'node:zlib'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -1209,10 +1209,27 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       logs: [{ path: localZip }],
     }, h.toolExecCtx(feishuSessionId, workDir, 'c-prep')) as {
       readonly taskId: string
+      readonly repoDir: string
+      readonly repoKind: string
+      readonly baseCommit: string
       readonly slots: readonly { readonly ref: string }[]
       readonly candidateIssues: readonly { readonly issueId: string; readonly humanConclusion?: string }[]
     }
     expect(prepRes.slots).toHaveLength(1)
+    // Diagnosis links repos/<app> to the session's shared read-only snapshot instead of creating a workspace.
+    expect(prepRes.repoKind).toBe('snapshot')
+    expect(prepRes.repoDir).toBe(join(workDir, 'repos', 'order-service'))
+    expect((await lstat(prepRes.repoDir)).isSymbolicLink()).toBe(true)
+    const snapshotDir = await readlink(prepRes.repoDir)
+    expect(snapshotDir.startsWith(join(h.fakeRepos.root, '.snapshots'))).toBe(true)
+    expect(snapshotDir.endsWith(prepRes.baseCommit.slice(0, 12))).toBe(true)
+    expect(h.fakeRepos.creates.some(create => create.path === prepRes.repoDir)).toBe(false)
+    const snapshotHandler = await readFile(join(snapshotDir, 'src', 'handler.ts'), 'utf8')
+    // A second diagnosis prepare in the same session keeps the same snapshot.
+    const acquiresBefore = h.fakeRepos.acquires.length
+    await prepare.execute({ taskId: prepRes.taskId }, h.toolExecCtx(feishuSessionId, workDir, 'c-prep-again'))
+    expect(await readlink(prepRes.repoDir)).toBe(snapshotDir)
+    expect(h.fakeRepos.acquires.length).toBe(acquiresBefore)
     expect(prepRes.candidateIssues[0]?.humanConclusion).toBe('人工已确认：handleOrder 必须返回默认值')
 
     // 2. Search IssueMemory explicitly
@@ -1296,8 +1313,19 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
     expect(proposal.actions[1]?.id).toBe('improve_skill')
     expect(proposal.actions[1]?.independent).toBe(true)
 
-    // 5. Simulate user clicking [fix_code]: edit repos/order-service/src/handler.ts & call supervisor_log_push_mr
+    // 5. Simulate user clicking [fix_code]: the read-only snapshot cannot be pushed; prepare `fix` swaps in a writable workspace.
+    await expect(pushMr.execute({
+      kind: 'fix_code',
+      commitMessage: 'fix(order): snapshot push',
+      mrTitle: 'fix(order): snapshot push',
+    }, h.toolExecCtx(feishuSessionId, workDir, 'call-snapshot-push'))).rejects.toThrow(/workspace: "fix"/)
+    const fixPrep = await prepare.execute({ taskId: prepRes.taskId, workspace: 'fix' }, h.toolExecCtx(feishuSessionId, workDir, 'c-prep-fix')) as { readonly repoKind: string }
+    expect(fixPrep.repoKind).toBe('workspace')
+    expect((await lstat(prepRes.repoDir)).isSymbolicLink()).toBe(false)
+    expect(h.fakeRepos.creates.at(-1)).toMatchObject({ path: prepRes.repoDir, branch: expect.stringMatching(/^fix\/log-order-service-/) })
     await writeFile(join(workDir, 'repos', 'order-service', 'src', 'handler.ts'), 'export function handleOrder() { return "ok" }\n')
+    // The shared snapshot is untouched by the fix.
+    expect(await readFile(join(snapshotDir, 'src', 'handler.ts'), 'utf8')).toBe(snapshotHandler)
     const fixPush = await pushMr.execute({
       kind: 'fix_code',
       commitMessage: 'fix(order): avoid returning null in handleOrder',
@@ -1409,6 +1437,7 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
     expect(domain.logTasks.get(secondPrep.taskId)?.revisions).toHaveLength(1)
 
     // 8. 4576880036: Verify workspace repository ownership and cross-task isolation before pushing MR.
+    await prepare.execute({ taskId: secondPrep.taskId, workspace: 'fix' }, h.toolExecCtx(feishuSessionId, workDir, 'c-prep-second-fix'))
     await writeFile(join(secondPrep.workDir, 'repos', 'payment-service', 'src', 'pay.ts'), 'export const pay = false\n')
     const pushesBefore = h.fakeRepos.pushes.length
 
@@ -1446,6 +1475,7 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       readonly workDir: string
     }
     expect(thirdPrep.workDir).toBe(join(workDir, 'tasks', thirdPrep.taskId))
+    await prepare.execute({ taskId: thirdPrep.taskId, workspace: 'fix' }, h.toolExecCtx(feishuSessionId, workDir, 'c-prep-third-fix'))
     await writeFile(join(thirdPrep.workDir, 'repos', 'order-service', 'src', 'handler.ts'), 'export function handleOrder() { return "child" }\n')
     await expect(pushMr.execute({
       kind: 'fix_code',
@@ -2654,7 +2684,7 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
     const task1WorkDir = domain.logTasks.get(task1Id)!.workDir!
     const task2WorkDir = domain.logTasks.get(task2Id)!.workDir!
     const task3WorkDir = domain.logTasks.get(task3Id)!.workDir!
-    expect((await stat(join(task2WorkDir, 'repos', 'order-service', '.git'))).isDirectory()).toBe(true)
+    const task2Snapshot = await readlink(join(task2WorkDir, 'repos', 'order-service'))
 
     // 2. Create two completed Feishu manual tasks in a shared session cwd:
     //    manualTask1 uses sharedFeishuCwd directly (parent cwd MUST never be deleted);
@@ -2724,7 +2754,9 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
     // Expired non-exempt tasks and their managed workspaces (plus outbox 'done' rows & repo checkouts) are pruned.
     expect(domain.logTasks.get(task2Id)).toBeUndefined()
     await expect(stat(task2WorkDir)).rejects.toThrow()
-    expect(h.fakeRepos.removedWorkspaces).toContain(join(task2WorkDir, 'repos', 'order-service'))
+    // The workspace held only a link to the shared snapshot: the link goes, the snapshot stays.
+    expect(h.fakeRepos.removedWorkspaces).not.toContain(join(task2WorkDir, 'repos', 'order-service'))
+    expect((await stat(join(task2Snapshot, 'src'))).isDirectory()).toBe(true)
     expect(domain.outboxPlatform.values().some(o => o.taskId === task2Id)).toBe(false)
 
     // Issue-referenced tasks (sampleReportUrl = task1, latestReportUrl = task3) are exempt and retained.

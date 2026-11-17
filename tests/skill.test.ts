@@ -17,20 +17,23 @@ describe('entry skill', () => {
     expect(renderCatalog([])).toContain('应用的代码仓库要由管理员在 dsh-repo 的「代码仓库 → 仓库」中添加，并打开「日志分析」')
     expect(renderEntrySkill([order], 3, true)).toContain('推送前可能还会弹出审批请用户再批准一次')
     const body = renderEntrySkill([order], 3, false)
+    expect(body).toContain('`supervisor_mount_apps`')
     expect(body).toContain('`supervisor_dispatch`')
     expect(body).toContain('最多 3 个')
+    expect(body).toContain('代码目录只读：只读取和搜索，不要修改、新建或删除其中的文件')
     expect(body).not.toContain('supervisor_improve_skill')
     const improving = renderEntrySkill([order], 3, true)
-    expect(improving).toContain('**先给结论，改进放到下一回合。** 派发结果中某个应用标出「SKILL 不足」时，照常写完汇总回复，在末尾另起一节「SKILL 改进建议」')
-    expect(improving).toContain('这一回合不要调用工具（工具会拒绝）')
-    expect(improving).toContain('工具会自动带上本会话中该应用记录了不足、还没改进过的全部分析，所以同一应用的多个改进点只调用一次')
+    expect(improving).toContain('派发结果中某个应用标出「SKILL 不足」，或你自己分析发现了不足时，照常写完汇总回复，在末尾另起一节「SKILL 改进建议」')
+    expect(improving).toContain('这一回合不要调用工具（工具会拒绝派发过的分析）')
+    expect(improving).toContain('你自己分析发现的不足写进 `feedback`')
+    expect(improving).toContain('派发过的分析由工具自动带上本会话中该应用记录了不足、还没改进过的全部分析，所以同一应用的多个改进点只调用一次')
     expect(improving).toContain('先用 `supervisor_show_skill` 查看现有 SKILL 的相关内容')
   })
 
   it('limits the hands-off rule to SKILL files and points code fixes at the analysed repository and commit', () => {
     for (const body of [renderEntrySkill([order], 3, false), renderEntrySkill([order], 3, true)]) {
       expect(body).not.toContain('不要自己用 git 推送或修改仓库')
-      expect(body).toContain('用户之后要求修复分析发现的代码问题时，按普通编码任务处理：从派发结果中该应用的仓库地址和提交开始修改')
+      expect(body).toContain('用户之后要求修复分析发现的代码问题时，按普通编码任务处理：从分析用的该应用仓库地址和提交开始修改')
       expect(body).not.toContain('supervisor_init_repo')
     }
     expect(renderEntrySkill([order], 3, true)).toContain('SKILL 改进一律通过这个工具，不要自己修改或推送 SKILL 文件。')

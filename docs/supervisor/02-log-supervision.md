@@ -20,14 +20,14 @@ sequenceDiagram
     W->>W: 2. 按 (product, component, error_code) 窗口聚合<br/>凑满 N 条或满 T 分钟触发批次任务
     W->>S: 3. 创建会话 (或经 feishuTopics 建群话题会话)
     S->>P: 4. supervisor_log_prepare 下载解压日志至 <workDir>/logs/
-    S->>R: 5. workspaceCreate 检出应用仓库至 <workDir>/repos/<app>
+    S->>R: 5. snapshotAcquire 取得共享只读代码快照，<workDir>/repos/<app> 链接到它
     S->>S: 6. 筛日志 (bash/rg/脚本) + 查本地 Issue 库 + 读代码/SKILL 推理
     S->>W: 7. supervisor_log_submit 显式提交逐日志结构化结论
     W-->>P: 8. [异步 Outbox] 逐 log_id 幂等上传并完成报告修订
     alt 定位为业务代码缺陷 / 发现分析流程可优化
         S->>F: 9. 输出诊断摘要 + 调用 propose_actions 挂出动作按钮<br/>[🔧 修复代码并提 MR] / [📚 改进分析 SKILL / 沉淀案例]
         F->>S: 10. 用户点击按钮 (渠道校验权限后唤醒同 Session)
-        S->>R: 11. 在 <workDir>/repos/<app> 改代码/跑单测/repo_workspace_push 提 MR
+        S->>R: 11. supervisor_log_prepare(workspace: fix) 换成可写工作区，改代码/跑单测/supervisor_log_push_mr 提 MR
         S->>W: 12. 将新建 MR 注册进「审微」持续监管 (跟进 CI 与人工评审)
     end
 ```
@@ -39,7 +39,7 @@ sequenceDiagram
 ### 1. 接入与匹配规则
 - **唯一仓库源**：`dsh-supervisor` 在启动时调用 `dshRepos.featureRegister({ id: 'log-analysis', title: '日志分析', description: '...' })`。凡在 `dsh-repo` 仓库清单中启用「日志分析」的仓库自动成为候选应用。
 - **名称与别名匹配**：在监管面板中为每个应用配置业务描述与触发别名（同时匹配平台原始 `component_code` 与飞书自然语言提及的应用名；采用 Unicode NFKC 规范化 + 忽略大小写）。无匹配或存在多仓库别名歧义时记录诊断告警，绝不盲猜仓库。
-- **可选知识（Optional SKILL）**：不要求仓库必须包含 `.agents/logalyze.yaml` 或特定 SKILL。检出代码后自动扫描 `<workDir>/repos/<app>/.dsh/skills` 与 `.agents/skills`；存在适用 SKILL 时由 Agent 按需加载并可执行其附带脚本，无 SKILL 时直接结合日志与源码分析。
+- **可选知识（Optional SKILL）**：不要求仓库必须包含 `.agents/logalyze.yaml` 或特定 SKILL。准备代码后自动扫描 `<workDir>/repos/<app>/.dsh/skills` 与 `.agents/skills`；存在适用 SKILL 时由 Agent 按需加载并可执行其附带脚本，无 SKILL 时直接结合日志与源码分析。
 
 ### 2. 轮询、分批与防风暴策略
 
@@ -71,14 +71,16 @@ sequenceDiagram
 │   ├── L1/                      # 安全解压后的第 1 份日志目录（防路径穿越、防符号链接逃逸、限解压总字节）
 │   └── L2/
 ├── repos/
-│   └── <app-slug>/              # dshRepos.workspaceCreate 创建的共享对象 Git 克隆（检出日志分析功能分支最新提交）
+│   ├── <app-slug>/              # 诊断时：指向 dsh-repo 共享只读快照的符号链接（最新同步提交）；修复时：workspaceCreate 创建的可写 Git 工作区
+│   └── <app-slug>-knowledge/    # 改进 SKILL / 沉淀案例时单独创建的可写 Git 工作区
 └── scratch/                     # Agent 编写临时解析脚本、聚合时间线 CSV 或报告附件的工作目录
 ```
 
 **为什么这套布局彻底消除了旧方案的安全与能力冲突？**
 1. `<workDir>` 是该会话的 `cwd`：宿主 `ctx.sandbox` 在 `workspace-write` 模式下只允许写入 `<workDir>` 内部，宿主凭据库与系统目录受保护。
-2. `dsh_channels` 的 `ReadFence` 天然放行 `<workDir>` 下的一切子路径（包括 `logs/` 与 `repos/<app-slug>/`），无需跨插件动态授权或禁用 `bash`。
-3. `repos/<app-slug>` 的 `origin` 指向 `dsh-repo` 本机 `127.0.0.1` 代理，磁盘内不含任何 GitHub/GitLab Token；在未获得 `code-write` 授权前，任何 `git push` 均被代理层硬拦截，但本地 `git log -S`、`git blame`、`git show` 100% 可用。
+2. `dsh_channels` 的 `ReadFence` 天然放行 `<workDir>` 下的一切子路径（包括 `logs/` 与可写工作区）。诊断用的 `repos/<app-slug>` 是指向 `<镜像目录>/.snapshots/...` 的符号链接，`ReadFence` 按真实路径判断，所以部署时要把 `<镜像目录>/.snapshots` 加入 `readFence.readableRoots`，并在 confine 运行器中用 `--expose` 暴露同一目录；这是部署配置，不需要跨插件动态授权。
+3. 快照是 dsh-repo 按提交共享、引用计数的只读文件，多个会话读同一提交时共用一份；`workspace-write` 沙箱只允许写 `<workDir>`，经链接写入快照会被拒绝（`danger-full-access` 下不受此限制，提示词要求模型不修改快照）。会话空闲 `snapshotHoldMs`（默认 4 小时）后释放快照，之后再调用 `supervisor_log_prepare` 重新挂载。
+4. 可写工作区 `repos/<app-slug>` 的 `origin` 指向 `dsh-repo` 本机 `127.0.0.1` 代理，磁盘内不含任何 GitHub/GitLab Token；在未获得 `code-write` 授权前，任何 `git push` 均被代理层硬拦截，但本地 `git log -S`、`git blame`、`git show` 100% 可用。
 
 ---
 
@@ -88,9 +90,10 @@ sequenceDiagram
 
 ### 1. `supervisor_log_prepare`
 - **作用**：幂等准备当前会话的分析材料。
-  - 若为平台自动任务：根据预登记的 `taskId` 下载各 `log_id` 归档包并解压至 `logs/L1..Ln`，调用 `dshRepos.workspaceCreate` 准备 `repos/<app-slug>`，扫描仓库可用 SKILL 列表，并自动检索本地 `IssueMemory` 中同应用的候选已知问题（含人工纠偏记录）一并返回。
-  - 若为飞书人工发起任务：接收应用名称/别名与当前话题附件路径（或允许白名单域名的下载 URL），执行同样的解压、代码检出与已知问题预检索。
-- **追问行为**：同 Session 后续追问时，`logs/` 与 `repos/<app-slug>` 原路径持续有效，无需重复解压或更换路径。
+  - 若为平台自动任务：根据预登记的 `taskId` 下载各 `log_id` 归档包并解压至 `logs/L1..Ln`，为本会话取得应用最新同步提交的共享只读快照并把 `repos/<app-slug>` 链接到它（返回 `repoKind: "snapshot"`），扫描仓库可用 SKILL 列表，并自动检索本地 `IssueMemory` 中同应用的候选已知问题（含人工纠偏记录）一并返回。
+  - 若为飞书人工发起任务：接收应用名称/别名与当前话题附件路径（或允许白名单域名的下载 URL），执行同样的解压、代码挂载与已知问题预检索。
+  - `workspace: "fix"` 把 `repos/<app-slug>` 换成 `dshRepos.workspaceCreate` 创建的可写工作区（返回 `repoKind: "workspace"`）；`workspace: "knowledge"` 在 `repos/<app-slug>-knowledge` 创建独立可写工作区。只读快照不能推送。
+- **追问行为**：同 Session 后续追问时，`logs/` 与 `repos/<app-slug>` 原路径持续有效，无需重复解压或更换路径；再次调用时快照提交未变就沿用。快照空闲释放后读取失败，再调用一次即可。
 
 ### 2. `supervisor_issue_search`
 - **作用**：在分析中途提取出新的异常特征（如特定异常类名、模块名、错误码）后，随时向本地 `IssueMemory` 进行全文/条件检索，核对历史同类问题的识别条件、排除条件与**人工确认结论**。
@@ -149,8 +152,8 @@ sequenceDiagram
   - `followUpPrompt`: 内含目标仓库目录 `repos/<app-slug>`、基准提交、根因文件行号、修复思路及验证要求。
 - **用户点击后的闭环执行**：
   1. 原 Session 被唤醒（拥有完整的前序日志证据与代码阅读上下文！）。
-  2. 在 `repos/<app-slug>` 中基于功能分支或基线分支切出修复分支，修改业务代码并补充回归单元测试。
-  3. 使用 `bash` 在本地工作区运行项目测试/类型检查通过后，调用 `repo_workspace_push`（附带 `mr: { title, body }`，正文中自动附带本次异常日志现象、根因证据与测试结果）。
+  2. 先调用 `supervisor_log_prepare({ workspace: "fix" })`，把诊断用的只读快照 `repos/<app-slug>` 换成从功能分支或基线分支切出的可写工作区，修改业务代码并补充回归单元测试。
+  3. 使用 `bash` 在本地工作区运行项目测试/类型检查通过后，调用 `supervisor_log_push_mr`（`kind: "fix_code"`，附带 MR 标题与正文，正文中附带本次异常日志现象、根因证据与测试结果）。
   4. 新建的修复 MR 自动写入本地 `IssueMemory` 的关联修复链接，并**自动注册进「审微」MR 监管表（标记 `origin: 'self-fix'`）**——若后续 CI 失败或人工 Reviewer 提出修改意见，自动唤醒本 Session 继续修复推送！
 
 ### 场景 2：分析流程可优化或发现新案例 → 主动询问是否触发知识改进
@@ -162,4 +165,4 @@ sequenceDiagram
   - `id`: `'improve_skill'`
   - `label`: `'📚 改进分析流程 / 沉淀案例'`（`style: 'default'`，`requiredAccess: 'code-write'`，`independent: true`）
 - **用户点击后的闭环执行**：
-  - 注意 `independent: true` 允许用户**既点「修复代码并提 MR」，又点「改进分析流程 / 沉淀案例」**！为避免业务代码修复分支与文档/SKILL 改进混在同一个 MR 中拖慢合入，知识改进动作在 `<workDir>/repos/<app-slug>-knowledge` 单独创建干净的 `workspaceCreate` 工作区，修改 `.agents/skills/` 或案例目录并提交独立的 `docs/chore` MR，由人工评审合入后自动惠及后续所有分析。
+  - 注意 `independent: true` 允许用户**既点「修复代码并提 MR」，又点「改进分析流程 / 沉淀案例」**！为避免业务代码修复分支与文档/SKILL 改进混在同一个 MR 中拖慢合入，知识改进动作先调用 `supervisor_log_prepare({ workspace: "knowledge" })`，在 `<workDir>/repos/<app-slug>-knowledge` 单独创建干净的 `workspaceCreate` 工作区，修改 `.agents/skills/` 或案例目录并提交独立的 `docs/chore` MR，由人工评审合入后自动惠及后续所有分析。

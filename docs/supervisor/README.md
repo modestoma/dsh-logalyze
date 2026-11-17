@@ -60,12 +60,12 @@ flowchart TB
 - **`dsh_channels` 零业务感知**：不包含任何日志分析或代码评审专有逻辑，不硬编码业务工具白名单。
 - 外部监管任务统一通过 `feishuTopics`（建话题与根卡）+ 新增的**通用非阻塞动作提议服务（`feishuActions` / `propose_actions`）**与人类协作：回合正常结束不挂起；飞书卡片底部展示持久化动作按钮；用户随时点击按钮即经渠道判权后唤醒原 Session 执行后续动作。
 
-### 3. 会话内共享镜像克隆（In-Workspace Mirror Clone），打通「只读排查 → 就地修代码」
-- 抛弃旧方案的外部目录短命 `SnapshotLease` 与手写工具路径拦截。
-- 所有分析或评审任务均通过 `dshRepos.workspaceCreate`（`access: 'read'`，底层从本地裸镜像共享 Git 对象，秒级创建、几乎零额外磁盘开销）将代码检出在**当前会话工作目录内部** `<sessionWorkDir>/repos/<slug>`：
-  1. **天然合规**：路径本身位于话题工作区内，无需任何特判即可通过 `dsh_channels` 既有 `ReadFence` 与宿主 `workspace-write` 进程沙箱（`ctx.sandbox`）。
-  2. **全能力释放**：Agent 可正常使用 `bash`、Python/jq/rg、仓库自带 SKILL 脚本，以及 `git log -S`、`git blame`、`git diff`；多轮追问路径永久有效。
-  3. **零摩擦转写**：远端推送由 `dsh-repo` 本机 Git 代理拦截（无令牌泄露风险，强制校验仓库写权限与飞书 `code-write` 开关）。当用户点击 `[🔧 修复代码并提 MR]` 时，Agent 直接在同一工作区编辑代码、跑测试、调用 `repo_workspace_push` 提 MR，上下文 100% 连续。
+### 3. 读代码用共享只读快照，修代码时才建可写工作区
+- 日志分析由主会话自己读代码：`supervisor_mount_apps`（`/supervisor`）与 `supervisor_log_prepare`（平台批次与飞书人工分析）为会话持有 `dsh-repo` 的只读快照（`snapshotAcquire`，按提交共享、引用计数），多个会话读同一提交时共用同一份文件。`supervisor_log_prepare` 把 `<sessionWorkDir>/repos/<slug>` 链接到快照，证据路径保持 `repos/<slug>/...`；会话空闲 `snapshotHoldMs`（默认 4 小时）后释放，再调用一次即重新挂载。
+  1. **读权限靠部署配置**：快照位于 `<镜像目录>/.snapshots`，部署时把它加入 `dsh_channels` 的 `readFence.readableRoots`，并在 confine 运行器中 `--expose`；宿主 `workspace-write` 沙箱不允许写入快照。
+  2. **全能力释放**：Agent 可正常使用 `bash`、Python/jq/rg 与仓库自带 SKILL 脚本读取快照。
+  3. **修代码时换成工作区**：用户点击 `[🔧 修复代码并提 MR]` 后，Agent 先调用 `supervisor_log_prepare({ workspace: "fix" })`，把 `repos/<slug>` 换成 `dshRepos.workspaceCreate` 创建的可写工作区，再编辑代码、跑测试、调用 `supervisor_log_push_mr` 提 MR。远端推送由 `dsh-repo` 本机 Git 代理拦截（无令牌泄露风险，强制校验仓库写权限与飞书 `code-write` 开关）。
+- MR 评审仍在 `<sessionWorkDir>/repos/<slug>` 用 `dshRepos.workspaceCreate` 检出评审代码，以便使用 `git diff` 等命令。
 
 ### 4. 「1 个监管实体 = 1 个有记忆的持久化 Session」
 - **1 批同组异常日志 = 1 个分析 Session**：支持人工在飞书话题内连续追问纠偏、二次更新平台回传报告、接着修代码或沉淀 SKILL。
@@ -124,10 +124,10 @@ flowchart LR
 - **涉及仓库**：`dsh-supervisor`
 - **交付内容**：
   1. 日志平台轮询器（`LogPoller`）与批次聚合调度器（按 `product + component + error_code` 凑满 N 条或超时 T 分钟发车，持久化水位线与单应用熔断）。
-  2. 统一「平台自动批次」与「飞书手动发日志 ZIP / `/supervisor`」到同一套 `log-supervisor` Agent Preset：在 `<workDir>` 解压日志、挂载 `<workDir>/repos/<app>` 镜像工作区与仓库可选 SKILL、开放受沙箱保护的 `bash` 分析能力、检索本地已知问题库 `IssueMemory`。
+  2. 统一「平台自动批次」与「飞书手动发日志 ZIP / `/supervisor`」到同一套 `log-supervisor` Agent Preset：在 `<workDir>` 解压日志、挂载 `<workDir>/repos/<app>` 共享只读代码快照与仓库可选 SKILL、开放受沙箱保护的 `bash` 分析能力、检索本地已知问题库 `IssueMemory`。
   3. 结构化结果提交工具 `supervisor_log_submit`：落盘结果修订，异步通过 Outbox 逐 `log_id` 回传日志平台报告，并向飞书投递/更新报告卡。
   4. **主动动作门控闭环**：
-     - 根因定位到业务代码缺陷时，自动通过 `propose_actions` 挂出 `[🔧 修复代码并提 MR]`；点击后就地修改业务代码、执行测试、调用 `repo_workspace_push` 创建修复 MR，并自动纳入 M2 的 MR 持续监管（CI 挂了或人工提意见自动唤醒续修）。
+     - 根因定位到业务代码缺陷时，自动通过 `propose_actions` 挂出 `[🔧 修复代码并提 MR]`；点击后换成可写工作区修改业务代码、执行测试、调用 `supervisor_log_push_mr` 创建修复 MR，并自动纳入 M2 的 MR 持续监管（CI 挂了或人工提意见自动唤醒续修）。
      - 排查发现新故障模式或现有分析 SKILL 不足时，挂出 `[📚 改进 SKILL / 沉淀案例]`；点击后提炼当前 Session 排查链路并提交知识改进 MR。
 - **验收标准（AC-M3）**：
   - 平台新归档日志在无人干预下完成拉取、分析、平台报告回传与飞书通知；飞书无平台配置时手动上传 ZIP 同样走通分析与追问。

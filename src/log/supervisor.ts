@@ -696,8 +696,8 @@ export class LogSupervisor {
     }
   }
 
-  /** Runtime adapter injected into `createLogTools(...)`. */
-  toolsRuntime(): LogToolsRuntime {
+  /** Runtime adapter injected into `createLogTools(...)`; the service adds `mountApp` from its session mounts. */
+  toolsRuntime(): Omit<LogToolsRuntime, 'mountApp'> {
     return {
       resolveApp: appOrAlias => this.deps.registry.resolve(appOrAlias),
       readyApp: appId => this.deps.registry.readyApp(appId),

@@ -136,7 +136,7 @@ export function buildFixCodeFollowUpPrompt(params: {
     evidenceText,
     '',
     '请按以下步骤执行：',
-    `1. 调用 \`${LOG_PREPARE_TOOL_NAME}\`（传入 \`taskId: "${params.taskId}"\`, \`workspace: "diagnosis"\`）确认工作区 \`repos/${slug}\` 就绪；`,
+    `1. 调用 \`${LOG_PREPARE_TOOL_NAME}\`（传入 \`taskId: "${params.taskId}"\`, \`workspace: "fix"\`），把诊断用的只读代码快照 \`repos/${slug}\` 换成可写工作区；`,
     `2. 在 \`repos/${slug}\` 中定位并修复代码缺陷，同时补充回归单元测试；`,
     '3. 在 `repos/' + slug + '` 运行项目测试与类型检查，确保全部通过；',
     `4. 调用 \`${LOG_PUSH_MR_TOOL_NAME}\`（\`kind: "fix_code"\`、附上清晰的 \`commitMessage\`、\`mrTitle\`、\`mrBody\`${params.issueId === undefined ? '' : ` 与 \`issueId: "${params.issueId}"\``}）推送修复分支、发起 MR、关联 \`IssueMemory\` 并自动登记审微 MR 监管。`,

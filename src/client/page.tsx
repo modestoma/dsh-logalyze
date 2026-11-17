@@ -1684,6 +1684,13 @@ function AdvancedTab({
             </div>
             <div className="lz__rowCtl"><span className="lz__tag lz__mono">{runtime?.refreshWaitMs ?? 15000} ms</span></div>
           </div>
+          <div className="lz__row">
+            <div className="lz__rowText">
+              <div className="lz__rowLabel">代码快照保留时长（snapshotHoldMs）</div>
+              <div className="lz__rowSummary">会话最后一次挂载应用代码后保留只读快照的时长；之后再读需要重新挂载。</div>
+            </div>
+            <div className="lz__rowCtl"><span className="lz__tag lz__mono">{runtime?.snapshotHoldMs ?? 14400000} ms</span></div>
+          </div>
         </div>
       </section>
 

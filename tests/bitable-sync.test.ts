@@ -680,6 +680,7 @@ describe('IssueBitableSyncer two-way synchronization', () => {
       platformSecretRef: 'SUPERVISOR_PLATFORM_CLIENT_SECRET',
       subagentProvider: 'custom-provider',
       subagentMaxDepth: 1,
+      snapshotHoldMs: 14400000,
       refreshWaitMs: 15000,
       autoInvoke: false,
     })

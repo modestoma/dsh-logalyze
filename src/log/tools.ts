@@ -1,6 +1,6 @@
 /**
  * 观象日志监管（`log-supervisor`）的模型工具：
- * 1. `supervisor_log_prepare`：幂等准备 `<workDir>/{logs,repos,scratch}`（兼容平台自动任务与飞书人工附件/URL），检出可检索代码与仓库 SKILL，并预检索 `IssueMemory`；
+ * 1. `supervisor_log_prepare`：幂等准备 `<workDir>/{logs,repos,scratch}`（兼容平台自动任务与飞书人工附件/URL），诊断时把 `repos/<app-slug>` 链接到本会话挂载的只读代码快照（多会话共享），修代码（`fix`）或知识改进（`knowledge`）时才创建可写工作区；列出仓库可选 SKILL，并预检索 `IssueMemory`；
  * 2. `supervisor_issue_search`：在分析中随时检索本地已知问题库（`humanConclusion` 人工结论优先展示）；
  *    `supervisor_log_group_stats`：只读查询平台批次同组 `(product, component, error)` 的历史数量、版本分布与首末归档时间；
  * 3. `supervisor_log_submit`：1:1 槽位覆盖校验 + 证据路径真实性校验 + 附件快照，原子写入 `log_tasks` 修订并触发 `IssueMemory` 更新与 `OutboxRunner` 回传；
@@ -10,11 +10,11 @@
  */
 
 import { constants } from 'node:fs'
-import { copyFile, cp, lstat, mkdir, open, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
-import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { copyFile, cp, lstat, mkdir, open, readdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { z } from 'zod'
-import { parse as parseYaml } from 'yaml'
 import type { ReadyApp } from '../apps/registry.ts'
+import { scanRepoSkills, type DiscoveredRepoSkill } from '../apps/repo-skills.ts'
 import type { DshRepos } from '../deps/repos-contract.ts'
 import type { ContentBlock, ToolDefinition, ToolRunContext } from '../host.ts'
 import type { IssueMemory, SearchedIssue } from '../issues/memory.ts'
@@ -22,6 +22,7 @@ import type { ListLogsPageParams, PlatformLogPage } from '../platform/client.ts'
 import type { RegisterSelfMrInput } from '../mr/supervisor.ts'
 import { pathProblem } from '../report/manifest.ts'
 import { admitUrl, downloadLog, fileNameFor, safeFileName } from '../runs/download.ts'
+import type { MountedApp } from '../runs/mounts.ts'
 import { isInside } from '../runs/run-dir.ts'
 import type {
   LogEvidence,
@@ -53,14 +54,6 @@ const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 const DEFAULT_GROUP_STATS_DAYS = 30
 const MAX_GROUP_STATS_DAYS = 180
 const DAY_MS = 24 * 60 * 60 * 1000
-
-/** Discovered optional skill inside a checked-out application repository. */
-export interface DiscoveredRepoSkill {
-  readonly name: string
-  readonly description: string
-  readonly path: string
-  readonly source: '.dsh/skills' | '.agents/skills'
-}
 
 /** Local manifest written to `<workDir>/logs/manifest.json`. */
 export interface LogSlotManifestEntry extends LogTaskInput {
@@ -126,6 +119,13 @@ export interface LogToolsRuntime {
     readonly app: ReadyApp
   }): Promise<{ readonly enqueuedOutboxKeys: readonly string[]; readonly detailUrlBackfilled: boolean }>
   registerSelfMr?(input: RegisterSelfMrInput): Promise<void>
+  /**
+   * Hold a read-only snapshot of an application's latest synced commit for a session.
+   * @param sessionId - holding session.
+   * @param appId - application id.
+   * @returns the mounted application with its snapshot directory.
+   */
+  mountApp(sessionId: string, appId: string): Promise<MountedApp>
   logWorkspacesRoot(): string
   now(): number
 }
@@ -139,7 +139,7 @@ const prepareArgsSchema = z.object({
       z.object({ url: z.string().trim().min(1) }).strict(),
     ]),
   ).max(MAX_PREPARED_LOGS).optional(),
-  workspace: z.enum(['diagnosis', 'knowledge']).default('diagnosis'),
+  workspace: z.enum(['diagnosis', 'fix', 'knowledge']).default('diagnosis'),
 }).strict()
 
 const issueSearchArgsSchema = z.object({
@@ -240,42 +240,6 @@ async function copyIfRegularFile(src: string, dest: string): Promise<void> {
   await copyFile(src, dest)
 }
 
-async function scanRepoSkills(repoDir: string): Promise<DiscoveredRepoSkill[]> {
-  const found: DiscoveredRepoSkill[] = []
-  const roots: ReadonlyArray<{ rel: string; source: '.dsh/skills' | '.agents/skills' }> = [
-    { rel: '.dsh/skills', source: '.dsh/skills' },
-    { rel: '.agents/skills', source: '.agents/skills' },
-  ]
-  for (const root of roots) {
-    const absRoot = join(repoDir, root.rel)
-    let names: string[]
-    try {
-      names = await readdir(absRoot)
-    } catch {
-      continue
-    }
-    for (const entry of names.sort()) {
-      const skillFile = join(absRoot, entry, 'SKILL.md')
-      try {
-        const content = await readFile(skillFile, 'utf8')
-        const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u.exec(content)
-        const parsed = match === null ? {} : (parseYaml(match[1] ?? '') as Record<string, unknown> | null ?? {})
-        const name = typeof parsed.name === 'string' && parsed.name.trim() !== '' ? parsed.name.trim() : entry
-        const description = typeof parsed.description === 'string' ? parsed.description.trim() : ''
-        found.push({
-          name,
-          description,
-          path: `${root.rel}/${entry}/SKILL.md`,
-          source: root.source,
-        })
-      } catch {
-        // Ignore subdirectories without a readable SKILL.md
-      }
-    }
-  }
-  return found
-}
-
 function shortTaskSlug(taskId: string): string {
   const cleaned = taskId.replace(/[^A-Za-z0-9]/gu, '').toLowerCase()
   return cleaned.slice(-8) || 'task'
@@ -286,7 +250,7 @@ async function ensureAppWorkspace(params: {
   readonly repoDir: string
   readonly app: ReadyApp
   readonly taskId: string
-  readonly mode: 'diagnosis' | 'knowledge'
+  readonly mode: 'fix' | 'knowledge'
   readonly exec: ToolRunContext
 }): Promise<string> {
   const { repos, repoDir, app, taskId, mode, exec } = params
@@ -315,6 +279,44 @@ async function ensureAppWorkspace(params: {
     signal: exec.signal,
   })
   return repoDir
+}
+
+/**
+ * Point `repoDir` at a mounted read-only snapshot. An existing link is
+ * replaced when it points elsewhere (a newer commit or a released snapshot);
+ * an empty directory is replaced; anything else is left untouched and refused.
+ * @param repoDir - `<workDir>/repos/<app-slug>`.
+ * @param target - absolute snapshot directory.
+ */
+async function linkSnapshot(repoDir: string, target: string): Promise<void> {
+  const info = await lstat(repoDir).catch(() => undefined)
+  if (info?.isSymbolicLink() === true) {
+    if (await readlink(repoDir) === target) return
+  } else if (info !== undefined) {
+    if (!info.isDirectory() || (await readdir(repoDir)).length > 0) {
+      throw new Error(`代码目录 ${repoDir} 已存在且不是代码快照链接，拒绝覆盖`)
+    }
+    await rm(repoDir, { recursive: true })
+  }
+  await mkdir(dirname(repoDir), { recursive: true })
+  const staging = `${repoDir}.link-${process.pid}-${Date.now()}`
+  await symlink(target, staging, 'dir')
+  try {
+    await rename(staging, repoDir)
+  } catch (error) {
+    await rm(staging, { force: true })
+    throw error
+  }
+}
+
+/**
+ * Turn `repoDir` into a writable workspace for a code fix: a snapshot link
+ * there is removed first, an existing workspace is kept.
+ * @param repoDir - `<workDir>/repos/<app-slug>`.
+ */
+async function unlinkSnapshot(repoDir: string): Promise<void> {
+  const info = await lstat(repoDir).catch(() => undefined)
+  if (info?.isSymbolicLink() === true) await rm(repoDir, { force: true })
 }
 
 async function resolveExistingEvidencePath(
@@ -530,15 +532,16 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
     readonly logsDir: string
     readonly manifestPath: string
     readonly repoDir: string
+    readonly repoKind: 'snapshot' | 'workspace'
     readonly scratchDir: string
-    readonly workspaceKind: 'diagnosis' | 'knowledge'
+    readonly workspaceKind: 'diagnosis' | 'fix' | 'knowledge'
     readonly reused: boolean
     readonly slots: readonly LogSlotManifestEntry[]
     readonly repoSkills: readonly DiscoveredRepoSkill[]
     readonly candidateIssues: readonly unknown[]
   }> = {
     name: LOG_PREPARE_TOOL_NAME,
-    description: '准备或刷新当前日志监管会话的工作区：<workDir>/logs/L1..Ln（安全解包与损坏隔离）、<workDir>/repos/<app-slug>（或 knowledge 隔离工作区）、<workDir>/scratch、仓库可选 SKILL 清单及本地已知问题库候选（humanConclusion 优先）。',
+    description: '准备或刷新当前日志监管会话的工作区：<workDir>/logs/L1..Ln（安全解包与损坏隔离）、<workDir>/repos/<app-slug>（诊断时链接到多会话共享的只读代码快照；修代码时为可写工作区；或 knowledge 隔离工作区）、<workDir>/scratch、仓库可选 SKILL 清单及本地已知问题库候选（humanConclusion 优先）。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -559,8 +562,8 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
         },
         workspace: {
           type: 'string',
-          enum: ['diagnosis', 'knowledge'],
-          description: '默认为 diagnosis（检出 <app-slug>）；在点击「改进分析流程/沉淀案例」时必须传 knowledge（检出独立的 <app-slug>-knowledge）',
+          enum: ['diagnosis', 'fix', 'knowledge'],
+          description: '默认为 diagnosis（repos/<app-slug> 链接到只读代码快照，只能读）；要修改代码时传 fix（把 repos/<app-slug> 换成可写工作区）；在点击「改进分析流程/沉淀案例」时必须传 knowledge（检出独立的 <app-slug>-knowledge）',
         },
       },
     },
@@ -689,14 +692,24 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
 
         const slug = appSlugOf(currentApp.app.id)
         const repoDir = join(workDir, 'repos', args.workspace === 'knowledge' ? `${slug}-knowledge` : slug)
-        await ensureAppWorkspace({
-          repos: runtime.requireRepos(),
-          repoDir,
-          app: currentApp,
-          taskId: currentBound.taskId,
-          mode: args.workspace,
-          exec,
-        })
+        let repoKind: 'snapshot' | 'workspace' = 'workspace'
+        let codeCommit = currentApp.commit
+        if (args.workspace === 'diagnosis' && !(await pathExists(join(repoDir, '.git')))) {
+          const mounted = await runtime.mountApp(sessionId, currentApp.app.id)
+          await linkSnapshot(repoDir, mounted.dir)
+          repoKind = 'snapshot'
+          codeCommit = mounted.commit
+        } else {
+          if (args.workspace === 'fix') await unlinkSnapshot(repoDir)
+          await ensureAppWorkspace({
+            repos: runtime.requireRepos(),
+            repoDir,
+            app: currentApp,
+            taskId: currentBound.taskId,
+            mode: args.workspace === 'knowledge' ? 'knowledge' : 'fix',
+            exec,
+          })
+        }
 
         await runtime.updateTask(currentBound.taskId, cur => ({
           ...cur,
@@ -734,11 +747,12 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
           appId: currentApp.app.id,
           appName: currentApp.app.name,
           writable: currentApp.writable,
-          baseCommit: currentApp.commit,
+          baseCommit: codeCommit,
           workDir,
           logsDir: join(workDir, 'logs'),
           manifestPath: join(workDir, 'logs', 'manifest.json'),
           repoDir,
+          repoKind,
           scratchDir: join(workDir, 'scratch'),
           workspaceKind: args.workspace,
           reused: preparedLogs.reused,
@@ -1230,7 +1244,7 @@ export function createLogTools(runtime: LogToolsRuntime): ToolDefinition<unknown
           throw new Error(`工作区路径 ${workspacePath} 必须位于当前会话目录 ${workDir} 之内`)
         }
         if (!(await pathExists(join(workspacePath, '.git')))) {
-          throw new Error(`工作区 ${workspacePath} 尚未初始化；请先调用 supervisor_log_prepare（workspace: "${args.kind === 'improve_skill' ? 'knowledge' : 'diagnosis'}"）`)
+          throw new Error(`工作区 ${workspacePath} 不是可写工作区（诊断用的只读代码快照不能推送）；请先调用 supervisor_log_prepare（workspace: "${args.kind === 'improve_skill' ? 'knowledge' : 'fix'}"）`)
         }
 
         const repos = runtime.requireRepos()
