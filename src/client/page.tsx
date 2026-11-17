@@ -1657,6 +1657,13 @@ function AdvancedTab({
           </div>
           <div className="lz__row">
             <div className="lz__rowText">
+              <div className="lz__rowLabel">子 Agent 委派深度上限（subagentMaxDepth）</div>
+              <div className="lz__rowSummary">每次启动子 Agent 时传给宿主的深度上限；provider-managed 表示不传，由提供方自己控制。</div>
+            </div>
+            <div className="lz__rowCtl"><span className="lz__tag lz__mono">{String(runtime?.subagentMaxDepth ?? 1)}</span></div>
+          </div>
+          <div className="lz__row">
+            <div className="lz__rowText">
               <div className="lz__rowLabel">允许自然语言自动触发 /supervisor（autoInvoke）</div>
               <div className="lz__rowSummary">由 cordis.yml 控制；启用时相关分析请求可自动激活入口 SKILL。</div>
             </div>

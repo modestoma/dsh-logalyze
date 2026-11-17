@@ -154,6 +154,7 @@ export class SupervisorService {
   private active = true
   private readonly refreshWaitMs: number
   private readonly subagentProvider: string
+  private readonly subagentMaxDepth: number | 'provider-managed'
   private readonly autoInvoke: boolean
   private readonly booted = Promise.withResolvers<void>()
 
@@ -203,6 +204,7 @@ export class SupervisorService {
     this.settings = new SettingsController(config, store, warn)
     this.refreshWaitMs = config.refreshWaitMs
     this.subagentProvider = config.subagentProvider
+    this.subagentMaxDepth = config.subagentMaxDepth
     this.autoInvoke = config.autoInvoke
     this.repos = new ReposClient(() => ctx.get?.(DSH_REPOS_SERVICE))
     const credentials = (): HostCredentials | undefined => ctx.get?.('credentials') as HostCredentials | undefined
@@ -223,7 +225,7 @@ export class SupervisorService {
       active: () => this.active,
       error: (message) => { ctx.logger?.error?.(message) },
     })
-    const children = { registry: this.registry, subagents: ctx.subagents, provider: config.subagentProvider, settings, workingDirectory, ...fetchSeam }
+    const children = { registry: this.registry, subagents: ctx.subagents, provider: config.subagentProvider, maxDepth: config.subagentMaxDepth, settings, workingDirectory, ...fetchSeam }
     this.improver = new SkillImprover({ ...children, repos: this.repos })
     this.viewer = new SkillViewer({ registry: this.registry, repos: this.repos })
     this.dispatcher = new Dispatcher({ ...children, gaps: this.improver, platformLogs: sessionId => this.platformLogsOf(sessionId), platform: this.platformDownloader(options.fetch) })
@@ -609,6 +611,7 @@ export class SupervisorService {
       runtime: {
         platformSecretRef: this.secret.ref,
         subagentProvider: this.subagentProvider,
+        subagentMaxDepth: this.subagentMaxDepth,
         refreshWaitMs: this.refreshWaitMs,
         autoInvoke: this.autoInvoke,
       },

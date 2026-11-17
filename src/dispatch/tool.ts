@@ -200,6 +200,8 @@ export interface DispatchDeps {
   settings(): EditableSettings
   /** Registered `ctx.subagents` provider name. */
   readonly provider: string
+  /** Depth cap sent with each child start (`subagentMaxDepth`). */
+  readonly maxDepth: number | 'provider-managed'
   /** The working-directory service, when the composition has one. */
   workingDirectory(): WorkingDirectoryService | undefined
   /** SKILL gap records; omitted never mentions them to children. */
@@ -291,6 +293,7 @@ export class Dispatcher {
         const outcome = await runChild({
           subagents: this.deps.subagents,
           provider: this.deps.provider,
+          maxDepth: this.deps.maxDepth,
           parent,
           label: `${ready.app.name}分析`,
           cwd: ready.dir,

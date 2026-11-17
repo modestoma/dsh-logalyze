@@ -169,6 +169,12 @@ const configSchema = z.object({
   /** Registered `ctx.subagents` provider the children start on. */
   subagentProvider: z.string().trim().min(1).default('spawn'),
   /**
+   * Delegation depth cap sent with every child start: a non-negative integer
+   * (`1` lets each child delegate once more, `0` forbids it), or
+   * `'provider-managed'` to send no cap when the provider enforces depth itself.
+   */
+  subagentMaxDepth: z.union([z.int().min(0).max(Number.MAX_SAFE_INTEGER), z.literal('provider-managed')]).default(1),
+  /**
    * How long loading `/supervisor` waits for the repository refresh before it
    * renders the catalog it already has, in milliseconds; the refresh keeps
    * running. 0 never waits.

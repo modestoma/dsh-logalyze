@@ -210,6 +210,8 @@ export interface SkillImproverDeps {
   readonly subagents: SubagentService
   /** Registered `ctx.subagents` provider the improvement child starts on. */
   readonly provider: string
+  /** Depth cap sent with the child start (`subagentMaxDepth`). */
+  readonly maxDepth: number | 'provider-managed'
   settings(): EditableSettings
   /** The working-directory service, when the composition has one. */
   workingDirectory(): WorkingDirectoryService | undefined
@@ -474,7 +476,7 @@ export class SkillImprover {
       caseRequired,
       date: localDate(this.deps.now?.() ?? new Date()),
     })
-    const child = await runChild({ subagents: this.deps.subagents, provider: this.deps.provider, parent, label: `${app.name} SKILL 改进`, cwd: repoDir, prompt, timeoutMs: settings.dispatchTimeoutMs, signal: exec.signal })
+    const child = await runChild({ subagents: this.deps.subagents, provider: this.deps.provider, maxDepth: this.deps.maxDepth, parent, label: `${app.name} SKILL 改进`, cwd: repoDir, prompt, timeoutMs: settings.dispatchTimeoutMs, signal: exec.signal })
     exec.signal.throwIfAborted()
     const { branch, base: target } = workspace
     const result = { app: app.id, repo: url, ...tasks.length === 0 ? {} : { workDirs: tasks.map(task => task.workDir) }, improveDir, branch, target, ...child.output === '' ? {} : { output: child.output } }

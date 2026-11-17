@@ -172,7 +172,6 @@ export interface SubagentStartRequest {
 /** The `ctx.subagents` slice. */
 export interface SubagentService {
   getProvider(name: string): unknown
-  resolveMaxDepth(configured?: number | 'provider-managed'): number | undefined
   /** Starts one child; the start request fields sit beside `provider` and `label` in one flat spec. */
   startActivation(spec: SubagentStartRequest & {
     readonly provider: string

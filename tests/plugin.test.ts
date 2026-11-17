@@ -64,7 +64,7 @@ async function harness(services: Record<string, unknown> = {}): Promise<Harness>
         return () => {}
       },
     },
-    subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('not used')) },
+    subagents: { getProvider: () => ({}), startActivation: () => Promise.reject(new Error('not used')) },
     get: (name: string) => ({ webServer, connection, ...services } as Record<string, unknown>)[name],
     on: (name: string, listener: HostListener) => {
       const listeners = name === 'session/event' ? sessionListeners : statusListeners

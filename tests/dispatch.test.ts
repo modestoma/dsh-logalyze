@@ -40,7 +40,6 @@ function fakeSubagents(): { service: SubagentService; started: Started[] } {
   const started: Started[] = []
   const service: SubagentService = {
     getProvider: () => ({}),
-    resolveMaxDepth: () => 1,
     startActivation: async (spec) => {
       let settle!: (result: SubagentResult) => void
       const result = new Promise<SubagentResult>((resolve) => { settle = resolve })
@@ -69,13 +68,14 @@ async function setup(overrides: Partial<EditableSettings> = {}, gaps = false, ex
   registry.configure([{ url: origin, writable: true }])
   await registry.syncAll()
   const { service, started } = fakeSubagents()
-  const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: new ReposClient(() => repos) })
+  const improver = new SkillImprover({ registry, subagents: service, provider: 'spawn', maxDepth: 1, settings: () => settings, workingDirectory: () => undefined, repos: new ReposClient(() => repos) })
   const dispatcher = new Dispatcher({
     registry,
     ...gaps ? { gaps: improver } : {},
     subagents: service,
     settings: () => settings,
     provider: 'spawn',
+    maxDepth: 1,
     workingDirectory: () => ({ ensure: async () => join(project, 'sample-logs') }),
     now: () => new Date(2026, 9, 25, 9, 30, 0),
     ...extra,
@@ -229,6 +229,16 @@ describe('supervisor_dispatch', () => {
     await expect(dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ path, url: 'x' }] }] }, exec)).rejects.toThrow('参数不合法')
     await expect(dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ path }] }] }, { ...exec, agent: { ...parent, session: { header: { id: 'c', cwd: project, delegationDepth: 1 } } } })).rejects.toThrow('不能在子 Agent 中调用')
     expect(started).toHaveLength(0)
+  })
+
+  it('sends no depth cap when the provider manages depth', async () => {
+    const { project, dispatcher, started, parent } = await setup({}, false, { maxDepth: 'provider-managed' })
+    const path = join(project, 'sample-logs', 'order-service.log')
+    const running = dispatcher.execute({ tasks: [{ app: 'order-service', question: 'q', logs: [{ path }] }] }, { signal: new AbortController().signal, agent: parent })
+    await waitForStarts(started, 1)
+    expect(started[0]?.spec).not.toHaveProperty('maxDepth')
+    started[0]?.settle({ stopReason: 'completed', output: [{ type: 'text', text: 'done' }] })
+    expect((await running).results[0]).toMatchObject({ status: 'completed', output: 'done' })
   })
 
   it('stops children still running at the dispatch timeout', async () => {

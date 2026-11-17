@@ -14,6 +14,8 @@ export interface ChildRun {
   readonly subagents: SubagentService
   /** Registered `ctx.subagents` provider. */
   readonly provider: string
+  /** Depth cap sent with the start request; `'provider-managed'` sends none. */
+  readonly maxDepth: number | 'provider-managed'
   readonly parent: Agent
   /** Child label shown in the UI. */
   readonly label: string
@@ -60,7 +62,6 @@ export async function runChild(run: ChildRun): Promise<ChildOutcome> {
   const { signal, timeoutMs } = run
   const stop = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
   const stoppedDiagnostic = (): string => signal.aborted ? '调用被取消' : `超过派发等待上限 ${timeoutMs} ms`
-  const maxDepth = run.subagents.resolveMaxDepth()
   let activation
   try {
     activation = await run.subagents.startActivation({
@@ -69,7 +70,7 @@ export async function runChild(run: ChildRun): Promise<ChildOutcome> {
       cwd: run.cwd,
       prompt: [{ type: 'text', text: run.prompt }],
       parent: run.parent,
-      ...maxDepth === undefined ? {} : { maxDepth },
+      ...run.maxDepth === 'provider-managed' ? {} : { maxDepth: run.maxDepth },
       signal: stop,
       delivery: 'caller',
     })
