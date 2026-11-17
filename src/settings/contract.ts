@@ -603,6 +603,8 @@ export interface StateWire {
   overridden: EditableKey[]
   /** Why the overlay file was ignored (unreadable or invalid); panel saves replace it. */
   overlayError?: string
+  /** Why the `dsh_supervisor` storage domain failed to open; MR, log, and issue supervision are off until a restart opens it. */
+  storageError?: string
   repos: RepoStatusWire[]
   /** Repositories in `dsh-repo` with the `mr-review` feature enabled. */
   mrRepos: MrRepoStatusWire[]

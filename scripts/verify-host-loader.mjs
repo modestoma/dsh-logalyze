@@ -12,7 +12,7 @@ const plugin = await import('../lib/index.js')
 
 assert.equal(plugin.name, 'supervisor', 'plugin must export stable Cordis name')
 assert.equal(typeof plugin.apply, 'function', 'host bundle must export apply()')
-assert.deepEqual([...plugin.inject], ['tools', 'skills', 'subagents'], 'unexpected inject list')
+assert.deepEqual([...plugin.inject], ['tools', 'skills', 'subagents', 'storageDomain'], 'unexpected inject list')
 assert.ok(plugin.Config !== undefined, 'host bundle must export the Config schema')
 
 // The Loader validates a composition entry through Config's Standard Schema.
