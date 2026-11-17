@@ -93,13 +93,13 @@ export class SessionMounts {
     const unique = [...new Set(ids)]
     const existing = this.sessions.get(sessionId)
     const entry = existing ?? { mounts: new Map<string, Mount>() }
-    // The idle release must not fire while new snapshots are being acquired; it is rescheduled once the mount settles.
-    if (entry.timer !== undefined) clearTimeout(entry.timer)
-    entry.timer = undefined
     const stale = unique.filter((id) => {
       const current = entry.mounts.get(id)
       return current === undefined || current.app.commit !== this.deps.registry.readyApp(id).commit
     })
+    // The idle release must not fire while new snapshots are being acquired; it is rescheduled once the mount settles.
+    if (entry.timer !== undefined) clearTimeout(entry.timer)
+    entry.timer = undefined
     const outcomes = await Promise.allSettled(stale.map(id => this.deps.registry.acquire([id])))
     const acquired = outcomes.flatMap(outcome => outcome.status === 'fulfilled' ? [outcome.value] : [])
     const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected')

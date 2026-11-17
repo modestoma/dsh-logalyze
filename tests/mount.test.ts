@@ -151,6 +151,16 @@ describe('supervisor_mount_apps', () => {
     expect(repos.heldSnapshots()).toBe(1)
   })
 
+  it('still releases a session after its hold time when a mounted application is removed', async () => {
+    const { repos, registry, mounts } = await setup(1000)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    await mounts.mount('a', ['order-service'])
+    registry.configure([])
+    await expect(mounts.mount('a', ['order-service'])).rejects.toThrow('「order-service」不在应用注册表中')
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(repos.heldSnapshots()).toBe(0)
+  })
+
   it('refuses unknown apps and too many apps without holding anything, and releases everything on close', async () => {
     const { repos, mounts, mounter, exec } = await setup()
     await expect(mounter.execute({ apps: ['nope'] }, exec)).rejects.toThrow('「nope」不在应用注册表中')
