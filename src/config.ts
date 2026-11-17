@@ -175,6 +175,11 @@ const configSchema = z.object({
    */
   subagentMaxDepth: z.union([z.int().min(0).max(Number.MAX_SAFE_INTEGER), z.literal('provider-managed')]).default(1),
   /**
+   * How long a session keeps the read-only code snapshots it mounted after
+   * its last mount, in milliseconds; a session reading later mounts again.
+   */
+  snapshotHoldMs: durationMs(60 * 1000).default(4 * 60 * 60 * 1000),
+  /**
    * How long loading `/supervisor` waits for the repository refresh before it
    * renders the catalog it already has, in milliseconds; the refresh keeps
    * running. 0 never waits.

@@ -132,7 +132,7 @@ describe('plugin', () => {
     await waitFor(async () => h.repos.acquires.length === 2 && await ready())
   })
 
-  it('registers the entry skill, clones repositories, and offers the dispatch tool to top-level agents only', async () => {
+  it('registers the entry skill, clones repositories, and offers the mount and dispatch tools to top-level agents only', async () => {
     const { dir, cleanup } = await tempDir()
     cleanups.push(cleanup)
     const origin = await createAppRepo(join(dir, 'order-service'))
@@ -142,6 +142,7 @@ describe('plugin', () => {
     apply(h.ctx, {}, { overlayPath: join(dir, 'settings.json') })
     expect(h.skills.map(skill => skill.name)).toEqual(['dsh-supervisor'])
     expect(h.tools.map(tool => tool.definition.name)).toEqual([
+      'supervisor_mount_apps',
       'supervisor_dispatch',
       'supervisor_improve_skill',
       'supervisor_show_skill',
@@ -156,7 +157,7 @@ describe('plugin', () => {
       'supervisor_log_submit',
       'supervisor_log_push_mr',
     ])
-    const [tool, improve, show, ...supervisionTools] = h.tools
+    const [mount, tool, improve, show, ...supervisionTools] = h.tools
     const mrTools = supervisionTools.slice(0, 5)
     const logTools = supervisionTools.slice(5)
     const signal = new AbortController().signal
@@ -164,6 +165,8 @@ describe('plugin', () => {
     // The condition waits for the first sync, so a step prepared during startup still sees the cloned application.
     expect(await tool!.when?.(step())).toBe(true)
     expect(await tool!.when?.(step(1))).toBe(false)
+    expect(await mount!.when?.(step())).toBe(true)
+    expect(await mount!.when?.(step(1))).toBe(false)
     // MR supervision tools are hidden outside bound MR supervision sessions.
     for (const mrTool of mrTools) {
       expect(await mrTool.when?.(step())).toBe(false)

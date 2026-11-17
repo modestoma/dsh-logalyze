@@ -13,7 +13,7 @@ description: 智能监管（观象）统一日志监管与问题闭环规范，�
 - 首轮先调用 `supervisor_log_prepare`（平台任务传 `taskId`；飞书人工分析传 `app` 与附件/URL `logs`）。
 - 工具会在当前工作区准备好：
   - `logs/manifest.json` 与逐槽位安全解压后的 `logs/L1..Ln/`；
-  - `repos/<app-slug>/` 可检索源码与可选仓库 SKILL（`.dsh/skills` / `.agents/skills`）；
+  - `repos/<app-slug>/` 可检索源码与可选仓库 SKILL（`.dsh/skills` / `.agents/skills`）：诊断时它链接到多个会话共享的只读代码快照（返回 `repoKind: "snapshot"`），只能读取和搜索，不要在里面修改、新建或删除文件；空闲一段时间后快照会释放，读取失败时再调用一次 `supervisor_log_prepare`；
   - `scratch/` 临时脚本与导出图表附件工作区；
   - 同应用本地 `IssueMemory` 候选已知问题。
 - 若发现候选 `IssueMemory` 条目包含 `humanConclusion` 或 `humanStatus`，**人工确认结论优先级最高**，务必逐条比对当前日志现象，切勿被过往 AI 误判覆盖。
@@ -37,7 +37,7 @@ description: 智能监管（观象）统一日志监管与问题闭环规范，�
 - 若当前处于面向人类的飞书会话且已获 `propose_actions` 工具，同时 `supervisor_log_submit` 报告目标仓库为可写（`writable: true`）：
   - **代码缺陷修复（`fix_code`）**：当至少一份日志确认 `rootCauseCategory === "code_defect"` 且定位清楚代码根因时，调用 `propose_actions` 挂出：
     - `id: "fix_code"`, `label: "🔧 修复代码并提 MR"`, `style: "primary"`, `requiredAccess: "code-write"`, `independent: true`
-    - `followUpPrompt` 中写清 `taskId`、`repos/<app-slug>` 路径、基准 commit、根因位置与验证要求。
+    - `followUpPrompt` 中写清 `taskId`、先调用 `supervisor_log_prepare({ workspace: "fix" })` 换成可写工作区 `repos/<app-slug>`、基准 commit、根因位置与验证要求。
   - **知识沉淀/SKILL 改进（`improve_skill`）**：当发现分析流程/仓库 SKILL 可优化或定位出值得沉淀的新典型案例时，在同一张提议卡中挂出（或单独挂出）：
     - `id: "improve_skill"`, `label: "📚 改进分析流程 / 沉淀案例"`, `style: "default"`, `requiredAccess: "code-write"`, `independent: true`
     - `followUpPrompt` 中写清需先调用 `supervisor_log_prepare({ workspace: "knowledge" })` 在隔离工作区修改文档/SKILL。
@@ -45,7 +45,7 @@ description: 智能监管（观象）统一日志监管与问题闭环规范，�
 
 ### 5. 用户点击按钮后的闭环交付（`supervisor_log_push_mr`）
 - **点击「🔧 修复代码并提 MR」被唤醒后**：
-  1. 确认工作区在 `repos/<app-slug>`（必要时调用 `supervisor_log_prepare({ workspace: "diagnosis" })`）；
+  1. **必须先调用** `supervisor_log_prepare({ workspace: "fix" })`，把诊断用的只读代码快照 `repos/<app-slug>` 换成可写工作区（返回 `repoKind: "workspace"`）；
   2. 修改代码并补充单元测试，通过 `bash` 运行验证检查；
   3. 调用 `supervisor_log_push_mr({ kind: "fix_code", commitMessage, mrTitle, mrBody, issueId })` 完成审批检查、推送分支、创建 MR、回填 `IssueMemory.fixMrUrl`，并自动登记到「审微」MR 监管队列持续跟进 CI 与评审评论。
 - **点击「📚 改进分析流程 / 沉淀案例」被唤醒后**：

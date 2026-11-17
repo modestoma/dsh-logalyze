@@ -5,6 +5,9 @@
  * @module dsh-supervisor/tool-names
  */
 
+/** Mounts read-only code snapshots for the calling session and prepares logs, so the session analyzes them itself. */
+export const MOUNT_TOOL_NAME = 'supervisor_mount_apps'
+
 /** Dispatches log analyses to children working in the application repositories. */
 export const DISPATCH_TOOL_NAME = 'supervisor_dispatch'
 

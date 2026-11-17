@@ -26,6 +26,7 @@ import { FEISHU_TOPICS_STATUS_EVENT } from './deps/topics-contract.ts'
 import type { FeishuTopicService } from './deps/topics-contract.ts'
 import { FEISHU_TOPICS_SERVICE, lookupTopics } from './deps/topics.ts'
 import { Dispatcher } from './dispatch/tool.ts'
+import { AppMounter } from './dispatch/mount.ts'
 import type { HostContext, HostCredentials, ToolActivationContext, ToolDefinition, WorkingDirectoryService } from './host.ts'
 import { SkillViewer } from './improve/show.ts'
 import { SkillImprover } from './improve/tool.ts'
@@ -42,6 +43,7 @@ import { AnalysisStore, defaultAnalysesDir } from './report/store.ts'
 import { ReportTracker } from './report/tracker.ts'
 import { admitPlatformUrl, downloadLog, DownloadError } from './runs/download.ts'
 import type { PlatformLogDownloader, PlatformLogRef } from './runs/logs.ts'
+import { SessionMounts } from './runs/mounts.ts'
 import { inRunDirectory, isDelegatedAgent, isInside } from './runs/run-dir.ts'
 import { CircuitBreakerRegistry } from './runtime/breaker.ts'
 import { openSupervisorDomain } from './runtime/domain.ts'
@@ -155,6 +157,9 @@ export class SupervisorService {
   private readonly refreshWaitMs: number
   private readonly subagentProvider: string
   private readonly subagentMaxDepth: number | 'provider-managed'
+  private readonly snapshotHoldMs: number
+  private readonly mounts: SessionMounts
+  private readonly mounter: AppMounter
   private readonly autoInvoke: boolean
   private readonly booted = Promise.withResolvers<void>()
 
@@ -205,6 +210,7 @@ export class SupervisorService {
     this.refreshWaitMs = config.refreshWaitMs
     this.subagentProvider = config.subagentProvider
     this.subagentMaxDepth = config.subagentMaxDepth
+    this.snapshotHoldMs = config.snapshotHoldMs
     this.autoInvoke = config.autoInvoke
     this.repos = new ReposClient(() => ctx.get?.(DSH_REPOS_SERVICE))
     const credentials = (): HostCredentials | undefined => ctx.get?.('credentials') as HostCredentials | undefined
@@ -229,6 +235,15 @@ export class SupervisorService {
     this.improver = new SkillImprover({ ...children, repos: this.repos })
     this.viewer = new SkillViewer({ registry: this.registry, repos: this.repos })
     this.dispatcher = new Dispatcher({ ...children, gaps: this.improver, platformLogs: sessionId => this.platformLogsOf(sessionId), platform: this.platformDownloader(options.fetch) })
+    this.mounts = new SessionMounts({ registry: this.registry, holdMs: () => this.snapshotHoldMs })
+    this.mounter = new AppMounter({
+      mounts: this.mounts,
+      settings,
+      workingDirectory,
+      platformLogs: sessionId => this.platformLogsOf(sessionId),
+      platform: this.platformDownloader(options.fetch),
+      ...fetchSeam,
+    })
     this.reports = new ReportTracker({
       store: new AnalysisStore(this.analysesDir, warn),
       topics: () => this.topicsService(),
@@ -314,6 +329,7 @@ export class SupervisorService {
     const register = <V>(definition: ToolDefinition<V>, condition: (context: ToolActivationContext) => boolean, label: string): void => {
       this.ctx.effect(() => this.ctx.tools.register(definition, { when: context => this.offers(context, condition) }), `supervisor: ${label} tool`)
     }
+    register(this.mounter.definition(), hasApps, 'mount')
     register(this.dispatcher.definition(), hasApps, 'dispatch')
     register(this.improver.definition(), () => this.settings.get().skillUpdates.enabled && this.registry.readyApps().some(ready => ready.writable && ready.app.skill !== undefined), 'skill improvement')
     register(this.viewer.definition(), () => this.registry.readyApps().some(ready => ready.app.skill !== undefined), 'skill view')
@@ -513,6 +529,7 @@ export class SupervisorService {
       this.logSupervisor?.drainAndClose(),
       this.mrSupervisor?.drainAndClose(),
       this.pools.drainAndClose({ cancelQueued: true, abortActive: true }),
+      this.mounts.close(),
       this.registry.close(),
     ])
     if (this.supervisorPromise !== undefined) {
@@ -612,6 +629,7 @@ export class SupervisorService {
         platformSecretRef: this.secret.ref,
         subagentProvider: this.subagentProvider,
         subagentMaxDepth: this.subagentMaxDepth,
+        snapshotHoldMs: this.snapshotHoldMs,
         refreshWaitMs: this.refreshWaitMs,
         autoInvoke: this.autoInvoke,
       },
@@ -754,7 +772,7 @@ export class SupervisorService {
   }
 
   private logToolsRuntimeAdapter(): LogToolsRuntime {
-    const requireSup = (): LogToolsRuntime => {
+    const requireSup = (): Omit<LogToolsRuntime, 'mountApp'> => {
       if (this.logSupervisor === undefined) {
         throw new Error('观象日志监管运行时尚未就绪')
       }
@@ -782,6 +800,7 @@ export class SupervisorService {
       withTaskOperation: (taskId, fn) => requireSup().withTaskOperation(taskId, fn),
       onRevisionSubmitted: params => requireSup().onRevisionSubmitted(params),
       registerSelfMr: async (input) => { await requireSup().registerSelfMr?.(input) },
+      mountApp: async (sessionId, appId) => (await this.mounts.mount(sessionId, [appId]))[0]!,
       logWorkspacesRoot: () => this.logWorkspacesDir,
       now: () => this.clock(),
     }
