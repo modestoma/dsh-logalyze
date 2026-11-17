@@ -5,7 +5,7 @@ import { diffOverlay } from '../src/settings/overlay.ts'
 describe('configuration', () => {
   it('defaults every field', () => {
     const config = resolveConfig(undefined)
-    expect(config).toMatchObject({ fetchIntervalMs: 0, maxAppsPerRequest: 4, subagentProvider: 'spawn', refreshWaitMs: 15000 })
+    expect(config).toMatchObject({ fetchIntervalMs: 0, maxAppsPerRequest: 4, subagentProvider: 'spawn', subagentMaxDepth: 1, refreshWaitMs: 15000 })
     expect(defaultsOf(config).skillUpdates).toEqual({ enabled: true, maxFiles: 16, maxFileBytes: 262144 })
     expect(defaultsOf(config).mrReview).toEqual({
       enabled: true,
@@ -66,6 +66,13 @@ describe('configuration', () => {
     expect(() => resolveConfig({ mrReview: { feishuChatId: 'bad_chat' } })).toThrow(/chat_id/)
     expect(() => resolveConfig({ issueSync: { bitableUrl: 'https://example.com/not-bitable' } })).toThrow(/飞书多维表格地址/)
     expect(() => resolveConfig({ issueSync: { syncIntervalMs: 1000 } })).toThrow(/issueSync\.syncIntervalMs/)
+  })
+
+  it('accepts a child depth cap or provider-managed depth and rejects other values', () => {
+    expect(resolveConfig({ subagentMaxDepth: 0 }).subagentMaxDepth).toBe(0)
+    expect(resolveConfig({ subagentMaxDepth: 'provider-managed' }).subagentMaxDepth).toBe('provider-managed')
+    expect(() => resolveConfig({ subagentMaxDepth: -1 })).toThrow()
+    expect(() => resolveConfig({ subagentMaxDepth: 1.5 })).toThrow()
   })
 
   it('normalizes allowed hosts and rejects schemes', () => {

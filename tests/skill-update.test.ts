@@ -128,7 +128,6 @@ function fakeSubagents(): { service: SubagentService; started: Started[] } {
   const started: Started[] = []
   const service: SubagentService = {
     getProvider: () => ({}),
-    resolveMaxDepth: () => 1,
     startActivation: async (spec) => {
       let settle!: (result: SubagentResult) => void
       const result = new Promise<SubagentResult>((resolve) => { settle = resolve })
@@ -184,6 +183,7 @@ async function setup(endTurn = true): Promise<Setup> {
     registry,
     subagents: service,
     provider: 'spawn',
+    maxDepth: 1,
     settings: () => settings,
     workingDirectory: () => undefined,
     repos: new ReposClient(() => repos.service),
@@ -476,7 +476,7 @@ describe('supervisor_improve_skill', () => {
     improver.turnEnded('parent')
     await expect(improver.execute({ ...args, workDirs: [broken], feedback: 'x' }, exec)).rejects.toThrow('skill-gap.md 是空的')
 
-    const withoutRepos = new SkillImprover({ registry, subagents: fakeSubagents().service, provider: 'spawn', settings: () => settings, workingDirectory: () => undefined, repos: new ReposClient(() => undefined) })
+    const withoutRepos = new SkillImprover({ registry, subagents: fakeSubagents().service, provider: 'spawn', maxDepth: 1, settings: () => settings, workingDirectory: () => undefined, repos: new ReposClient(() => undefined) })
     await withoutRepos.inspect(task)
     withoutRepos.turnEnded('parent')
     await expect(withoutRepos.execute(args, exec)).rejects.toThrow('需要 dsh-repo 插件提供的 dshRepos 服务')

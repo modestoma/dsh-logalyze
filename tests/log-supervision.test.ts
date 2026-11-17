@@ -710,7 +710,6 @@ describe('LogSupervisor & SupervisorService M3 end-to-end closed loops', () => {
       },
       subagents: {
         getProvider: () => undefined,
-        resolveMaxDepth: () => 1,
         startActivation: async () => { throw new Error('unused') },
       },
       skills: {

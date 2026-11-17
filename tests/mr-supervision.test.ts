@@ -282,7 +282,6 @@ async function createServiceHarness(options: {
     },
     subagents: {
       getProvider: () => ({}),
-      resolveMaxDepth: () => 1,
       startActivation: () => Promise.reject(new Error('not used')),
     },
     get: (name: string) => {
@@ -1355,7 +1354,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     const fakeCtx: HostContext = {
       tools: { register: () => () => {} },
       skills: { registerProvider: () => () => {} },
-      subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('unused')) },
+      subagents: { getProvider: () => ({}), startActivation: () => Promise.reject(new Error('unused')) },
       on: () => () => {},
       effect: () => () => {},
     }
@@ -1560,7 +1559,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     const ctx: HostContext = {
       tools: { register: () => () => {} },
       skills: { registerProvider: () => () => {} },
-      subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('unused')) },
+      subagents: { getProvider: () => ({}), startActivation: () => Promise.reject(new Error('unused')) },
       on: () => () => {},
       effect: () => () => {},
       get: (name: string) => {
@@ -2179,7 +2178,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     const ctx: HostContext = {
       tools: { register: () => () => {} },
       skills: { registerProvider: () => () => {} },
-      subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('unused')) },
+      subagents: { getProvider: () => ({}), startActivation: () => Promise.reject(new Error('unused')) },
       on: () => () => {},
       effect: () => () => {},
       get: (name: string) => {
@@ -2369,7 +2368,7 @@ describe('MrSupervisor end-to-end stateful supervision loop', () => {
     const ctx: HostContext = {
       tools: { register: () => () => {} },
       skills: { registerProvider: () => () => {} },
-      subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('unused')) },
+      subagents: { getProvider: () => ({}), startActivation: () => Promise.reject(new Error('unused')) },
       on: () => () => {},
       effect: () => () => {},
       get: (name: string) => {

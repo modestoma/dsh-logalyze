@@ -625,7 +625,7 @@ describe('IssueBitableSyncer two-way synchronization', () => {
     const ctx: HostContext = {
       tools: { register: () => () => {} },
       skills: { registerProvider: () => () => {} },
-      subagents: { getProvider: () => ({}), resolveMaxDepth: () => 1, startActivation: () => Promise.reject(new Error('unused')) },
+      subagents: { getProvider: () => ({}), startActivation: () => Promise.reject(new Error('unused')) },
       get: (name: string) => {
         if (name === DSH_REPOS_SERVICE) return repos
         if (name === FEISHU_BITABLE_SERVICE) return providedBitable
@@ -679,6 +679,7 @@ describe('IssueBitableSyncer two-way synchronization', () => {
     expect(initial.runtime).toEqual({
       platformSecretRef: 'SUPERVISOR_PLATFORM_CLIENT_SECRET',
       subagentProvider: 'custom-provider',
+      subagentMaxDepth: 1,
       refreshWaitMs: 15000,
       autoInvoke: false,
     })

@@ -587,6 +587,7 @@ export interface IssueOverviewWire {
 export interface RuntimeInfoWire {
   platformSecretRef: string
   subagentProvider: string
+  subagentMaxDepth: number | 'provider-managed'
   refreshWaitMs: number
   autoInvoke: boolean
 }

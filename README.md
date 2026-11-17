@@ -106,6 +106,7 @@ npm 发行包已包含构建产物；本地 `link:` 安装前必须先执行 `pn
       maxBytes: 536870912
       timeoutMs: 600000
     subagentProvider: spawn            # 子 Agent 使用的 ctx.subagents provider
+    subagentMaxDepth: 1                # 子 Agent 委派深度上限；0 = 子 Agent 不能再委派；provider-managed = 不传上限，由 provider 自己控制
     refreshWaitMs: 15000               # 加载 /supervisor 时等待 fetch 的上限；0 = 不等待
     autoInvoke: true                   # 任务匹配已注册应用时模型可自行加载入口 SKILL；false = 只能输入 /supervisor
     skillUpdates:                      # SKILL 改进，见下文
@@ -184,7 +185,7 @@ DSH Web 左侧栏的 **「智能监管」** 入口打开统一 5 标签页整页
 | **应用与日志监管** | `log` | 跟随 `dsh-repo` 已开启「日志分析」的应用仓库（支持就地编辑应用描述与单行添加/删除触发别名并保存 `PUT /supervisor/applications`）；`logSupervision` 水位线状态与暂停/恢复/时间回拨控制（`POST /supervisor/log-supervision/watermark`）、攒批参数与轮询安全滞后、日志平台连接与 OAuth2 client_secret（`PUT/DELETE /supervisor/token`）、日志下载/上传限制及最近报告回传与手动重传（`POST /supervisor/reports/upload`） |
 | **MR 自动评审** | `mr` | 跟随 `dsh-repo` 已开启「MR 自动评审」的仓库清单（含目标分支与只读/可写标记）、审微运行状态与熔断器、受监管 MR 列表（`open`/`merged`/`closed`/`draft_skipped`、origin 标记及待处理信号）、`mrReview` 并发/防抖/忽略标签/熔断阈值、`customInstructions` 与可选 `feishuChatId` 告警群 |
 | **已知问题库** | `issues` | `feishuBitable` v1 就绪状态、一键「立即同步」（`POST /supervisor/issues/sync`）与「检查字段映射」（`POST /supervisor/issues/check` 对 16 列标准 Schema 逐列诊断）、`issueSync` 表格链接/表名/周期配置、本地 `IssueMemory` 问题检索列表与 `humanConclusion` / `fixMrUrl` 状态 |
-| **模型与高级** | `advanced` | 只读展示 `cordis.yml` 运行时配置（`platformSecretRef`、`subagentProvider`、`refreshWaitMs`、`autoInvoke`）、仓库读取间隔与派发上限、`skillUpdates` 开关与文件限制，以及清除覆盖恢复默认值（`DELETE /supervisor/settings`） |
+| **模型与高级** | `advanced` | 只读展示 `cordis.yml` 运行时配置（`platformSecretRef`、`subagentProvider`、`subagentMaxDepth`、`refreshWaitMs`、`autoInvoke`）、仓库读取间隔与派发上限、`skillUpdates` 开关与文件限制，以及清除覆盖恢复默认值（`DELETE /supervisor/settings`） |
 
 面板读取状态走 `GET /supervisor/state`，保存设置走 `PUT /supervisor/settings`（写入 `$DSH_HOME/supervisor/settings.json`，仅保存与 `cordis.yml` 不同的覆盖键并共用同一 Zod 校验），所有 `/supervisor/*` 路由均经过宿主 `connection.requestRejection` 登录与来源校验，写操作另做同源校验。
 
