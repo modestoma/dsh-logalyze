@@ -91,7 +91,11 @@ export class SessionMounts {
 
   private async mountNow(sessionId: string, ids: readonly string[]): Promise<MountedApp[]> {
     const unique = [...new Set(ids)]
-    const entry = this.sessions.get(sessionId) ?? { mounts: new Map<string, Mount>() }
+    const existing = this.sessions.get(sessionId)
+    const entry = existing ?? { mounts: new Map<string, Mount>() }
+    // The idle release must not fire while new snapshots are being acquired; it is rescheduled once the mount settles.
+    if (entry.timer !== undefined) clearTimeout(entry.timer)
+    entry.timer = undefined
     const stale = unique.filter((id) => {
       const current = entry.mounts.get(id)
       return current === undefined || current.app.commit !== this.deps.registry.readyApp(id).commit
@@ -99,10 +103,14 @@ export class SessionMounts {
     const outcomes = await Promise.allSettled(stale.map(id => this.deps.registry.acquire([id])))
     const acquired = outcomes.flatMap(outcome => outcome.status === 'fulfilled' ? [outcome.value] : [])
     const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected')
-    if (failure !== undefined || this.closed) {
+    const releasedMeanwhile = existing !== undefined && this.sessions.get(sessionId) !== existing
+    if (failure !== undefined || this.closed || releasedMeanwhile) {
       for (const lease of acquired) lease.release()
+      if (this.sessions.get(sessionId) === entry) this.schedule(sessionId, entry)
       if (failure !== undefined) throw failure.reason
-      throw new Error('智能监管已停止，未挂载应用代码')
+      if (this.closed) throw new Error('智能监管已停止，未挂载应用代码')
+      // The session's leases were released during the acquisition, so the kept mounts are gone: mount everything again.
+      return this.mountNow(sessionId, ids)
     }
     for (const [index, id] of stale.entries()) {
       const lease = acquired[index] as RepoLease

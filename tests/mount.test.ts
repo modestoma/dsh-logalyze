@@ -110,6 +110,47 @@ describe('supervisor_mount_apps', () => {
     expect(mounts.held('a')).toEqual([])
   })
 
+  it('keeps the idle release from firing while a mount is acquiring, and mounts again after an explicit release', async () => {
+    const { origin, repos, registry } = await setup()
+    let gate: Promise<void> = Promise.resolve()
+    let open = () => {}
+    const hold = () => { gate = new Promise(resolve => { open = resolve }) }
+    const mounts = new SessionMounts({
+      registry: { readyApp: id => registry.readyApp(id), acquire: async (ids) => { await gate; return registry.acquire(ids) } },
+      holdMs: () => 1000,
+    })
+    cleanups.push(() => mounts.close())
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    await mounts.mount('a', ['order-service'])
+    await commitFile(origin, 'README.md', 'changed\n')
+    await registry.syncAll()
+    hold()
+    const moving = mounts.mount('a', ['order-service'])
+    await vi.advanceTimersByTimeAsync(1500)
+    expect(mounts.held('a')).toHaveLength(1)
+    open()
+    const [moved] = await moving
+    expect(moved!.commit).toBe(registry.readyApp('order-service').commit)
+    expect(mounts.held('a')).toEqual([moved])
+    expect(repos.heldSnapshots()).toBe(1)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(repos.heldSnapshots()).toBe(0)
+
+    gate = Promise.resolve()
+    await mounts.mount('b', ['order-service'])
+    await commitFile(origin, 'README.md', 'changed again\n')
+    await registry.syncAll()
+    hold()
+    const again = mounts.mount('b', ['order-service'])
+    await vi.advanceTimersByTimeAsync(10)
+    mounts.release('b')
+    open()
+    const [remounted] = await again
+    expect(remounted!.commit).toBe(registry.readyApp('order-service').commit)
+    expect(mounts.held('b')).toEqual([remounted])
+    expect(repos.heldSnapshots()).toBe(1)
+  })
+
   it('refuses unknown apps and too many apps without holding anything, and releases everything on close', async () => {
     const { repos, mounts, mounter, exec } = await setup()
     await expect(mounter.execute({ apps: ['nope'] }, exec)).rejects.toThrow('「nope」不在应用注册表中')
